@@ -46,8 +46,8 @@ The console binds to `127.0.0.1` by default. Remote use should go through an SSH
 ### 1. Install
 
 ```bash
-git clone https://github.com/<your-account>/so-arm101-console.git
-cd so-arm101-console
+git clone https://github.com/sesepark/soarm101-console.git
+cd soarm101-console
 uv sync --all-groups
 cp config/soarm.env.example config/soarm.env
 ```

@@ -1,19 +1,19 @@
 # SO-ARM101 Console
 
-> A local-first operator console for an SO-ARM101 leader–follower pair: inspect hardware, calibrate arms, teleoperate safely, and record LeRobot-compatible demonstrations from one browser UI.
+> SO-ARM101 leader–follower 팔을 위한 로컬 우선 운영 콘솔입니다. 브라우저 하나에서 하드웨어 상태 확인, 캘리브레이션, 안전 게이트가 있는 텔레옵, LeRobot 호환 데이터 수집을 수행합니다.
 
-Built as a portfolio project around the practical problems that appear between a working robot arm and a usable operator workflow: stable device identity, exclusive serial ownership, calibration gates, camera lifecycle, and an intentional motion-start flow.
+이 프로젝트는 실제 운영에서 필요한 안정적인 장치 식별, serial bus 단일 소유권, calibration 검증, 카메라 lifecycle, 명시적인 motion 시작 절차를 구현하는 데 초점을 둡니다.
 
-## Highlights
+## 주요 기능
 
-- **Browser-based operations** — a FastAPI console for hardware status, camera preview, teleoperation, and dataset recording.
-- **Stable hardware identity** — serial devices are addressed by `/dev/serial/by-id`; cameras by `/dev/v4l/by-path`, rather than volatile `ttyACM*` or `video*` indices.
-- **Motion is gated** — teleoperation requires valid leader/follower calibration, an enabled motion flag, an explicit physical-workspace acknowledgement, and the `START SOARM101` confirmation phrase.
-- **Exclusive hardware ownership** — a single active mode owns the serial bus and cameras; observation, teleop, and recording do not contend for device handles.
-- **Dataset-oriented** — records local, reviewable LeRobot datasets with episode success/retry controls and no automatic Hub upload.
-- **Operational documentation** — runbook, failure-mode guide, safety notes, architecture, and an ADR capture the decisions behind the implementation.
+- **브라우저 기반 운영** — FastAPI 콘솔에서 하드웨어 상태, 카메라 프리뷰, 텔레옵, 데이터 수집을 제어합니다.
+- **안정적인 장치 식별** — serial은 `/dev/serial/by-id`, 카메라는 `/dev/v4l/by-path`를 사용해 변하는 `ttyACM*`와 `video*` 번호에 의존하지 않습니다.
+- **Motion safety gate** — 텔레옵은 양팔 calibration, motion 활성화, 현장 작업영역 확인, `START SOARM101` 입력을 모두 요구합니다.
+- **하드웨어 단일 소유권** — observation, teleop, recording 중 한 모드만 serial bus와 카메라를 점유합니다.
+- **데이터 수집 파이프라인** — episode 성공/재시도 제어가 가능한 로컬 LeRobot dataset을 기록하며, Hub 자동 업로드는 하지 않습니다.
+- **운영 문서화** — runbook, failure mode, safety, architecture, ADR로 구현 결정과 현장 절차를 남깁니다.
 
-## System overview
+## 시스템 구조
 
 ```text
 Browser
@@ -29,21 +29,21 @@ FastAPI console
 SO-ARM101 leader / follower + scene / wrist cameras
 ```
 
-The console binds to `127.0.0.1` by default. Remote use should go through an SSH tunnel rather than exposing an unauthenticated motion-control API on a LAN.
+콘솔은 기본적으로 `127.0.0.1`에만 bind합니다. 인증 없는 motion-control API를 LAN에 노출하지 않으며, 원격 접속은 SSH tunnel을 사용합니다.
 
-## Tech stack
+## 기술 스택
 
-| Area | Choice |
+| 영역 | 구성 |
 | --- | --- |
 | Robot runtime | Python 3.12, [LeRobot](https://github.com/huggingface/lerobot) 0.6.1, Feetech SDK |
-| Web console | FastAPI, Uvicorn, vanilla HTML/CSS/JavaScript |
-| Video and data | OpenCV camera input, PyAV / MP4, LeRobot dataset format |
-| Deployment | `uv`, systemd user service, udev device aliases |
-| Validation | pytest hardware-free tests + read-only bus doctor |
+| Web console | FastAPI, Uvicorn, Vanilla HTML/CSS/JavaScript |
+| Video / data | OpenCV camera input, PyAV / MP4, LeRobot dataset format |
+| Deployment | `uv`, systemd user service, udev device alias |
+| 검증 | pytest 기반 hardware-free test + read-only bus doctor |
 
-## Quick start
+## 빠른 시작
 
-### 1. Install
+### 1. 설치
 
 ```bash
 git clone https://github.com/sesepark/soarm101-console.git
@@ -52,80 +52,80 @@ uv sync --all-groups
 cp config/soarm.env.example config/soarm.env
 ```
 
-Set the leader, follower, and camera paths in `config/soarm.env` for your own hardware. Do not commit that file.
+`config/soarm.env`에서 본인 환경의 leader/follower/camera 경로를 설정합니다. 이 파일은 로컬 런타임 설정이며 커밋하지 않습니다.
 
-### 2. Verify without motion
+### 2. Motion 없이 확인
 
 ```bash
 ./scripts/doctor.sh
 .venv/bin/pytest -q
 ```
 
-The doctor reads motor ID, model, firmware, position, voltage, and torque state without issuing a motion command.
+Doctor는 모터 ID, 모델, firmware, 현재 위치, 전압, torque 상태만 읽습니다. motion command는 전송하지 않습니다.
 
-### 3. Calibrate the arms
+### 3. 양팔 캘리브레이션
 
-With the work area clear, a local observer present, and a power-cut method ready:
+작업영역을 비우고, 현장 관찰자와 전원 차단 수단을 준비한 뒤 실행합니다.
 
 ```bash
 ./scripts/calibrate_follower.sh
 ./scripts/calibrate_leader.sh
 ```
 
-For each arm, place it near the middle of its safe range, press Enter, then sweep the requested joints one at a time through their safe usable ranges. Full instructions are in the [runbook](RUNBOOK.md).
+각 팔을 안전한 범위의 중간 자세에 둔 뒤 Enter를 누르고, 안내되는 관절을 한 번에 하나씩 안전한 실사용 범위까지 움직입니다. 상세 절차는 [RUNBOOK.md](RUNBOOK.md)를 참고하세요.
 
-### 4. Start the console
+### 4. 콘솔 시작
 
 ```bash
 ./scripts/run_web.sh
 ```
 
-Open <http://127.0.0.1:8088>. To enable teleoperation, set `SOARM_ENABLE_MOTION=1` in the local configuration and restart the service. The browser still requires an explicit safety acknowledgement and `START SOARM101` before it starts a motion session.
+<http://127.0.0.1:8088>을 엽니다. 텔레옵을 활성화하려면 로컬 설정의 `SOARM_ENABLE_MOTION=1`로 변경한 뒤 서비스를 재시작해야 합니다. 이후에도 브라우저에서 현장 확인과 `START SOARM101` 입력을 거쳐야 motion session이 시작됩니다.
 
-## Operator workflow
+## 운영 흐름
 
-| Step | Operator action | Guardrail |
+| 순서 | 작업 | 보호 장치 |
 | --- | --- | --- |
-| 1 | Run **Environment Doctor** | Read-only; blocked while teleop or recording owns hardware |
-| 2 | Confirm calibration files | Both roles must have valid motor IDs and ranges |
-| 3 | Start **Teleoperation** | Motion flag + physical confirmation + typed phrase |
-| 4 | Stop the current mode | Closes the active hardware owner before another mode starts |
-| 5 | Record demonstrations | Requires confirmed camera roles as an additional gate |
+| 1 | **환경 진단** 실행 | 읽기 전용이며 teleop/record 중에는 실행을 막음 |
+| 2 | calibration 파일 확인 | Leader/Follower 모두 유효한 motor ID와 range 필요 |
+| 3 | **텔레옵 시작** | Motion flag, 현장 확인, 확인 문구 입력 필요 |
+| 4 | 현재 모드 중지 | 다음 모드가 시작되기 전에 active hardware owner 해제 |
+| 5 | demonstration 기록 | camera role 확인을 추가로 요구 |
 
-## Repository layout
+## 저장소 구조
 
 ```text
 src/soarm_console/        FastAPI app, teleop, recording, diagnostics, camera workers
-scripts/                  Calibration, doctor, web, recording, service installation
-config/                   Local runtime configuration template
-deploy/                   systemd user service and udev rule
-tests/                    Hardware-free API and safety-gate tests
-ADR/                      Architecture decisions
-RUNBOOK.md                Field procedure for calibration, teleop, and recording
-SAFETY.md                 Safety invariants and current limitations
-ARCHITECTURE.md           Ownership model and future extensibility
+scripts/                  calibration, doctor, web, recording, service installation
+config/                   로컬 runtime 설정 template
+deploy/                   systemd user service, udev rule
+tests/                    hardware-free API 및 safety gate test
+ADR/                      Architecture Decision Records
+RUNBOOK.md                calibration, teleop, recording 현장 절차
+SAFETY.md                 안전 불변조건과 현재 한계
+ARCHITECTURE.md           소유권 모델과 향후 확장 방향
 ```
 
-## Safety and scope
+## 안전 범위와 한계
 
-This is an experimental robotics project, **not** a safety-certified control system. The repository does not claim that software stop behavior replaces a physical E-stop or power cutoff. Start with small motions, keep a local observer present, and review [SAFETY.md](SAFETY.md) and [FAILURE_MODES.md](FAILURE_MODES.md) before operating hardware.
+이 프로젝트는 실험용 로보틱스 시스템이며 **안전 인증 제어 시스템이 아닙니다**. 소프트웨어 정지가 물리 E-stop 또는 전원 차단을 대체한다고 주장하지 않습니다. 작은 동작부터 시작하고, 현장 관찰자를 유지하며, 하드웨어 동작 전 [SAFETY.md](SAFETY.md)와 [FAILURE_MODES.md](FAILURE_MODES.md)를 검토하세요.
 
-## Validation performed
+## 검증 항목
 
 - Hardware-free test suite: `12 passed`
-- Read-only bus checks for both arms: motor IDs 1–6, voltage, firmware, position, and torque state
-- Calibration JSON validation for leader and follower
-- Browser preflight confirms device paths and calibration gates before enabling teleoperation
+- 양팔 read-only bus 확인: motor ID 1–6, 전압, firmware, 위치, torque 상태
+- Leader/Follower calibration JSON 검증
+- 텔레옵 시작 전 브라우저 preflight에서 장치 경로와 calibration gate 확인
 
-## Documentation
+## 문서
 
-- [Runbook](RUNBOOK.md) — calibration, teleoperation, recording, and recovery sequence
-- [Hardware notes](hardware.md) — USB/camera identity and the verified role mapping
-- [Safety model](SAFETY.md) — what the system does and does not guarantee
-- [Architecture](ARCHITECTURE.md) — exclusive hardware ownership and future policy/VLA integration
-- [Protocol](PROTOCOL.md) — planned observation/action contract
-- [Failure modes](FAILURE_MODES.md) — expected faults and operator response
+- [RUNBOOK.md](RUNBOOK.md) — calibration, teleoperation, recording, recovery 절차
+- [hardware.md](hardware.md) — USB/camera 식별과 검증된 역할 매핑
+- [SAFETY.md](SAFETY.md) — 시스템이 보장하는 것과 보장하지 않는 것
+- [ARCHITECTURE.md](ARCHITECTURE.md) — hardware ownership과 향후 policy/VLA 확장
+- [PROTOCOL.md](PROTOCOL.md) — 계획 중인 observation/action contract
+- [FAILURE_MODES.md](FAILURE_MODES.md) — 예상 장애와 운영자 대응
 
-## Acknowledgements
+## 참고 및 감사
 
-The arm runtime is built on [Hugging Face LeRobot](https://github.com/huggingface/lerobot) and its [SO-101 workflow](https://github.com/huggingface/lerobot/blob/main/docs/source/so101.mdx). This repository adds a local operations layer around that hardware workflow; it is not affiliated with or endorsed by Hugging Face.
+로봇 runtime은 [Hugging Face LeRobot](https://github.com/huggingface/lerobot)과 [SO-101 workflow](https://github.com/huggingface/lerobot/blob/main/docs/source/so101.mdx)를 기반으로 합니다. 이 저장소는 해당 하드웨어 workflow 위에 로컬 운영 계층을 구현한 프로젝트이며, Hugging Face와 제휴 또는 보증 관계가 없습니다.

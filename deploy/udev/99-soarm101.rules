@@ -1,0 +1,3 @@
+# Prevent ModemManager from probing the two SO-ARM101 Bus Servo Adapter (A) devices.
+SUBSYSTEM=="tty", ENV{ID_SERIAL_SHORT}=="5B90147327", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="soarm101-follower"
+SUBSYSTEM=="tty", ENV{ID_SERIAL_SHORT}=="5B90149286", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="soarm101-leader"

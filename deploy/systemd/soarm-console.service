@@ -1,0 +1,21 @@
+[Unit]
+Description=SO-ARM101 local web console (observation-only)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/deploy/Project/so-arm-101
+# The existing user manager may predate deploy's dialout membership. `sg`
+# establishes the device group without requiring a logout or a system service.
+ExecStart=/usr/bin/sg dialout -c /home/deploy/Project/so-arm-101/scripts/run_web.sh
+EnvironmentFile=/home/deploy/Project/so-arm-101/config/soarm.env
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+# `sg dialout` needs to establish the configured supplementary device group.
+NoNewPrivileges=false
+TimeoutStopSec=15
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

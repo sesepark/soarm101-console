@@ -1,0 +1,170 @@
+# Safety and Operational Invariants
+
+## 목적
+
+이 문서는 실험을 불필요하게 막지 않으면서, 동시 명령 충돌과 복구 불가능한 상태처럼 명백한 위험만 일관되게 방지한다.
+
+이 프로젝트는 산업용 안전 인증을 받은 시스템이 아니다. 아래 원칙은 위험을 줄이기 위한 개발 규칙이며 안전 인증을 의미하지 않는다.
+
+## 현재 보장 수준
+
+이 문서의 lease, heartbeat, watchdog, owner lock, HOLD 동작은 목표 설계다. 아직 구현·fault injection·실제 motion 검증이 끝나지 않았다.
+
+- 문서에 적혀 있다는 이유만으로 현재 동작한다고 가정하지 않는다.
+- 구현된 기능과 제안 단계 기능을 run 시작 전에 구분한다.
+- 독립 actuator power cutoff와 물리 E-stop은 현재 없다.
+- 구현 전에는 소프트웨어 timeout이 실제 arm을 멈출 것이라고 의존하지 않는다.
+
+## 원칙 적용과 예외
+
+이 원칙 때문에 올바르거나 직접적인 해결책을 무작정 배제하지 않는다.
+
+1. 충돌하는 원칙과 그 원래 목적을 확인한다.
+2. 직접 해결책의 이점, 실제 위험, 영향 범위, 복구 방법을 설명한다.
+3. 사용자에게 예외 적용 또는 원칙 변경 여부를 재질문한다.
+4. 명시적 확인 후 제한된 범위에서 진행한다.
+5. 반복 가능한 결정이면 config/profile 또는 ADR에 기록한다.
+
+예외 절차는 검토를 가능하게 하기 위한 것이며, 위험을 숨기거나 동시 Follower 명령 같은 핵심 불변조건을 암묵적으로 우회하기 위한 것이 아니다.
+
+## 최소 불변조건 (`MUST`)
+
+1. Follower에는 한 시점에 하나의 active command authority만 존재한다.
+2. 각 serial/camera 장치에는 한 시점에 하나의 Hardware Owner만 존재한다.
+3. 모델, Mac, ROS 2 client는 raw servo packet을 직접 보내지 않는다.
+4. NaN/Inf, 잘못된 구조, 검증된 절대 joint 범위 밖 command는 실행하지 않는다. 검증되지 않은 범위를 추정해 절대 제한으로 사용하지 않는다.
+5. Command는 session/sequence를 가지며 과거 또는 중복 command를 구분할 수 있어야 한다.
+6. 유효기간이 없는 마지막 command를 연결 단절 후 무기한 반복하지 않는다.
+7. Fault나 owner 변경 후 자동으로 이전 motion을 재개하지 않는다.
+8. Calibration과 hardware mapping은 active motion 중 변경하지 않는다.
+9. Firmware flash, servo ID 변경, calibration 변경은 일반 운용 mode와 분리한다.
+10. 독립 전원 차단 수단이 없는 현재 상태를 원격 무인 운용에서 항상 고려한다.
+
+## 변경 가능한 정책 (`DEFAULT`)
+
+다음 항목은 안전 불변조건이 아니라 profile 설정이다.
+
+- heartbeat 주기와 lease timeout
+- action chunk horizon
+- update 단절 후 grace 구간
+- 최대 속도/가속도/action delta
+- 카메라 한 대 손실 시 계속 운용 여부
+- 특정 workspace 제한
+- 연결 단절 후 HOLD와 torque-off 순서
+- 원격 운용에서 로컬 관찰자 필요 여부
+
+기본값은 보수적으로 시작하되 실측과 운용 경험에 따라 변경한다. 변경 이유와 결과는 config 또는 ADR에 남긴다.
+
+## 상태 모델
+
+```text
+SAFE -> READY -> ACTIVE
+  ^       |        |
+  |       v        v
+  +----- HOLD <- FAULT
+```
+
+### SAFE
+
+- 장치 진단과 observation 허용
+- Follower motion command 거부
+- 시작과 crash recovery의 기본 상태
+
+`SAFE`는 논리적 command 상태 이름이다. Servo torque-off, 전원 차단, arm 무에너지 상태 또는 물리적으로 안전한 자세를 보장하지 않는다.
+
+### READY
+
+- 장치와 config를 확인한 상태
+- command authority가 없으면 motion 없음
+
+### ACTIVE
+
+- 유효한 command authority가 있음
+- profile 정책과 최소 validator를 통과한 command 실행
+
+### HOLD
+
+- 새 motion 진행을 멈추거나 현재 상태를 유지
+- 원인 확인 후 새 lease/명시적 전이 필요
+
+`HOLD`의 물리 동작은 hardware/profile별로 정의해야 한다. 아직 검증되지 않은 상태에서 HOLD가 즉시 정지, 위치 유지 또는 torque-off를 보장한다고 가정하지 않는다.
+
+### FAULT
+
+- hardware/communication/validation 오류
+- recovery 절차 없이 자동 ACTIVE 복귀 금지
+
+`ARMED` 같은 추가 상태는 실제 운용에서 유용성이 확인될 때 도입한다. 상태를 늘리는 것 자체를 안전으로 간주하지 않는다.
+
+## Action chunk 중단 원칙
+
+Action chunk 전체를 무조건 완료하거나 무조건 즉시 폐기하는 단일 규칙을 사용하지 않는다.
+
+### Streaming action
+
+지속적으로 갱신될 것을 전제로 하는 command다.
+
+- Update가 끊기면 짧은 configurable grace 뒤 HOLD
+- 남은 command를 끝까지 실행하지 않는 것이 기본
+
+### Bounded action chunk
+
+짧은 미래 action sequence다.
+
+- 서버는 최신 chunk의 앞부분만 실행
+- 새 chunk가 오면 실행하지 않은 뒷부분을 교체 가능
+- Update가 끊기면 profile에 지정된 prefix/grace까지만 실행 후 HOLD
+
+### Atomic action
+
+완료 자체에 의미가 있는 제한된 작업이다. 예: 이미 시작된 짧은 gripper close.
+
+- 명시적으로 `allow_completion`이 설정된 action만 연결 단절 후 완료 가능
+- 최대 실행시간과 종료 조건이 있어야 함
+- 일반 VLA action을 자동으로 atomic으로 취급하지 않음
+- 실제 arm에서 종료 조건과 중단 동작을 검증하기 전에는 `allow_completion`을 기본 비활성으로 둠
+
+## 원격 운용
+
+외부 네트워크에서 perception, 데이터 확인, 학습, 상태 관찰은 가능하다.
+
+현재 독립된 물리 E-stop이나 원격 actuator power cutoff가 없다. 전원 플러그를 직접 차단하는 것이 유일한 물리 대응이다.
+
+따라서 현재 기본 정책은 다음과 같다.
+
+- 원격 observation/compute: 허용
+- 현장 사람이 있는 원격 motion: profile로 허용 가능
+- 완전 무인 원격 motion: 독립 차단 수단이 생기기 전에는 기본 비활성
+
+이는 protocol의 영구 제한이 아니다. 독립 power cutoff, 안전한 작업 셀 또는 적절한 현장 대응 방법이 마련되면 profile 변경으로 활성화할 수 있다.
+
+완전 무인 원격 motion을 활성화할 때는 단순 config 변경으로 끝내지 않고 현재 잔여 위험을 다시 설명하고 사용자 확인을 기록한다.
+
+## 전원과 E-stop
+
+Software stop은 runtime이 정상 동작할 때만 유효하다. Runtime/OS/USB 전체 오류에 대비하려면 actuator power를 독립적으로 차단할 수 있어야 한다.
+
+장기 권장사항:
+
+- Servo 전원만 차단하고 PC/기록 장치는 유지하는 수단
+- Arm 근처에서 즉시 누를 수 있는 물리 switch
+- 외부 원격 운용을 위한 독립 경로의 power cutoff
+
+Torque를 갑자기 끄면 arm이 낙하할 수 있으므로 torque-off를 모든 fault의 자동 기본값으로 정하지 않는다. 기본은 profile에 따른 HOLD/controlled stop이며, power cutoff는 더 큰 위험을 막기 위한 최종 수단이다.
+
+## Model/VLA 출력
+
+VLA는 높은 수준의 command authority가 될 수 있지만 Safety Validator를 우회하지 않는다. Validator는 VLA의 전략을 평가하지 않고 command의 최소 유효성만 검사한다.
+
+- 언어 또는 model confidence만으로 안전 조건을 해제하지 않음
+- Model-specific range와 normalization은 model adapter/config에 둠
+- 실행 action과 model proposal을 모두 기록하여 validator 동작을 검증 가능하게 함
+
+## 자원 격리
+
+- Live manipulation 중 서버에서 무거운 학습을 실행하지 않는 것이 기본
+- Recorder/dataset failure가 control process를 중단시키지 않도록 분리
+- Root filesystem이 가득 차지 않도록 데이터 전용 저장공간을 사용
+- 기존 cookierunhub container를 로봇 runtime이 stop/restart하지 않음
+
+이 항목들의 구체적인 CPU/memory limit는 실측 후 정하며 core 불변조건으로 고정하지 않는다.

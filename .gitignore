@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.serena/
+*.py[cod]
+runtime/
+config/soarm.env
+data/*
+!data/README.md

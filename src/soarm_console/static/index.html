@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SO-ARM101 Console</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><span class="brand-mark">S</span><span>SO-ARM <b>101</b></span></div>
+      <nav class="view-switcher" aria-label="화면 전환">
+        <button class="view-tab active" data-view="observe" aria-selected="true"><span>01</span> 관찰</button>
+        <button class="view-tab" data-view="teleop" aria-selected="false"><span>02</span> 텔레옵</button>
+        <button class="view-tab" data-view="dataset" aria-selected="false"><span>03</span> 데이터</button>
+      </nav>
+      <div class="header-actions">
+        <div id="overall" class="status-pill neutral"><i></i> 연결 확인 중</div>
+        <button id="doctor" class="compact-button primary">환경 진단</button>
+        <button id="stop-all" class="compact-button stop">모드 중지</button>
+      </div>
+    </header>
+
+    <main class="console-main">
+      <section class="view-panel active" data-panel="observe" aria-label="관찰 화면">
+        <div class="panel-heading"><div><p class="eyebrow">LIVE OBSERVATION</p><h1>작업공간 관찰</h1></div><p>필요할 때만 카메라를 점유하며 데이터 수집 전 자동 해제됩니다.</p></div>
+        <div class="observe-layout">
+          <div class="camera-grid">
+            <article class="camera-card">
+              <div class="camera-head"><div><small>CAMERA 01</small><h2>Scene</h2></div><span id="scene-state" class="mini-status">대기</span></div>
+              <div class="viewport"><img id="scene-image" alt="Scene camera"><div><b>SCENE OFFLINE</b><span>프리뷰를 시작하세요</span></div></div>
+              <div class="card-actions"><button data-camera-start="scene">프리뷰</button><button data-camera-stop="scene">중지</button><button data-camera-focus="scene">확대</button></div>
+            </article>
+            <article class="camera-card">
+              <div class="camera-head"><div><small>CAMERA 02</small><h2>Wrist</h2></div><span id="wrist-state" class="mini-status">대기</span></div>
+              <div class="viewport"><img id="wrist-image" alt="Wrist camera"><div><b>WRIST OFFLINE</b><span>프리뷰를 시작하세요</span></div></div>
+              <div class="card-actions"><button data-camera-start="wrist">프리뷰</button><button data-camera-stop="wrist">중지</button><button data-camera-focus="wrist">확대</button></div>
+            </article>
+          </div>
+          <aside class="observe-sidebar">
+            <article class="surface-card readiness-card">
+              <div class="section-head"><div><p>READINESS</p><h2>준비 상태</h2></div><span id="version">LeRobot</span></div>
+              <div id="readiness" class="readiness-list"></div>
+              <div class="mode-strip"><span>ACTIVE MODE</span><strong id="mode">IDLE</strong><small id="pid">pid —</small></div>
+            </article>
+            <article class="terminal-card compact-log"><div class="terminal-head"><div><p>RUNTIME LOG</p><h2>진단 로그</h2></div><button id="clear-log">지우기</button></div><pre id="logs">아직 실행 로그가 없습니다.</pre></article>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view-panel" data-panel="teleop" aria-label="텔레오퍼레이션 화면" hidden>
+        <div class="panel-heading"><div><p class="eyebrow">LEADER → FOLLOWER</p><h1>Teleoperation</h1></div><p>두 팔을 비슷한 초기 자세로 맞춘 뒤 작은 움직임부터 확인합니다.</p></div>
+        <div class="teleop-layout">
+          <article class="teleop-primary grid-paper">
+            <div><span class="step-number">02</span><p class="eyebrow">PRIMARY CONTROL</p></div>
+            <div class="teleop-copy"><h2>리더 팔의 움직임을<br><em>팔로워에 전달합니다.</em></h2><p>30 FPS · 관절 추적 · 프레임당 상대 목표 2° 제한</p></div>
+            <button id="start-teleop" class="action-button">텔레옵 시작 <span>→</span></button>
+          </article>
+          <div class="teleop-side">
+            <article class="surface-card gate-card"><div class="section-head"><div><p>SAFETY GATE</p><h2>시작 조건</h2></div></div><p id="motion-note">현재 상태를 확인하는 중입니다.</p><ul><li><span>01</span> Leader/Follower 캘리브레이션</li><li><span>02</span> 읽기 전용 bus doctor 통과</li><li><span>03</span> 현장 작업영역과 전원 차단 확인</li></ul></article>
+            <article class="surface-card quick-status"><span>CURRENT MODE</span><strong id="teleop-mode-mirror">IDLE</strong><p>문제가 생기면 상단의 <b>모드 중지</b>를 누르고 물리 전원을 차단하세요.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel" data-panel="dataset" aria-label="데이터 수집 화면" hidden>
+        <div class="panel-heading dark-heading"><div><p class="eyebrow">VLA DATA PIPELINE</p><h1>Dataset recording</h1></div><p>Scene/Wrist 영상과 리더·팔로워 상태를 로컬 LeRobot dataset으로 기록합니다.</p></div>
+        <div class="dataset-layout">
+          <article class="record-setup surface-card">
+            <div class="section-head"><div><p>SESSION SETUP</p><h2>수집 조건</h2></div></div>
+            <label>단일 작업 설명<textarea id="record-task" rows="3" placeholder="예: 빨간 블록을 집어 트레이 안에 놓기"></textarea></label>
+            <div class="field-row"><label>에피소드 수<input id="record-episodes" type="number" min="1" max="1000" value="10"></label><label>에피소드 시간<div class="input-unit"><input id="record-seconds" type="number" min="5" max="300" value="30"><span>초</span></div></label></div>
+            <button id="start-record" class="action-button blue">새 데이터 수집 시작 <span>→</span></button>
+            <p class="fine-print">로컬 `data/`에 고유 세션으로 저장하며 자동 업로드하지 않습니다.</p>
+          </article>
+          <article class="record-console">
+            <div class="record-state"><span>RECORDING STATE</span><strong id="record-phase">INACTIVE</strong><small id="record-dataset">dataset —</small></div>
+            <div class="record-instruction"><span>EPISODE CONTROL</span><h2>현재 시연 결과를 선택하세요.</h2><p>성공은 episode를 저장하고, 실패는 폐기한 뒤 같은 episode를 다시 시작합니다.</p></div>
+            <div class="record-buttons"><button id="record-success" class="success" disabled>성공 저장 <span>→</span></button><button id="record-retry" class="warning" disabled>실패 폐기 <span>↺</span></button><button id="record-stop" class="danger" disabled>전체 수집 종료</button></div>
+          </article>
+          <aside class="dataset-checks surface-card"><div class="section-head"><div><p>BEFORE RECORDING</p><h2>수집 체크</h2></div></div><ul><li><i></i> Scene/Wrist 역할 확인</li><li><i></i> 두 캘리브레이션 완료</li><li><i></i> Motion gate 활성화</li><li><i></i> 로컬 저장공간 확인</li></ul><p>카메라 프리뷰는 수집 시작 시 자동으로 종료됩니다.</p></aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="motion-dialog"><form method="dialog"><p class="eyebrow">MOTION AUTHORITY</p><h2 id="dialog-title">동작 시작 확인</h2><p id="dialog-copy">작업영역과 전원 차단 수단을 확인하세요.</p><label class="check-line"><input id="safety-check" type="checkbox"> 현장에서 사람·장애물·케이블과 전원 차단 위치를 확인했습니다.</label><label>확인 문구<input id="confirmation" autocomplete="off"></label><p id="action-result" class="error-text"></p><div class="dialog-actions"><button value="cancel" class="compact-button ghost">취소</button><button id="dialog-confirm" value="default" class="compact-button primary" disabled>확인</button></div></form></dialog>
+  <div id="focus-view" class="focus-view" aria-hidden="true"><header><div><small>LIVE CAMERA</small><h2 id="focus-title">Camera</h2></div><button id="focus-close">닫기</button></header><img id="focus-image" alt="Enlarged camera"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

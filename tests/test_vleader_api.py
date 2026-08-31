@@ -258,3 +258,96 @@ def next_of_type(socket, kind, limit=200):
         if message["type"] == kind:
             return message
     raise AssertionError(f"{kind} 메시지가 오지 않았습니다")
+
+
+# --------------------------------------------------------------- 수집으로 넘기기
+
+
+def test_the_relay_starts_from_where_the_arm_was_and_refuses_when_it_does_not_know(console):
+    """수집으로 넘어갈 때 팔이 튀지 않으려면 출발점을 알아야 한다.
+
+    `lerobot-record`가 팔로워 serial의 소유자가 되므로 콘솔은 장치를 놓는다. 놓기 직전의
+    자세를 들고 있지 않으면 중계할 첫 목표가 어디인지 아무도 모른다.
+    """
+    from soarm_console.vleader.backend import HardwareError
+
+    client, vleader = console
+    # 한 번도 읽은 적이 없으면 거절한다.
+    with pytest.raises(HardwareError):
+        vleader.start_relay()
+
+    start_and_arm(client)
+    for _ in range(100):
+        if client.get("/api/vleader").json()["observation"] > 2:
+            break
+        time.sleep(0.02)
+    before = {j["name"]: j["present"] for j in client.get("/api/vleader").json()["joints"]}
+
+    snapshot = vleader.start_relay()
+    assert snapshot["relay"] is True
+    assert snapshot["running"] is True
+    # 중계는 놓기 직전의 자세에서 출발한다.
+    after = {joint["name"]: joint["goal"] for joint in snapshot["joints"]}
+    assert after == pytest.approx(before, abs=0.001)
+
+    # 중계 중에는 토크가 우리 것이 아니다.
+    with pytest.raises(HardwareError):
+        vleader.owner.arm()
+
+    goal = client.get("/api/vleader/goal").json()
+    assert set(goal["joints"]) == set(CALIBRATION)
+    assert goal["state"] in {"READY", "HOLD"}
+
+
+def test_the_lerobot_teleoperator_reads_the_relay_and_refuses_when_there_is_none():
+    """`lerobot-record`가 쓰는 teleoperator. 콘솔이 중계하고 있지 않으면 붙지 않는다.
+
+    LeRobot의 `make_teleoperator_from_config`가 이 클래스를 찾아내는지까지 함께 본다 —
+    third-party teleoperator는 이름 규칙으로 해결되므로, 클래스나 모듈 이름을 바꾸면
+    조용히 못 찾게 된다.
+    """
+    import http.server
+    import threading
+
+    from lerobot.teleoperators.utils import make_teleoperator_from_config
+
+    from soarm_console.vleader.teleoperator import SOArmVirtualLeaderConfig
+
+    payload = {"joints": {name: 1.5 for name in CALIBRATION}, "stale": False, "state": "ACTIVE"}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server의 이름 규칙
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config = SOArmVirtualLeaderConfig(
+            id="test", host="127.0.0.1", port=server.server_address[1]
+        )
+        teleoperator = make_teleoperator_from_config(config)
+        # 이름 규칙으로 실제 클래스가 잡혔는가.
+        assert type(teleoperator).__name__ == "SOArmVirtualLeader"
+        teleoperator.connect()
+        assert teleoperator.is_connected
+        action = teleoperator.get_action()
+        assert set(action) == {f"{name}.pos" for name in CALIBRATION}
+        assert all(value == pytest.approx(1.5) for value in action.values())
+        # 목표가 낡았다고 알려 오면 마지막 값을 그대로 유지한다 — 절대 위치를 다시 쓰는
+        # 것은 "거기 서 있으라"는 뜻이고, 움직이라는 명령을 반복하는 것과 다르다.
+        payload["stale"] = True
+        payload["joints"] = {name: 40.0 for name in CALIBRATION}
+        held = teleoperator.get_action()
+        assert all(value == pytest.approx(1.5) for value in held.values())
+        teleoperator.disconnect()
+        assert not teleoperator.is_connected
+    finally:
+        server.shutdown()

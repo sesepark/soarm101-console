@@ -402,6 +402,9 @@ function applyTelemetry(message) {
 
 function paintState() {
   if (!telemetry) return;
+  // 루프가 돌지 않으면 우리가 그리는 자세는 실제 팔의 자세가 아니다. 그럴듯한 모델을
+  // 그대로 두면 화면이 "팔이 이 자세다"라고 거짓말을 한다.
+  document.body.classList.toggle('unknown-pose', telemetry.state === 'STOPPED');
   const fault = telemetry.fault;
   const banner = el('banner');
   if (fault) {

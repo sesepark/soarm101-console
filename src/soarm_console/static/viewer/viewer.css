@@ -175,3 +175,19 @@ dialog menu button.danger { border: 0; }
   body { grid-template-rows: 1fr; grid-template-columns: 1fr 340px; }
   #chrome { max-height: none; border-top: 0; border-left: 1px solid var(--line); }
 }
+
+/* 제어 루프가 돌지 않을 때. 3D는 실제 자세를 모르는 상태이므로 그렇게 보여야 한다. */
+body.unknown-pose #canvas { opacity: .35; filter: grayscale(.6); }
+body.unknown-pose #stage::after {
+  content: '관찰을 시작하면 실제 자세가 보입니다';
+  position: absolute;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(17,23,34,.92);
+  color: var(--muted);
+  font-size: 12px;
+  pointer-events: none;
+}

@@ -7,6 +7,7 @@ from soarm_console.app import (
     MotionRequest,
     RecordRequest,
     camera_stream,
+    mobile,
     start_recording,
     start_teleoperation,
     status,
@@ -42,6 +43,20 @@ def test_unknown_camera_is_rejected():
     with pytest.raises(HTTPException) as error:
         camera_stream("unknown")
     assert error.value.status_code == 404
+
+
+def test_mobile_view_is_observation_only_camera_ui():
+    response = mobile()
+    html = Path(response.path).read_text(encoding="utf-8")
+    static = Path(response.path).parent
+    javascript = (static / "mobile.js").read_text(encoding="utf-8")
+
+    assert "관찰 전용" in html
+    assert 'data-camera="scene"' in html
+    assert 'data-camera="wrist"' in html
+    assert "/api/cameras/${selectedCamera}.mjpg" in javascript
+    assert "/api/teleoperation" not in javascript
+    assert "method: 'POST'" not in javascript
 
 
 def test_ui_is_fixed_console_with_capsule_views_and_reference_design_tokens():

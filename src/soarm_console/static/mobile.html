@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#070b12">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SO-ARM101 Camera</title>
+  <link rel="stylesheet" href="/static/mobile.css">
+</head>
+<body>
+  <main class="mobile-viewer">
+    <header class="viewer-header">
+      <div class="brand-block">
+        <span class="brand-mark">S</span>
+        <div><strong>SO-ARM 101</strong><small>CAMERA VIEWER</small></div>
+      </div>
+      <div id="connection" class="connection waiting" role="status" aria-live="polite">
+        <i></i><span>연결 확인 중</span>
+      </div>
+    </header>
+
+    <section class="camera-stage" aria-label="로봇 카메라">
+      <img id="camera-image" alt="SO-ARM101 실시간 카메라" draggable="false">
+      <div id="camera-placeholder" class="camera-placeholder">
+        <div class="scanner"></div>
+        <strong id="placeholder-title">카메라 연결 중</strong>
+        <span id="placeholder-copy">첫 프레임을 기다리고 있습니다.</span>
+        <button id="retry" type="button" hidden>다시 연결</button>
+      </div>
+      <div class="read-only-badge"><i></i> 관찰 전용</div>
+      <div class="camera-label">
+        <span id="camera-number">CAM 01</span>
+        <strong id="camera-name">SCENE</strong>
+        <small id="camera-detail">640×480 · 연결 중</small>
+      </div>
+    </section>
+
+    <nav class="camera-switcher" aria-label="카메라 선택">
+      <button class="camera-choice active" type="button" data-camera="scene" aria-pressed="true">
+        <span>01</span><strong>Scene</strong><small>전체 작업공간</small>
+      </button>
+      <button class="camera-choice" type="button" data-camera="wrist" aria-pressed="false">
+        <span>02</span><strong>Wrist</strong><small>팔 끝 시점</small>
+      </button>
+    </nav>
+
+    <footer class="viewer-footer">
+      <p>영상만 표시합니다. 이 화면에서는 로봇을 움직일 수 없습니다.</p>
+      <a href="/">전체 콘솔</a>
+    </footer>
+  </main>
+  <script src="/static/mobile.js"></script>
+</body>
+</html>

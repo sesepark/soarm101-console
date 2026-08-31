@@ -4,13 +4,14 @@ from contextlib import asynccontextmanager, suppress
 from importlib.metadata import version
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .cameras import CameraWorker
+from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
+from .datasets import DatasetError, describe, list_datasets, playable_clip
 from .diagnostics import run_hardware_doctor
 from .record_manager import RecordManager
 from .teleop import TeleopError, TeleopManager
@@ -57,6 +58,30 @@ class RecordControlRequest(BaseModel):
     key: str
 
 
+class CameraSettingsRequest(BaseModel):
+    width: int
+    height: int
+    fps: int
+
+
+def camera_status(worker: CameraWorker) -> dict[str, object]:
+    """카메라 한 대의 지금 상태.
+
+    `requested`와 `actual`을 따로 내보내는 이유가 있다. 드라이버는 못 맞추는 해상도를
+    거절하는 대신 가까운 값으로 바꿔 열어 버리기 때문에, 고른 값만 보여 주면 화면이
+    실제와 다른 말을 하게 된다.
+    """
+    actual = worker.actual
+    return {
+        "active": worker.active,
+        "clients": worker.clients,
+        "error": worker.error,
+        "requested": worker.profile.as_dict(),
+        "actual": actual.as_dict() if actual else None,
+        "modes": worker.modes(),
+    }
+
+
 def device_status(path: str) -> dict[str, object]:
     device = Path(path)
     return {
@@ -101,10 +126,10 @@ def status() -> dict[str, object]:
             },
         },
         "software": {"lerobot": version("lerobot")},
-        "cameras": {
-            name: {"active": worker.active, "clients": worker.clients, "error": worker.error}
-            for name, worker in cameras.items()
-        },
+        "cameras": {name: camera_status(worker) for name, worker in cameras.items()},
+        # 수집은 프리뷰에서 무엇을 고르든 이 값으로 돌아간다. 화면이 그렇게 말할 수 있도록
+        # 값을 숨기지 않고 내보인다.
+        "recording_profile": RECORDING_PROFILE.as_dict(),
         "preflight": teleop.preflight(),
         "teleop_preflight": teleop.preflight(),
         "record_preflight": recorder.preflight(),
@@ -126,6 +151,37 @@ def camera_stream(name: str) -> StreamingResponse:
     )
 
 
+@app.post("/api/cameras/{name}/settings")
+def configure_camera(name: str, request: CameraSettingsRequest) -> dict[str, object]:
+    """프리뷰 화질과 프레임을 바꾼다. 수집 중에는 받지 않는다.
+
+    수집이 도는 동안 카메라를 쥐고 있는 것은 LeRobot 쪽이고, 그때의 설정은 고정이다.
+    여기서 바꿀 수 있게 두면 화면에는 새 값이 뜨는데 기록되는 데이터는 그대로인,
+    정확히 헷갈리기 좋은 상태가 된다.
+    """
+    worker = cameras.get(name)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    if recorder.running:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Recording fixes every camera at "
+                f"{RECORDING_PROFILE.width}x{RECORDING_PROFILE.height}@{RECORDING_PROFILE.fps}"
+            ),
+        )
+    profile = CameraProfile(width=request.width, height=request.height, fps=request.fps)
+    if profile.fps < 1 or profile.width < 1 or profile.height < 1:
+        raise HTTPException(status_code=400, detail="Camera settings must be positive")
+    if not worker.supports(profile):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Camera cannot do {profile.width}x{profile.height}@{profile.fps}",
+        )
+    worker.configure(profile)
+    return {"ok": True, "camera": name, **camera_status(worker)}
+
+
 @app.post("/api/cameras/{name}/stop")
 def stop_camera(name: str) -> dict[str, object]:
     worker = cameras.get(name)
@@ -133,6 +189,47 @@ def stop_camera(name: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="Unknown camera")
     worker.stop()
     return {"ok": True, "camera": name}
+
+
+@app.get("/api/datasets")
+def datasets() -> list[dict[str, object]]:
+    """Recorded datasets, newest metadata first read from disk.
+
+    Read-only, and deliberately served from here rather than read over SSH by a
+    client: the on-disk layout is LeRobot's, the episode metadata is parquet, and
+    the only process that should need to know either is the one that wrote it.
+    """
+    return list_datasets()
+
+
+@app.get("/api/datasets/{name}")
+def dataset(name: str) -> dict[str, object]:
+    try:
+        return describe(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{name}/video/{video_key}/{chunk_index}/{file_index}")
+def dataset_video(
+    name: str, video_key: str, chunk_index: int, file_index: int,
+    from_: float = Query(0.0, alias="from"), to: float = Query(0.0),
+) -> FileResponse:
+    """One episode, as something the caller can actually play.
+
+    Several episodes share a video file, so the range is part of the request. The
+    recording itself is AV1, which Apple Silicon cannot decode, so this hands back
+    an H.264 cut of just those seconds — the dataset on disk stays exactly what
+    LeRobot wrote."""
+    try:
+        path = playable_clip(name, video_key, chunk_index, file_index, from_, to)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="No such video file") from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path, media_type="video/mp4")
 
 
 @app.post("/api/doctor")

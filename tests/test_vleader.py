@@ -1,0 +1,377 @@
+"""가상 리더의 안전 사다리와 권한 상태기계.
+
+팔을 움직이지 않고 확인할 수 있는 것을 전부 여기서 확인한다. 백엔드는 흉내(`simulated`)이고,
+실물에서만 알 수 있는 것(접촉 문턱의 실제 값, 3D의 회전 방향)은 RUNBOOK의 현장 절차로
+남겨 두었다.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+
+import pytest
+
+from soarm_console.vleader.authority import AuthorityManager, LeaseConflict
+from soarm_console.vleader.backend import SimulatedFollower
+from soarm_console.vleader.owner import State, VirtualLeaderOwner
+from soarm_console.vleader.safety import (
+    CommandValidator,
+    Reject,
+    RejectError,
+    Trip,
+    TripDetector,
+    VLeaderSettings,
+)
+from soarm_console.vleader.spec import JointSpec, SpecError, load_joint_specs
+
+
+CALIBRATION = {
+    "shoulder_pan": {"id": 1, "drive_mode": 0, "homing_offset": -101, "range_min": 758, "range_max": 3447},
+    "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": -1980, "range_min": 1360, "range_max": 3746},
+    "elbow_flex": {"id": 3, "drive_mode": 0, "homing_offset": -645, "range_min": 996, "range_max": 3200},
+    "wrist_flex": {"id": 4, "drive_mode": 0, "homing_offset": 773, "range_min": 577, "range_max": 2913},
+    "wrist_roll": {"id": 5, "drive_mode": 0, "homing_offset": -141, "range_min": 0, "range_max": 4095},
+    "gripper": {"id": 6, "drive_mode": 0, "homing_offset": -472, "range_min": 1656, "range_max": 3100},
+}
+
+
+@pytest.fixture
+def calibration_file(tmp_path):
+    path = tmp_path / "soarm101_follower.json"
+    path.write_text(json.dumps(CALIBRATION), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def specs(calibration_file):
+    return load_joint_specs(calibration_file)
+
+
+@pytest.fixture
+def settings():
+    return VLeaderSettings()
+
+
+# --------------------------------------------------------------- 관절 계약
+
+
+def test_absolute_limits_come_from_calibration_not_from_a_guess(specs):
+    """추정값을 절대 한계로 쓰지 않는다(SAFETY.md 불변조건 4).
+
+    LeRobot의 도 단위 정규화는 `(raw - mid) * 360 / 4095`이므로 범위는 0을 가운데 둔
+    대칭 구간이다. 집게만 0~100 퍼센트인데, `SOFollower`가 집게에만
+    `MotorNormMode.RANGE_0_100`을 하드코딩해 두었기 때문이다.
+    """
+    by_name = {spec.name: spec for spec in specs}
+    span = lambda motor: (CALIBRATION[motor]["range_max"] - CALIBRATION[motor]["range_min"]) / 2 * 360 / 4095
+    for motor in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"):
+        assert by_name[motor].unit == "deg"
+        assert by_name[motor].maximum == pytest.approx(span(motor))
+        assert by_name[motor].minimum == pytest.approx(-span(motor))
+    assert by_name["gripper"].unit == "percent"
+    assert (by_name["gripper"].minimum, by_name["gripper"].maximum) == (0.0, 100.0)
+
+
+def test_calibration_that_does_not_describe_this_arm_is_refused(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"shoulder_pan": CALIBRATION["shoulder_pan"]}), encoding="utf-8")
+    with pytest.raises(SpecError):
+        load_joint_specs(path)
+
+
+def test_viewer_conversion_is_defined_by_the_server(specs):
+    """3D의 각도 변환식은 서버가 준다. 클라이언트마다 다시 쓰면 두 기기가 어긋난다."""
+    by_name = {spec.name: spec for spec in specs}
+    assert by_name["shoulder_pan"].to_radians(90) == pytest.approx(1.5707963, abs=1e-6)
+    # 집게는 퍼센트다. 100%가 URDF의 열린 자세(1.74533 rad)에 대응한다.
+    assert by_name["gripper"].to_radians(100) == pytest.approx(1.74533, abs=1e-5)
+
+
+# --------------------------------------------------------------- 명령 검사
+
+
+@pytest.mark.parametrize(
+    "payload, code",
+    [
+        ("not a dict", Reject.INVALID_SHAPE),
+        ({}, Reject.INVALID_SHAPE),
+        ({"elbow_flex": "1"}, Reject.INVALID_SHAPE),
+        ({"elbow_flex": True}, Reject.INVALID_SHAPE),
+        ({"no_such_joint": 1.0}, Reject.INVALID_SHAPE),
+        ({"elbow_flex": float("nan")}, Reject.NON_FINITE_VALUE),
+        ({"elbow_flex": float("inf")}, Reject.NON_FINITE_VALUE),
+        ({"elbow_flex": 400.0}, Reject.OUTSIDE_ABSOLUTE_LIMIT),
+        ({"gripper": -1.0}, Reject.OUTSIDE_ABSOLUTE_LIMIT),
+        ({"gripper": 101.0}, Reject.OUTSIDE_ABSOLUTE_LIMIT),
+    ],
+)
+def test_the_validator_refuses_by_reason(specs, settings, payload, code):
+    validator = CommandValidator(specs, settings)
+    present = {spec.name: 0.0 for spec in specs}
+    with pytest.raises(RejectError) as error:
+        validator.validate(payload, present=present, needs_sync=False)
+    assert error.value.code == code
+
+
+def test_the_first_command_after_a_lease_must_start_from_where_the_arm_is(specs, settings):
+    """이것이 없으면 리스를 잡는 순간 팔이 가상 리더의 기본 자세로 튄다."""
+    validator = CommandValidator(specs, settings)
+    present = {spec.name: 0.0 for spec in specs}
+    with pytest.raises(RejectError) as error:
+        validator.validate({"elbow_flex": 45.0}, present=present, needs_sync=True)
+    assert error.value.code == Reject.POSE_NOT_SYNCED
+    # 현재 자세 근처면 통과한다.
+    assert validator.validate({"elbow_flex": 3.0}, present=present, needs_sync=True)
+
+
+def test_step_limit_clamps_instead_of_refusing(specs, settings):
+    """빠르게 끌면 목표는 늘 멀리 있다. 그때마다 거절하면 조작 자체가 되지 않는다."""
+    validator = CommandValidator(specs, settings)
+    present = {spec.name: 0.0 for spec in specs}
+    goal, limited = validator.clamp_step({"elbow_flex": 90.0}, present)
+    assert goal["elbow_flex"] == pytest.approx(settings.step_deg)
+    assert limited == ["elbow_flex"]
+
+
+def test_sending_faster_does_not_move_the_arm_faster(specs, settings):
+    """상한이 '명령당'이면 초당 300번 보내는 클라이언트가 초당 600도를 움직인다."""
+    validator = CommandValidator(specs, settings)
+    present = {spec.name: 0.0 for spec in specs}
+    tenth_of_a_tick = 0.1
+    goal, _ = validator.clamp_step({"elbow_flex": 90.0}, present, scale=tenth_of_a_tick)
+    assert goal["elbow_flex"] == pytest.approx(settings.step_deg * tenth_of_a_tick)
+
+
+# --------------------------------------------------------------- 권한
+
+
+def test_only_one_follower_motion_lease_at_a_time(settings):
+    authority = AuthorityManager(settings)
+    mac = authority.grant("맥북", "session-mac")
+    with pytest.raises(LeaseConflict) as conflict:
+        authority.grant("아이폰", "session-phone")
+    assert conflict.value.holder == "맥북"
+    # 반납하면 다음 사람이 받는다. 빼앗기는 없다.
+    assert authority.release(mac.lease_id)
+    assert authority.grant("아이폰", "session-phone").holder == "아이폰"
+
+
+def test_a_lease_expires_without_a_heartbeat(settings):
+    authority = AuthorityManager(settings)
+    now = time.monotonic()
+    lease = authority.grant("맥북", "s", now=now)
+    ttl = settings.lease_ttl_ms / 1000.0
+    assert authority.active(now + ttl - 0.1) is not None
+    assert authority.active(now + ttl + 0.1) is None
+    # 만료된 뒤에는 그 lease_id로 아무것도 못 한다.
+    with pytest.raises(RejectError) as error:
+        authority.authorise(lease.lease_id, 1, now=now + ttl + 0.2)
+    assert error.value.code == Reject.NO_ACTIVE_LEASE
+
+
+def test_a_heartbeat_extends_the_lease(settings):
+    authority = AuthorityManager(settings)
+    now = time.monotonic()
+    lease = authority.grant("맥북", "s", now=now)
+    ttl = settings.lease_ttl_ms / 1000.0
+    authority.renew(lease.lease_id, now=now + ttl - 0.5)
+    assert authority.active(now + ttl + 0.2) is not None
+
+
+def test_commands_from_the_wrong_holder_and_replayed_sequences_are_refused(settings):
+    authority = AuthorityManager(settings)
+    lease = authority.grant("맥북", "s")
+    authority.authorise(lease.lease_id, 5)
+    with pytest.raises(RejectError) as duplicate:
+        authority.authorise(lease.lease_id, 5)
+    assert duplicate.value.code == Reject.DUPLICATE_SEQUENCE
+    with pytest.raises(RejectError) as older:
+        authority.authorise(lease.lease_id, 3)
+    assert older.value.code == Reject.DUPLICATE_SEQUENCE
+    with pytest.raises(RejectError) as wrong:
+        authority.authorise("someone-elses-lease", 6)
+    assert wrong.value.code == Reject.WRONG_AUTHORITY
+
+
+# --------------------------------------------------------------- 관측이 거는 정지
+
+
+def test_a_single_spike_does_not_stop_the_arm(specs, settings):
+    """한 번 튄 값에 팔이 서면, 진짜로 막혔을 때 사람이 그 경고를 믿지 않게 된다."""
+    detector = TripDetector(specs, settings)
+    high = {"elbow_flex": settings.load_trip + 50}
+    quiet = {name: 0.0 for name in high}
+    now = time.monotonic()
+    assert detector.inspect(now=now, present={}, goal={}, load=high, current={}, temperature={}) is None
+    assert detector.inspect(now=now + 0.05, present={}, goal={}, load=quiet, current={}, temperature={}) is None
+    # 다시 올라가도 창은 처음부터 다시 센다.
+    assert detector.inspect(now=now + 0.1, present={}, goal={}, load=high, current={}, temperature={}) is None
+
+
+def test_a_sustained_load_trips(specs, settings):
+    detector = TripDetector(specs, settings)
+    high = {"elbow_flex": settings.load_trip + 50}
+    now = time.monotonic()
+    detector.inspect(now=now, present={}, goal={}, load=high, current={}, temperature={})
+    trip = detector.inspect(
+        now=now + settings.load_trip_ms / 1000.0 + 0.01,
+        present={}, goal={}, load=high, current={}, temperature={},
+    )
+    assert trip is not None and trip[0] == Trip.OVERLOAD and trip[1] == "elbow_flex"
+
+
+def test_a_joint_that_stops_following_its_goal_trips(specs, settings):
+    detector = TripDetector(specs, settings)
+    present = {"elbow_flex": 10.0}
+    goal = {"elbow_flex": 10.0 + settings.following_error_deg + 1}
+    now = time.monotonic()
+    detector.inspect(now=now, present=present, goal=goal, load={}, current={}, temperature={})
+    trip = detector.inspect(
+        now=now + settings.following_error_ms / 1000.0 + 0.01,
+        present=present, goal=goal, load={}, current={}, temperature={},
+    )
+    assert trip is not None and trip[0] == Trip.FOLLOWING_ERROR
+
+
+def test_temperature_stops_before_the_servo_cuts_its_own_torque(specs, settings):
+    """STS3215는 70°C에서 스스로 토크를 끊는다 — 그러면 팔이 떨어진다."""
+    detector = TripDetector(specs, settings)
+    assert settings.temperature_trip_c < 70
+    trip = detector.inspect(
+        now=time.monotonic(), present={}, goal={}, load={}, current={},
+        temperature={"wrist_flex": settings.temperature_trip_c},
+    )
+    assert trip is not None and trip[0] == Trip.OVER_TEMPERATURE
+
+
+# --------------------------------------------------------------- 제어 루프
+
+
+@pytest.fixture
+def owner(specs, settings, monkeypatch):
+    monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
+    authority = AuthorityManager(settings)
+    instance = VirtualLeaderOwner(
+        specs=specs, settings=settings, port="/dev/null", robot_id="test", authority=authority
+    )
+    instance.start()
+    yield instance
+    instance.stop(force=True)
+
+
+def wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def drive(owner, lease, joints, sequence):
+    return owner.submit(
+        payload=joints, lease_id=lease.lease_id, sequence=sequence, valid_for_ms=300, observation=None
+    )
+
+
+def test_the_loop_starts_observing_with_torque_off(owner):
+    assert wait_for(lambda: owner.snapshot()["observation"] > 2)
+    snapshot = owner.snapshot()
+    assert snapshot["state"] == State.SAFE
+    assert snapshot["torque_enabled"] is False
+
+
+def test_a_goal_is_refused_until_torque_is_on(owner):
+    lease = owner.authority.grant("테스트", "s")
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    with pytest.raises(RejectError) as error:
+        drive(owner, lease, {"elbow_flex": 0.0}, 1)
+    assert error.value.code == Reject.HARDWARE_NOT_READY
+
+
+def test_silence_puts_the_arm_on_hold_rather_than_repeating_the_last_command(owner):
+    """SAFETY.md 불변조건 6 — 유효기간 없는 마지막 명령을 무기한 반복하지 않는다."""
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    lease = owner.authority.grant("테스트", "s")
+    drive(owner, lease, {"elbow_flex": 1.0}, 1)
+    assert owner.snapshot()["state"] == State.ACTIVE
+    assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=2.0)
+    assert owner.snapshot()["fault"]["code"] == Trip.COMMAND_TIMEOUT
+
+
+def test_hold_needs_a_person_before_it_accepts_motion_again(owner):
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    lease = owner.authority.grant("테스트", "s")
+    drive(owner, lease, {"elbow_flex": 1.0}, 1)
+    owner.hold()
+    with pytest.raises(RejectError) as error:
+        drive(owner, lease, {"elbow_flex": 1.2}, 2)
+    assert error.value.code == Reject.NOT_ACCEPTING_MOTION
+    owner.resume()
+    # 다시 시작할 때는 현재 자세에서 출발해야 한다(불변조건 7).
+    present = {joint["name"]: joint["present"] for joint in owner.snapshot()["joints"]}
+    with pytest.raises(RejectError) as far:
+        drive(owner, lease, {"elbow_flex": present["elbow_flex"] + 60}, 3)
+    assert far.value.code == Reject.POSE_NOT_SYNCED
+    assert drive(owner, lease, {"elbow_flex": present["elbow_flex"]}, 4)
+
+
+def test_losing_the_lease_holds_the_arm_where_it_is(owner):
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    lease = owner.authority.grant("테스트", "s")
+    drive(owner, lease, {"elbow_flex": 1.0}, 1)
+    owner.authority.release(lease.lease_id)
+    assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=2.0)
+    assert owner.snapshot()["torque_enabled"] is True  # 떨어뜨리지 않는다
+
+
+def test_the_loop_never_turns_torque_off_by_itself(owner):
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    owner.hold(Trip.HARDWARE_ERROR, None, "흉내 낸 고장")
+    assert owner.snapshot()["torque_enabled"] is True
+    # 내리는 것도 막는다. 토크가 걸린 채로 조용히 사라지면 팔을 붙잡을 것이 없어진다.
+    with pytest.raises(Exception):
+        owner.stop()
+
+
+def test_a_blocked_joint_backs_off_and_then_holds(specs, settings, monkeypatch):
+    """책상에 닿았을 때. 물러난 뒤 서고, 어느 관절이 왜 걸렸는지 남는다."""
+    monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
+    monkeypatch.setenv("SOARM_VL_SIM_OBSTACLE", "elbow_flex:5")
+    authority = AuthorityManager(settings)
+    owner = VirtualLeaderOwner(
+        specs=specs, settings=settings, port="/dev/null", robot_id="test", authority=authority
+    )
+    owner.start()
+    try:
+        wait_for(lambda: owner.snapshot()["observation"] > 2)
+        owner.arm()
+        lease = authority.grant("테스트", "s")
+        sequence = 0
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            if owner.state in (State.HOLD, State.RETREATING):
+                break
+            sequence += 1
+            # 조작하는 사람이 하는 것과 같은 모양으로 민다. 현재 자세에서 조금씩 —
+            # 리스를 잡은 직후 멀리 있는 목표는 자세 미동기로 거절되는 것이 맞다.
+            present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+            try:
+                drive(owner, lease, {"elbow_flex": present["elbow_flex"] + 3.0}, sequence)
+            except RejectError:
+                break
+            time.sleep(0.03)
+        assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=3.0)
+        fault = owner.snapshot()["fault"]
+        assert fault["joint"] == "elbow_flex"
+        assert fault["code"] in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR)
+        present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+        # 걸린 자리보다 뒤로 물러나 있어야 한다.
+        assert present["elbow_flex"] < 5.0
+    finally:
+        owner.stop(force=True)

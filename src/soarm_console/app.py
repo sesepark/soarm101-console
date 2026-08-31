@@ -15,6 +15,8 @@ from .datasets import DatasetError, describe, list_datasets, playable_clip
 from .diagnostics import run_hardware_doctor
 from .record_manager import RecordManager
 from .teleop import TeleopError, TeleopManager
+from .vleader.api import VirtualLeader, build_router
+from .vleader.backend import HardwareError
 
 
 settings = Settings()
@@ -24,6 +26,7 @@ cameras = {
     "scene": CameraWorker(settings.scene_camera),
     "wrist": CameraWorker(settings.wrist_camera),
 }
+vleader = VirtualLeader(settings)
 last_doctor: dict[str, object] | None = None
 static_dir = Path(__file__).with_name("static")
 
@@ -33,6 +36,11 @@ async def lifespan(_: FastAPI):
     yield
     for worker in cameras.values():
         worker.stop()
+    # 가상 리더가 팔로워 serial을 쥐고 있으면 여기서 놓는다. `force=True`인 이유는
+    # 프로세스가 내려가는 자리라 사람에게 물어볼 수 없기 때문이다 — 토크는 그대로 두고
+    # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
+    with suppress(Exception):
+        vleader.stop(force=True)
     with suppress(TeleopError):
         recorder.stop()
     with suppress(TeleopError):
@@ -41,6 +49,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="SO-ARM101 Console", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+# 3D 뷰어는 한 번만 만들고 서버가 서빙한다. 맥 앱이 `WKWebView`로 품는 화면과 폰의
+# 조작 화면이 같은 파일을 쓴다 — 구현이 둘이면 두 기기의 동작이 반드시 어긋난다.
+app.mount("/viewer", StaticFiles(directory=static_dir / "viewer", html=True), name="viewer")
+app.include_router(build_router(vleader))
 
 
 class MotionRequest(BaseModel):
@@ -52,6 +64,8 @@ class RecordRequest(BaseModel):
     task: str
     episodes: int = 10
     episode_seconds: int = 30
+    #: `leader`는 물리 리더 팔, `virtual`은 3D 뷰어로 만드는 가상 리더.
+    teleop: str = "leader"
 
 
 class RecordControlRequest(BaseModel):
@@ -135,6 +149,7 @@ def status() -> dict[str, object]:
         "record_preflight": recorder.preflight(),
         "teleoperation": teleop.status(),
         "recording": recorder.status(),
+        "virtual_leader": vleader.status(),
         "doctor": last_doctor,
     }
 
@@ -235,7 +250,7 @@ def dataset_video(
 @app.post("/api/doctor")
 def doctor() -> dict[str, object]:
     global last_doctor
-    if teleop.running or recorder.running:
+    if teleop.running or recorder.running or vleader.running:
         raise HTTPException(status_code=409, detail="Cannot inspect serial buses during an active mode")
     last_doctor = run_hardware_doctor(settings)
     return last_doctor
@@ -248,6 +263,11 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if recorder.running:
         raise HTTPException(status_code=409, detail="Stop recording before teleoperation")
+    if vleader.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the virtual leader before physical-leader teleoperation: the follower has one owner",
+        )
     last_doctor = run_hardware_doctor(settings)
     if not last_doctor["safe_for_motion_start"]:
         raise HTTPException(
@@ -277,14 +297,34 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if teleop.running:
         raise HTTPException(status_code=409, detail="Stop teleoperation before recording")
-    last_doctor = run_hardware_doctor(settings)
-    if not last_doctor["safe_for_motion_start"]:
-        raise HTTPException(status_code=409, detail="Hardware doctor did not pass")
+    if request.teleop not in {"leader", "virtual"}:
+        raise HTTPException(status_code=400, detail="teleop must be 'leader' or 'virtual'")
+    if request.teleop == "leader":
+        if vleader.running:
+            raise HTTPException(
+                status_code=409, detail="Stop the virtual leader before recording with the physical leader"
+            )
+        last_doctor = run_hardware_doctor(settings)
+        if not last_doctor["safe_for_motion_start"]:
+            raise HTTPException(status_code=409, detail="Hardware doctor did not pass")
+    else:
+        # 가상 리더로 찍는다. 팔로워 serial의 소유자는 이제 record 프로세스이므로
+        # 콘솔은 장치를 놓고 목표만 중계한다. 진단은 돌리지 않는다 — 그 진단도 serial을
+        # 여는 일이고, 가상 리더가 이미 열어 두고 읽고 있었다.
+        try:
+            vleader.start_relay()
+        except HardwareError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     for worker in cameras.values():
         worker.stop()
     try:
-        recorder.start(request.task, request.episodes, request.episode_seconds)
+        recorder.start(
+            request.task, request.episodes, request.episode_seconds, teleop_source=request.teleop
+        )
     except TeleopError as exc:
+        if request.teleop == "virtual":
+            with suppress(Exception):
+                vleader.stop(force=True)
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return recorder.status()
 
@@ -307,4 +347,12 @@ def stop_active_mode() -> dict[str, object]:
             teleop.stop()
     except TeleopError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"teleoperation": teleop.status(), "recording": recorder.status()}
+    # 가상 리더는 여기서 **멈추기만** 한다. 내리지 않는 이유는 토크가 걸려 있을 수 있고,
+    # 그때 루프를 세우면 팔을 붙잡아 줄 것이 사라지기 때문이다. 자세를 유지한 채 선다.
+    if vleader.owner is not None:
+        vleader.owner.hold()
+    return {
+        "teleoperation": teleop.status(),
+        "recording": recorder.status(),
+        "virtual_leader": vleader.status(),
+    }

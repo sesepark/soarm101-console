@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#070b12">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SO-ARM101 가상 리더</title>
+  <link rel="stylesheet" href="/static/viewer/viewer.css">
+  <link rel="icon" href="data:,">
+  <!-- three.js의 예제 모듈(OrbitControls·STLLoader)이 `three`를 그대로 import한다.
+       CDN을 쓰지 않고 서버가 직접 서빙하므로, 그 이름이 어디를 가리키는지 여기서 정한다. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/viewer/vendor/three.module.min.js",
+      "three/": "/static/viewer/vendor/"
+    }
+  }
+  </script>
+</head>
+<body class="loading">
+  <!-- 3D는 언제나 있다. 주변 UI는 host에 따라 붙었다 떨어진다: 폰은 이 페이지의 것을
+       쓰고, 맥은 네이티브 SwiftUI가 같은 자리를 맡는다. 3D 구현은 하나뿐이다. -->
+  <main id="stage">
+    <canvas id="canvas"></canvas>
+
+    <div id="boot" class="overlay">
+      <div class="spinner"></div>
+      <strong>3D 모델을 여는 중</strong>
+      <small id="boot-detail">URDF와 메시를 받고 있습니다</small>
+    </div>
+
+    <div id="banner" class="banner" hidden>
+      <strong id="banner-title">멈췄습니다</strong>
+      <span id="banner-detail"></span>
+      <button id="banner-resume" type="button" hidden>확인하고 계속</button>
+    </div>
+
+    <div id="grabbed" class="grabbed" hidden></div>
+  </main>
+
+  <aside id="chrome">
+    <header class="bar">
+      <div class="brand">
+        <span class="mark">S</span>
+        <div><strong>SO-ARM 101</strong><small id="state-line">연결 확인 중</small></div>
+      </div>
+      <button id="hold" class="danger" type="button">정지</button>
+    </header>
+
+    <section class="cameras" aria-label="카메라">
+      <figure class="camera" data-camera="scene">
+        <img alt="작업공간 카메라">
+        <figcaption>SCENE · 작업공간</figcaption>
+      </figure>
+      <figure class="camera" data-camera="wrist">
+        <img alt="손목 카메라">
+        <figcaption>WRIST · 손목</figcaption>
+      </figure>
+    </section>
+
+    <section id="joints" class="joints" aria-label="관절"></section>
+
+    <section id="authority" class="authority">
+      <div id="lease-idle">
+        <p id="authority-copy">조작하려면 권한을 받아야 합니다. 받기 전까지는 보기만 합니다.</p>
+        <label>조작 토큰
+          <input id="token" type="password" autocomplete="off" placeholder="서버의 SOARM_MOTION_TOKEN">
+        </label>
+        <label id="confirm-row">아래 문구를 손으로 옮겨 적으세요
+          <code>MOVE SOARM101</code>
+          <input id="confirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="">
+        </label>
+        <button id="take" type="button" disabled>조작 권한 받기</button>
+      </div>
+      <div id="lease-held" hidden>
+        <p><strong id="lease-holder">이 기기</strong>가 조작 중입니다. 화면에서 손을 떼면 팔은 그 자리에 섭니다.</p>
+        <button id="give-back" type="button">권한 반납</button>
+        <button id="release-torque" type="button" class="ghost">토크 해제…</button>
+      </div>
+    </section>
+
+    <footer class="note">
+      <p>안전 판정은 전부 서버가 합니다. 이 화면의 한계 표시는 보여 주기 위한 사본입니다.</p>
+      <p><a href="/mobile">카메라만 보기</a> · <a href="/">전체 콘솔</a></p>
+    </footer>
+  </aside>
+
+  <dialog id="torque-dialog">
+    <form method="dialog">
+      <h2>토크를 풀면 팔이 떨어집니다</h2>
+      <p>팔을 손으로 받치고 있는 사람이 있을 때만 하세요. 푸는 순간 팔은 자기 자세를 버티지 못합니다.</p>
+      <label>확인 문구 — <code>RELEASE TORQUE SOARM101</code>
+        <input id="release-confirm" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <menu>
+        <button value="cancel" type="submit">취소</button>
+        <button id="release-go" value="release" type="submit" class="danger" disabled>토크 해제</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script type="module" src="/static/viewer/viewer.js"></script>
+</body>
+</html>

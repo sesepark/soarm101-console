@@ -8,7 +8,17 @@
 
 ## 현재 보장 수준
 
-이 문서의 lease, heartbeat, watchdog, owner lock, HOLD 동작은 목표 설계다. 아직 구현·fault injection·실제 motion 검증이 끝나지 않았다.
+**가상 리더 경로(2026-09-01)**: lease, heartbeat, watchdog, HOLD, 절대 관절 한계, 틱당
+변화량, 자세 동기화, 부하·전류·추종오차·온도 트립이 구현되어 있고 fault injection을 포함한
+42개 시험을 통과한다. 문턱값과 근거, 그리고 **아직 실측하지 못한 것**은 맥 앱 저장소의
+`docs/원격_텔레옵_안전.md`에 정직하게 적혀 있다. 실제 motion 검증은 아직 하지 않았다 —
+접촉 문턱값은 데이터시트와 LeRobot 기본값에서 유추한 값이다.
+
+**기존 물리 리더 텔레옵 경로**: lease도 watchdog도 없다. `lerobot-teleoperate` 서브프로세스
+하나이고, 보호 장치는 LeRobot의 `max_relative_target`과 사람의 손뿐이다.
+
+owner lock 파일은 어느 경로에도 없다. 상호배타는 프로세스 상태 검사와 409로 한다.
+독립 actuator power cutoff와 물리 E-stop은 여전히 없다.
 
 - 문서에 적혀 있다는 이유만으로 현재 동작한다고 가정하지 않는다.
 - 구현된 기능과 제안 단계 기능을 run 시작 전에 구분한다.

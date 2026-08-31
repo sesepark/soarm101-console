@@ -1,6 +1,12 @@
 # Observation and Action Protocol
 
-> 구현 상태: 이 문서는 protocol 계약 초안이다. 현재 command lease, heartbeat, replay protection, owner lock이 실행 중이라는 의미가 아니다. 구현과 fault test가 완료되기 전에는 안전장치로 의존하지 않는다.
+> 구현 상태 (2026-09-01): command lease, heartbeat, replay protection(session/sequence),
+> command TTL, observation age는 **가상 리더 경로에서 구현되어 돌고 있다**
+> (`src/soarm_console/vleader/`). 구체적인 wire 형식 — REST 엔드포인트, WebSocket 메시지,
+> 단위, 추가된 거절 코드 — 는 맥 앱 저장소의 `docs/원격_텔레옵_프로토콜.md`에 한 벌로 적혀
+> 있고, 맥·폰·서버 세 구현이 그것을 읽는다.
+>
+> owner lock 파일은 여전히 없다. 상호배타는 프로세스 상태 검사와 409로 하고 있다.
 
 ## 목적
 

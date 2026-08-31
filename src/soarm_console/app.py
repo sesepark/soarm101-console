@@ -71,6 +71,13 @@ def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
 
 
+@app.get("/mobile", include_in_schema=False)
+@app.get("/mobile/", include_in_schema=False)
+def mobile() -> FileResponse:
+    """Phone-first, observation-only camera viewer."""
+    return FileResponse(static_dir / "mobile.html")
+
+
 @app.get("/api/status")
 def status() -> dict[str, object]:
     return {

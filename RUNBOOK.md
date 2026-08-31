@@ -194,3 +194,53 @@ SOARM_VL_BACKEND=simulated SOARM_VL_SIM_OBSTACLE=elbow_flex:12 \
 
 흉내 백엔드는 serial을 열지 않는다. `SOARM_VL_SIM_OBSTACLE`로 지정한 각도에서 관절이 막혀
 접촉 트립과 물러남을 팔 없이 걸어 볼 수 있다.
+
+### 6.7 접촉 문턱 실측
+
+`scripts/measure_contact.py`가 관절별 `Present_Load`/`Present_Current`/`Present_Temperature`를
+10Hz로 찍어 백분위수를 낸다. 이 스크립트는 **스스로 토크를 걸지 않는다** — 이미 걸려 있는
+상태를 읽기만 한다.
+
+```bash
+sg dialout -c ".venv/bin/python scripts/measure_contact.py quiescent --seconds 25"
+```
+
+네 단계가 있고, 뒤의 둘은 토크를 요구하므로 **사람이 현장에 있을 때만** 한다.
+
+| 단계 | 무엇을 재는가 | 사람 필요 |
+|---|---|---|
+| `quiescent` | 토크 끄고 가만히. 바닥값 | 아니오 |
+| `handled` | 토크 끄고 사람이 팔을 손으로 움직이는 동안 | 예 |
+| `holding` | 토크 걸고 자세를 유지하는 동안. 중력을 버티는 부하 | 예 |
+| `contact` | 토크 걸고 사람이 팔을 무언가에 대고 미는 동안 | 예 |
+
+**문턱은 `holding`의 최대값과 `contact`의 최소값 사이에 있어야 한다.** `holding`보다 낮으면
+가만히 있어도 걸리고, `contact`보다 높으면 닿아도 안 걸린다.
+
+가상 리더가 팔로워 serial을 쥐고 있으면 이 스크립트는 열지 못한다(소유자는 하나다).
+`holding`/`contact`를 재려면 토크를 건 뒤 `POST /api/vleader/stop?force=true`로 콘솔의 루프만
+내린다 — 토크는 그대로 남는다.
+
+#### 잰 값
+
+`quiescent` (2026-09-01, 25초, 10Hz, 토크 꺼짐, 팔 정지):
+
+```
+관절                 부하 p50    p95    max   전류 p50    p95    max  (mA max)   온도 max
+shoulder_pan            0      0      0        0      0      1         6       36
+shoulder_lift           0      0      0        0      0      0         0       36
+elbow_flex              0      0      0        0      0      1         6       34
+wrist_flex              0      0      0        0      0      0         0       36
+wrist_roll              0      0      0        0      0      1         6       41
+gripper                 0      0      0        0      0      0         0       48
+```
+
+읽는 법: 쉬는 중의 부하와 전류는 **0이다.** 지금 문턱(부하 400, 전류 108)은 그보다 한참
+위이므로, 가만히 있는 팔이 이유 없이 서는 일은 없다. 아직 모르는 것은 반대쪽 — 실제로
+닿았을 때 어떤 숫자가 나오는지다. `holding`과 `contact`를 재기 전까지 400과 108은 여전히
+유추값이다.
+
+온도는 다르다. **집게가 쉬는 중에도 48°C**로 다른 관절보다 12°C 이상 높다. 경고 문턱을
+처음 55°C로 잡았더니 집게는 평소에도 경고에 가까웠고, 그런 경고는 진짜로 뜨거워졌을 때
+아무도 믿지 않게 만든다. 그래서 58°C로 올렸다(정지 65°C, 서보 자체 차단 70°C는 그대로).
+`holding`을 재고 나면 이 값도 다시 봐야 한다.

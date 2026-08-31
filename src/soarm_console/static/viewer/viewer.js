@@ -518,11 +518,15 @@ el('take').addEventListener('click', async () => {
   el('take').disabled = true;
   try {
     localStorage.setItem('soarm-motion-token', el('token').value.trim());
+    const phrase = el('confirm').value.trim();
     if (!telemetry?.running) await post('/api/vleader/start');
     if (!telemetry?.torque_enabled) {
-      await post('/api/vleader/arm', { confirmation: el('confirm').value.trim() });
+      await post('/api/vleader/arm', { confirmation: phrase });
     }
-    lease = await post('/api/vleader/lease', { holder: HOLDER, session_id: SESSION });
+    // 리스에도 같은 문구가 붙는다. 토크가 이미 걸려 있으면 위 줄을 지나치기 때문이다.
+    lease = await post('/api/vleader/lease', {
+      confirmation: phrase, holder: HOLDER, session_id: SESSION,
+    });
     // 확인 문구는 한 번 쓰고 지운다. 다음 사람이 그대로 눌러 시작하지 못하게 한다.
     el('confirm').value = '';
     target = { ...present };
@@ -590,7 +594,11 @@ function startCameras() {
   for (const figure of document.querySelectorAll('.camera')) {
     const image = figure.querySelector('img');
     image.src = `/api/cameras/${figure.dataset.camera}.mjpg?v=${Date.now()}`;
+    image.addEventListener('load', () => image.classList.remove('down'));
     image.addEventListener('error', () => {
+      // 깨진 이미지 아이콘을 남겨 두지 않는다. 카메라가 없는 것과 화면이 고장 난 것은
+      // 다른 일인데, 그 아이콘은 둘을 같아 보이게 한다.
+      image.classList.add('down');
       setTimeout(() => {
         image.src = `/api/cameras/${figure.dataset.camera}.mjpg?v=${Date.now()}`;
       }, 3000);

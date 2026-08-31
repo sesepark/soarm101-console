@@ -322,6 +322,14 @@ class VirtualLeaderOwner:
         with self._lock:
             if self._state in (State.STOPPED,):
                 return
+            # 이미 서 있으면 이유를 덮어쓰지 않는다.
+            #
+            # 팔을 세운 것은 **처음 이유**다. 그 뒤에 리스가 반납되거나 누가 정지를 한 번
+            # 더 눌렀다고 그것으로 바뀌면, 화면에는 마지막으로 일어난 일이 뜨고 정작 팔을
+            # 세운 이유는 사라진다. 접촉으로 멈춘 팔에 "조작 권한을 반납했습니다"라고
+            # 적혀 있는 것을 시험에서 보았다.
+            if self._state in (State.HOLD, State.FAULT) and self._fault is not None:
+                return
             self._enter_hold(reason, joint, message or TRIP_KOREAN.get(reason, reason))
 
     def resume(self) -> None:

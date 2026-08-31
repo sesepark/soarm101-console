@@ -143,8 +143,12 @@ class VLeaderSettings:
     following_error_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 400)
     )
+    #: 실측(2026-09-01, 토크 끄고 25초): 팔 관절은 34~36°C, **집게는 48°C**였다. 움직이지
+    #: 않고 쉬는 중에도 그렇다. 처음에 55°C로 잡았더니 집게는 평소에도 경고에 가까웠고,
+    #: 그런 경고는 진짜로 뜨거워졌을 때 아무도 믿지 않게 만든다. 정지 문턱(65°C)과의
+    #: 간격은 그대로 두면서 집게의 평상시보다 10°C 위로 올렸다.
     temperature_warn_c: int = field(
-        default_factory=lambda: _env_int("SOARM_VL_TEMP_WARN_C", 55)
+        default_factory=lambda: _env_int("SOARM_VL_TEMP_WARN_C", 58)
     )
     #: STS3215의 자체 보호는 70°C에서 토크를 끊는다 — 그러면 팔이 떨어진다. 그보다
     #: 먼저, 떨어뜨리지 않는 방식으로 우리가 멈춘다.

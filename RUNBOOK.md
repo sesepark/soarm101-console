@@ -2,8 +2,10 @@
 
 현재 구현된 로컬 제어 기능과 향후 network 기능을 구분한다. 로컬 UI에는 observation-only
 gate, 단일 teleop/record mode, read-only doctor, camera 단일 소유, calibration 검증,
-SIGINT 정지가 있다. `PROTOCOL.md`의 network lease, heartbeat, 독립 watchdog/HOLD는 아직
-구현되지 않았다.
+SIGINT 정지가 있다.
+
+`PROTOCOL.md`의 network lease, heartbeat, watchdog, HOLD는 **가상 리더 경로에서는
+구현되어 있다**(아래 6절). 기존 물리 리더 텔레옵 경로에는 없다.
 
 ## 1. 기본 검증
 
@@ -110,3 +112,85 @@ fuser /dev/ttyACM0 /dev/ttyACM1 /dev/video0 /dev/video2
 - SIGINT 정지 실패: 독립 power cutoff를 사용한다. 자동 강제 재개하지 않는다.
 - SSH 단절: SSH 자체는 heartbeat가 아니다. 현재 network control은 구현되지 않았다.
 - Calibration mismatch: motion gate를 다시 닫고 두 calibration을 재검토한다.
+
+
+## 6. 가상 리더 (물리 리더 팔 없는 원격 텔레옵)
+
+3D로 그린 팔을 맥 앱이나 아이폰에서 끌면 팔로워가 따라온다. 설계 근거는
+[ADR 0002](ADR/0002-virtual-leader-owner.md), 문턱값과 미확인 항목은 맥 앱 저장소의
+`docs/원격_텔레옵_안전.md`에 있다.
+
+### 6.1 한 번만 하는 설정
+
+```bash
+# 조작 권한 토큰. 관찰에는 필요 없고 팔을 움직이는 요청에만 붙는다.
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+# config/soarm.env 에 SOARM_MOTION_TOKEN=<값> 을 넣고
+systemctl --user restart soarm-console
+curl -s http://127.0.0.1:8088/api/vleader | python3 -m json.tool | head -20
+```
+
+`preflight`가 비어 있어야 시작할 수 있다. 비어 있지 않으면 그 문장이 이유다.
+
+아이폰에서 쓰려면 Tailscale Serve를 켠다. tailnet 안에서만 열리고 funnel은 쓰지 않는다.
+
+```bash
+tailscale serve --bg --https=443 8088
+tailscale serve status
+```
+
+`Serve is not enabled on your tailnet`이 나오면 안내된 주소를 브라우저에서 한 번 열어
+켠 뒤 다시 실행한다.
+
+### 6.2 평소 순서
+
+1. `POST /api/vleader/start` — 팔로워 serial을 잡고 30Hz 관찰. **토크는 걸지 않는다.**
+2. 토크를 걸기 전에 팔을 손으로 움직여 3D가 같은 방향으로 도는지 본다.
+3. `POST /api/vleader/arm` + `MOVE SOARM101` — 토크를 건다.
+4. `POST /api/vleader/lease` — 조작 권한 하나. 동시에 하나만 발급된다.
+5. 조작. 손을 떼면 팔은 그 자리에 선다.
+6. `DELETE /api/vleader/lease/{id}` — 반납. 팔은 자세를 유지한다.
+7. `POST /api/vleader/stop` — 루프를 내린다. **토크가 걸려 있으면 거절한다.**
+
+### 6.3 멈췄을 때
+
+```bash
+curl -s http://127.0.0.1:8088/api/vleader | python3 -c \
+  "import json,sys; d=json.load(sys.stdin); print(d['state'], d['fault'])"
+```
+
+- `HOLD` + `fault.code` — 왜 멈췄는지가 그 안에 있다. 원인을 확인한 뒤
+  `POST /api/vleader/resume`. **이전 동작을 이어서 하지 않는다** — 다음 명령은 현재 자세
+  근처에서 시작해야 한다.
+- `FAULT` + `HARDWARE_ERROR` — serial이 흔들렸다. 토크는 그대로 두었다. 팔을 받치고
+  `POST /api/vleader/torque/release` + `RELEASE TORQUE SOARM101`로 내리거나,
+  버스가 돌아왔으면 `resume`.
+- **팔이 계속 움직이면** 소프트웨어를 믿지 말고 전원 플러그를 뽑는다. 독립 차단 수단은 없다.
+
+### 6.4 누가 쥐고 있는지 모를 때
+
+```bash
+curl -s http://127.0.0.1:8088/api/vleader | python3 -c \
+  "import json,sys; d=json.load(sys.stdin); print(d['lease'], d['lease_history'][-3:])"
+curl -s -X POST http://127.0.0.1:8088/api/vleader/hold   # 토큰도 리스도 필요 없다
+```
+
+리스는 5초 만에 만료되므로, 쥔 쪽이 사라졌다면 기다리면 풀린다. 강제로 빼앗는 길은 없다.
+
+### 6.5 상호배타 확인
+
+가상 리더가 도는 동안 `lerobot-teleoperate`와 `lerobot-record`(물리 리더)는 409로 막힌다.
+그 반대도 같다. 셋이 겹치면 같은 serial에 두 프로세스가 말을 걸어 status packet이 깨진다 —
+개발 중에 실제로 한 번 보았고, 그 상태의 로그는
+`Failed to read 'Present_Voltage' on id_=1 ... Incorrect status packet!`이다.
+
+### 6.6 하드웨어 없이 시험하기
+
+```bash
+SOARM_VL_BACKEND=simulated SOARM_VL_SIM_OBSTACLE=elbow_flex:12 \
+  SOARM_MOTION_TOKEN=sim-token SOARM_ENABLE_MOTION=1 \
+  .venv/bin/uvicorn soarm_console.app:app --app-dir src --port 8090
+```
+
+흉내 백엔드는 serial을 열지 않는다. `SOARM_VL_SIM_OBSTACLE`로 지정한 각도에서 관절이 막혀
+접촉 트립과 물러남을 팔 없이 걸어 볼 수 있다.

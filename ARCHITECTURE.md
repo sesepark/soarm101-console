@@ -1,6 +1,15 @@
 # Architecture
 
-> 구현 상태: 이 문서는 목표 구조를 정의한다. 현재 실제로 확인된 것은 [hardware.md](hardware.md)의 USB 연결과 카메라 동시 캡처까지다. Authority Manager, command lease, watchdog, owner lock, ROS 2 Bridge는 아직 구현·검증되지 않았으므로 현재 안전장치로 간주하지 않는다.
+> 구현 상태 (2026-09-01): 이 문서는 목표 구조를 정의한다. **가상 리더 경로에 한해**
+> Hardware Owner, Authority Manager(follower motion lease), Safety Validator, watchdog이
+> 구현되어 있고 `tests/test_vleader*.py`로 검증된다 — `src/soarm_console/vleader/`와
+> [ADR 0002](ADR/0002-virtual-leader-owner.md)를 보라. 실물 팔로워를 열어 30Hz로 읽는
+> 것까지 확인했고(루프 4.4ms), **팔이 실제로 움직이는 시험은 아직 하지 않았다.**
+> 접촉 문턱값은 유추값이고 실측이 필요하다.
+>
+> 아직 구현되지 않은 것: owner lock 파일, ROS 2 Bridge, VLA worker, 독립 power cutoff.
+> 기존 `lerobot-teleoperate` 텔레옵 경로에는 lease도 watchdog도 없다(서브프로세스가
+> 리더 팔에서 읽은 값을 그대로 흘려보내는 구조라 끼어들 자리가 없다).
 
 ## 목표
 

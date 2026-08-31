@@ -25,22 +25,34 @@ class RecordManager:
     def running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
-    def preflight(self) -> list[str]:
+    def preflight(self, teleop_source: str = "leader") -> list[str]:
+        """수집을 막는 것들.
+
+        가상 리더로 찍을 때는 리더 팔의 calibration을 요구하지 않는다 — 그 팔이 없는 것이
+        이 경로의 존재 이유다. 팔로워 쪽은 어느 경로에서도 있어야 한다.
+        """
         problems: list[str] = []
         if not self.settings.motion_enabled:
             problems.append("SOARM_ENABLE_MOTION=1 is not set")
         if not self.settings.camera_roles_confirmed:
             problems.append("SOARM_CAMERA_ROLES_CONFIRMED=1 is not set")
-        for role, path in (
-            ("leader", self.settings.leader_calibration),
-            ("follower", self.settings.follower_calibration),
-        ):
+        required = (
+            [("follower", self.settings.follower_calibration)]
+            if teleop_source == "virtual"
+            else [
+                ("leader", self.settings.leader_calibration),
+                ("follower", self.settings.follower_calibration),
+            ]
+        )
+        for role, path in required:
             error = validate_calibration(path)
             if error:
                 problems.append(f"Invalid {role} calibration: {error}")
         return problems
 
-    def start(self, task: str, episodes: int, episode_seconds: int) -> None:
+    def start(
+        self, task: str, episodes: int, episode_seconds: int, teleop_source: str = "leader"
+    ) -> None:
         if not 1 <= episodes <= 1000:
             raise TeleopError("episodes must be between 1 and 1000")
         if not 5 <= episode_seconds <= 300:
@@ -50,7 +62,7 @@ class RecordManager:
         with self._lock:
             if self.running:
                 raise TeleopError("Recording is already running")
-            problems = self.preflight()
+            problems = self.preflight(teleop_source)
             if problems:
                 raise TeleopError("; ".join(problems))
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +73,7 @@ class RecordManager:
                     "SOARM_TASK": task.strip(),
                     "SOARM_NUM_EPISODES": str(episodes),
                     "SOARM_EPISODE_SECONDS": str(episode_seconds),
+                    "SOARM_TELEOP_SOURCE": teleop_source,
                 }
             )
             command = [str(Path(__file__).parents[2] / "scripts/record.sh")]

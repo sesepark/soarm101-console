@@ -22,13 +22,13 @@ class Settings:
     scene_camera: str = field(
         default_factory=lambda: os.getenv(
             "SOARM_SCENE_CAMERA",
-            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:7:1.0-video-index0",
+            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:11.4:1.0-video-index0",
         )
     )
     wrist_camera: str = field(
         default_factory=lambda: os.getenv(
             "SOARM_WRIST_CAMERA",
-            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:8:1.0-video-index0",
+            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:5:1.0-video-index0",
         )
     )
     leader_id: str = field(default_factory=lambda: os.getenv("SOARM_LEADER_ID", "soarm101_leader"))

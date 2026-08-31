@@ -35,6 +35,11 @@ class ArmRequest(BaseModel):
 
 
 class LeaseRequest(BaseModel):
+    #: 조작 권한을 받는 순간의 확인 문구. 토크를 거는 자리에도 같은 것을 요구하지만,
+    #: 그것만으로는 모자란다 — 토크가 이미 걸려 있으면 그 게이트를 지나치게 되고,
+    #: 그러면 먼저 켜 둔 사람이 있는 팔에 아무나 문구 없이 붙을 수 있다.
+    #: **팔이 움직일 수 있게 되는 순간**은 리스를 받는 순간이므로 게이트는 여기에도 있다.
+    confirmation: str = ""
     holder: str = "unknown"
     session_id: str = ""
 
@@ -335,6 +340,8 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
     @router.post("/lease")
     def grant(request: Request, body: LeaseRequest) -> dict[str, object]:
         _authorise_motion(_token_from(request))
+        if body.confirmation != ARM_CONFIRMATION:
+            raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
         owner = vleader.require_owner()
         if owner.state in (State.STOPPED, State.SAFE):
             raise HTTPException(
@@ -345,6 +352,17 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             lease = vleader.authority.grant(body.holder or "unknown", body.session_id)
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # 앞 사람이 반납해서 선 것이라면 새 사람이 이어받는 것으로 풀린다. 그것은 고장이
+        # 아니라 정상적인 교대이고, 지금 문구를 손으로 옮겨 적은 사람이 바로 여기 있다.
+        #
+        # 그 밖의 이유로 선 것은 풀지 않는다. 누가 정지를 눌렀거나 무언가에 닿았거나 모터가
+        # 뜨거웠던 것이고, 그 이유는 다음 사람이 **읽고** 확인해야 한다. 권한을 새로 받는
+        # 것으로 조용히 지워지면, 멈춘 이유를 아무도 보지 않은 채 다시 움직이게 된다.
+        owner = vleader.owner
+        if owner is not None and owner.state == State.HOLD:
+            fault = owner.snapshot().get("fault") or {}
+            if fault.get("code") == Trip.LEASE_RELEASED:
+                owner.resume()
         return lease.as_dict()
 
     @router.post("/lease/{lease_id}/heartbeat")

@@ -78,9 +78,9 @@ def test_observation_needs_nothing_and_motion_needs_a_token(console):
     client, _ = console
     assert client.get("/api/vleader").status_code == 200
     # 토큰 없이 조작 권한을 달라고 하면 401.
-    assert client.post("/api/vleader/lease", json={"holder": "누구"}).status_code == 401
+    assert client.post("/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "누구"}).status_code == 401
     assert client.post(
-        "/api/vleader/lease", json={"holder": "누구"},
+        "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "누구"},
         headers={"X-SOARM-Motion-Token": "wrong"},
     ).status_code == 401
 
@@ -96,10 +96,32 @@ def test_the_arm_confirmation_is_not_pre_filled_and_must_match(console):
     assert payload["arm_confirmation_length"] == len("MOVE SOARM101")
 
 
+def test_taking_authority_needs_the_phrase_even_when_torque_is_already_on(console):
+    """토크를 거는 자리에만 게이트를 두면, 이미 켜져 있을 때 그 자리를 지나치게 된다.
+
+    실제로 그렇게 만들어 두었다가 시험에서 잡혔다. 먼저 켜 둔 사람이 있는 팔에 아무나
+    문구 없이 붙을 수 있었다. 팔이 움직일 수 있게 되는 순간은 리스를 받는 순간이다.
+    """
+    client, _ = console
+    assert start_and_arm(client).status_code == 200
+    assert client.get("/api/vleader").json()["torque_enabled"] is True
+    wrong = motion(
+        client, "POST", "/api/vleader/lease",
+        json={"confirmation": "move soarm101", "holder": "맥북"},
+    )
+    assert wrong.status_code == 400
+    assert client.get("/api/vleader").json()["lease"] is None
+    right = motion(
+        client, "POST", "/api/vleader/lease",
+        json={"confirmation": "MOVE SOARM101", "holder": "맥북"},
+    )
+    assert right.status_code == 200
+
+
 def test_a_lease_is_refused_while_torque_is_off(console):
     client, _ = console
     motion(client, "POST", "/api/vleader/start")
-    response = motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"})
+    response = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"})
     assert response.status_code == 409
     assert "torque" in response.json()["detail"].lower()
 
@@ -107,22 +129,22 @@ def test_a_lease_is_refused_while_torque_is_off(console):
 def test_two_devices_cannot_hold_the_lease_at_once(console):
     client, _ = console
     assert start_and_arm(client).status_code == 200
-    mac = motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"})
+    mac = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"})
     assert mac.status_code == 200
-    phone = motion(client, "POST", "/api/vleader/lease", json={"holder": "아이폰"})
+    phone = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "아이폰"})
     assert phone.status_code == 409
     assert "맥북" in phone.json()["detail"]
     # 반납하면 폰이 받는다. 빼앗기는 없다.
     lease_id = mac.json()["lease_id"]
     assert motion(client, "DELETE", f"/api/vleader/lease/{lease_id}").json()["released"] is True
-    assert motion(client, "POST", "/api/vleader/lease", json={"holder": "아이폰"}).status_code == 200
+    assert motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "아이폰"}).status_code == 200
 
 
 def test_anyone_can_stop_the_arm_without_a_token_or_a_lease(console):
     """폰이 맥을 멈출 수 있어야 한다. 멈추는 것은 권한을 빼앗는 것이 아니다."""
     client, _ = console
     start_and_arm(client)
-    motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"})
+    motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"})
     response = client.post("/api/vleader/hold")  # 토큰 없음
     assert response.status_code == 200
     assert response.json()["state"] == "HOLD"
@@ -144,7 +166,7 @@ def test_the_socket_refuses_a_command_without_a_lease_and_names_the_reason(conso
 def test_the_socket_drives_the_arm_and_reports_what_it_clamped(console):
     client, vleader = console
     start_and_arm(client)
-    lease = motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"}).json()
+    lease = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"}).json()
     with client.websocket_connect("/api/vleader/stream") as socket:
         hello = socket.receive_json()
         present = {joint["name"]: joint["present"] for joint in hello["joints"]}
@@ -178,7 +200,7 @@ def test_the_socket_drives_the_arm_and_reports_what_it_clamped(console):
 def test_a_command_out_of_the_absolute_limit_is_refused_by_code(console):
     client, _ = console
     start_and_arm(client)
-    lease = motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"}).json()
+    lease = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"}).json()
     with client.websocket_connect("/api/vleader/stream") as socket:
         socket.receive_json()
         socket.send_json(
@@ -195,7 +217,7 @@ def test_a_command_out_of_the_absolute_limit_is_refused_by_code(console):
 def test_dropping_the_connection_leaves_the_arm_holding_not_repeating(console):
     client, _ = console
     start_and_arm(client)
-    lease = motion(client, "POST", "/api/vleader/lease", json={"holder": "맥북"}).json()
+    lease = motion(client, "POST", "/api/vleader/lease", json={"confirmation": "MOVE SOARM101", "holder": "맥북"}).json()
     with client.websocket_connect("/api/vleader/stream") as socket:
         hello = socket.receive_json()
         present = {joint["name"]: joint["present"] for joint in hello["joints"]}
@@ -351,3 +373,38 @@ def test_the_lerobot_teleoperator_reads_the_relay_and_refuses_when_there_is_none
         assert not teleoperator.is_connected
     finally:
         server.shutdown()
+
+
+def test_handover_clears_a_released_hold_but_not_a_real_one(console):
+    """앞 사람이 반납해서 선 것과, 누가 정지를 눌러 선 것은 다르다.
+
+    앞의 것은 정상적인 교대라 새 사람이 이어받으면 풀린다. 뒤의 것은 이유를 읽고 확인해야
+    풀린다 — 권한을 새로 받는 것으로 조용히 지워지면 아무도 그 이유를 보지 않는다.
+    """
+    client, _ = console
+    start_and_arm(client)
+    lease = motion(
+        client, "POST", "/api/vleader/lease",
+        json={"confirmation": "MOVE SOARM101", "holder": "맥북"},
+    ).json()
+    motion(client, "DELETE", f"/api/vleader/lease/{lease['lease_id']}")
+    assert client.get("/api/vleader").json()["fault"]["code"] == "LEASE_RELEASED"
+    # 이어받으면 풀린다.
+    motion(
+        client, "POST", "/api/vleader/lease",
+        json={"confirmation": "MOVE SOARM101", "holder": "아이폰"},
+    )
+    assert client.get("/api/vleader").json()["state"] != "HOLD"
+
+    # 누가 정지를 누른 것은 그렇지 않다.
+    client.post("/api/vleader/hold")
+    held = client.get("/api/vleader").json()
+    assert held["state"] == "HOLD" and held["fault"]["code"] == "OPERATOR_HOLD"
+    motion(client, "DELETE", f"/api/vleader/lease/{held['lease']['lease_id']}")
+    motion(
+        client, "POST", "/api/vleader/lease",
+        json={"confirmation": "MOVE SOARM101", "holder": "맥북"},
+    )
+    after = client.get("/api/vleader").json()
+    assert after["state"] == "HOLD"
+    assert after["fault"]["code"] == "OPERATOR_HOLD"

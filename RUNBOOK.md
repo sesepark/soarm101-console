@@ -93,6 +93,40 @@ Follower와 Leader를 안전한 가운데 자세에 두고, 안내되는 관절�
 [ADR 0002](ADR/0002-virtual-leader-owner.md), 장치 소유권은
 [ADR 0003](ADR/0003-device-owner-lock.md)을 따른다.
 
+### 6.0 고친 코드는 재시작해야 돈다
+
+당연해 보이지만 한 번 걸렸다. owner lock을 넣고 커밋하고 pytest까지 통과시킨 뒤에도, 돌고
+있는 서비스는 **그 전 코드**였다. 밖의 프로세스가 가상 리더가 쥔 팔로워를 그대로 다시 열어
+읽었고, 두 프로세스가 같은 버스에 붙는 것을 실제로 만들었다 — lock이 막았어야 할 바로 그
+상황이다. 원인은 하나였다: `systemctl --user restart`를 하지 않았다.
+
+커밋 시각과 서비스가 뜬 시각을 비교하면 바로 보인다.
+
+```bash
+systemctl --user show soarm-console -p ActiveEnterTimestamp --value
+git log -1 --format=%cI
+```
+
+앞의 것이 뒤의 것보다 이르면 서비스는 옛 코드다. 고친 뒤에는 반드시:
+
+```bash
+systemctl --user restart soarm-console.service
+```
+
+lock이 실제로 걸려 있는지는 가상 리더를 켠 상태에서 이렇게 본다.
+
+```bash
+PYTHONPATH=src .venv/bin/python -c "
+from soarm_console.config import Settings
+from soarm_console.owner_lock import DeviceLockSet, DeviceLockError
+try:
+    with DeviceLockSet.acquire([Settings().follower_port], 'probe'): print('잡혔다 - 막지 못했다')
+except DeviceLockError as e: print('거절:', e)"
+```
+
+`거절: Device is owned by virtual-leader (pid ...)`가 나와야 한다. `잡혔다`가 나오면 서비스가
+옛 코드이거나 lock 경로가 어긋난 것이다.
+
 ### 6.1 한 번만 하는 설정과 Tailscale Serve
 
 조작 토큰은 관찰에는 필요 없고 motion 권한 확인에만 쓴다. 실제 값은 응답이나 문서에 넣지

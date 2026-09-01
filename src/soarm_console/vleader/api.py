@@ -207,9 +207,17 @@ class VirtualLeader:
             if positions and not snapshot.get("relay"):
                 self.last_known_position = positions
                 self.last_known_at = time.time()
-        self._owner = None
+        # **먼저 내리고 그다음에 놓는다.**
+        #
+        # 반대로 하면 `owner.stop()`이 거절할 때(토크가 걸려 있는데 `force`가 없을 때가
+        # 그렇다) 참조는 이미 사라진 뒤다. 루프는 계속 돌면서 serial과 lock을 쥐고 팔을
+        # 잡고 있는데 서비스는 \"꺼짐\"이라고 말하고, 그 루프에 닿을 방법이 다시는 없다.
+        # 토크를 풀 수도, 다시 시작할 수도 없다 — 서비스를 재시작하는 것 말고는.
+        # 실제로 그 상태를 만들었다: 다음 `start`가 \"Device is owned by virtual-leader
+        # (pid ...)\"로 거절당했고, 그 pid는 콘솔 자신이었다.
         if owner is not None:
             owner.stop(force=force)
+        self._owner = None
 
     def start_relay(self) -> dict[str, object]:
         """데이터 수집으로 넘기기 전, 장치를 놓고 목표만 중계하는 모드로 바꾼다.
@@ -316,6 +324,13 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             return vleader.start()
         except (HardwareError, SpecError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - 이유 없는 500만은 내보내지 않는다
+            # 500은 화면에서 \"서버가 요청을 끝내지 못했습니다\"로만 보인다. 무엇이
+            # 잘못됐는지가 사라지면 사람은 다음에 무엇을 할지 알 수 없다. 실제로
+            # status packet 하나가 깨졌을 때 이 자리에서 500이 나갔다.
+            raise HTTPException(
+                status_code=409, detail=f"Could not start the virtual leader: {exc}"
+            ) from exc
 
     @router.post("/stop")
     def stop(request: Request, force: bool = False) -> dict[str, object]:

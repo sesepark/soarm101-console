@@ -50,6 +50,35 @@ class RealFollower:
         self._torque = False
 
     def connect(self) -> None:
+        """팔로워에 붙는다. **붙었다는 이유로 토크가 바뀌지 않게** 한다.
+
+        `SOFollower.connect()`를 그대로 부르면 안 된다. 그 안의 `configure()`가
+        `with bus.torque_disabled():`를 쓰는데, 이 컨텍스트 관리자는 빠져나오면서 토크를
+        **켠다.** 그래서 관찰만 하려고 시작해도 팔이 뻣뻣해졌고, 그러면 확인을 요구하는
+        `arm` 게이트를 지나지 않고도 팔이 명령을 받을 수 있는 상태가 된다 — 게이트를
+        우회하는 길을 열어 둔 셈이다. 더 나쁜 것은 그 순간 서보가 지난번 `Goal_Position`을
+        향해 스스로 달린다는 점이다.
+
+        그래서 `connect()` 대신 그 안에서 하는 일을 직접 하고, 그 사이에 우리 손을 넣는다:
+        붙기 전의 토크 상태를 기억했다가 원래대로 돌려놓고, 토크가 켜지기 전에 지금 자세를
+        목표로 먼저 써 넣는다. 이미 토크가 걸려 있던 팔은 그대로 둔다 — 들려 있던 팔을
+        여기서 놓으면 떨어진다.
+        """
+        # 상태 패킷 하나가 깨졌다고 시작이 통째로 실패하지 않게 한 번 더 해 본다. 실제로
+        # `Failed to write 'Lock' on id_=5 ... There is no status packet!` 한 번에
+        # 관찰 시작이 막혔고, 화면에는 이유 없는 500만 떴다. 판독값이 튀듯 쓰기도 튄다.
+        failure: Exception | None = None
+        for _ in range(2):
+            try:
+                self._connect_once()
+                return
+            except HardwareError:
+                raise
+            except ConnectionError as exc:
+                failure = exc
+        raise HardwareError(f"Follower bus did not answer while connecting: {failure}")
+
+    def _connect_once(self) -> None:
         # import를 함수 안에 두는 이유: 콘솔 웹 서버는 LeRobot을 쓰지 않고도 떠야 한다.
         # 모듈을 읽는 것만으로 torch까지 끌려 들어오면 상태 화면이 그만큼 늦게 뜬다.
         from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
@@ -66,28 +95,45 @@ class RealFollower:
             cameras={},
         )
         robot = SOFollower(config)
-        # `calibrate=True`로 부르면 모터에 적힌 calibration이 파일과 다를 때 `input()`으로
-        # 사람을 기다린다. 웹 서버 안에서는 그 자리가 곧 무한 대기다.
-        robot.connect(calibrate=False)
-        if not robot.bus.is_calibrated:
-            if not robot.calibration:
-                robot.disconnect()
-                raise HardwareError("Follower calibration file is missing; run scripts/calibrate_follower.sh")
-            robot.bus.write_calibration(robot.calibration)
-        self._robot = robot
-        # **붙는다고 토크를 건드리지 않는다.**
-        #
-        # 처음에는 여기서 토크를 껐다. 관찰만 하는 동안 팔을 손으로 움직일 수 있어야 한다는
-        # 이유였는데, 그 코드는 이미 토크를 물고 자세를 유지하던 팔에 붙는 순간 그 팔을
-        # 놓아 버린다. 팔이 들려 있었다면 떨어진다. 붙는 것은 관찰의 시작이지 상태를 바꿀
-        # 이유가 아니다 — 토크는 확인 문구가 있는 자리에서만 바뀐다.
-        #
-        # 대신 지금 어떤 상태인지 읽어서 그대로 들고 간다. 화면은 사실을 말해야 한다.
+        robot.bus.connect()
         try:
-            torque = robot.bus.sync_read("Torque_Enable", normalize=False, num_retry=2)
-            self._torque = any(int(value) != 0 for value in torque.values())
-        except Exception:  # noqa: BLE001 - 읽지 못하면 걸려 있다고 보는 쪽이 안전하다
-            self._torque = True
+            # calibration을 여기서 맞춘다. `SOFollower.connect(calibrate=True)`는 모터에
+            # 적힌 값이 파일과 다를 때 `input()`으로 사람을 기다리는데, 웹 서버 안에서
+            # 그 자리는 곧 무한 대기다.
+            if not robot.bus.is_calibrated:
+                if not robot.calibration:
+                    raise HardwareError(
+                        "Follower calibration file is missing; run scripts/calibrate_follower.sh"
+                    )
+                robot.bus.write_calibration(robot.calibration)
+
+            # 붙기 전의 상태를 먼저 읽는다. 이 값을 놓치면 `configure()`가 켠 토크와
+            # 사람이 걸어 둔 토크를 구별할 수 없다.
+            try:
+                torque = robot.bus.sync_read("Torque_Enable", normalize=False, num_retry=2)
+                was_enabled = any(int(value) != 0 for value in torque.values())
+            except ConnectionError as exc:  # 읽지 못하면 걸려 있다고 보는 쪽이 안전하다
+                was_enabled = True
+
+            # 토크가 켜지기 전에 지금 자세를 목표로 박아 둔다. 이러지 않으면 켜지는 순간
+            # 서보가 지난번 목표까지 스스로 달린다.
+            present = robot.bus.sync_read("Present_Position", normalize=False, num_retry=2)
+            robot.bus.sync_write("Goal_Position", present, normalize=False, num_retry=2)
+
+            robot.configure()  # 여기서 토크가 켜진다 — LeRobot의 동작이다
+
+            if not was_enabled:
+                # 원래 꺼져 있던 팔이다. 관찰을 시작했다는 이유로 켜 두지 않는다.
+                # 목표를 지금 자세로 맞춰 두었으므로 끄는 동안 팔은 그 자리에 있다.
+                robot.bus.disable_torque()
+            self._torque = was_enabled
+        except BaseException:
+            try:
+                robot.bus.disconnect()
+            except Exception:  # noqa: BLE001 - 정리하는 길은 어떤 이유로도 막히지 않는다
+                pass
+            raise
+        self._robot = robot
 
     def disconnect(self) -> None:
         robot, self._robot = self._robot, None

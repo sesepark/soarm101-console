@@ -62,17 +62,6 @@ body {
 button, a, input, select { font: inherit; -webkit-tap-highlight-color: transparent; }
 a { color: var(--blue); }
 
-/* 맥은 3D만 품는다. 관절 슬라이더·카메라·정지 버튼은 네이티브 SwiftUI가 그린다. */
-body.host-native { grid-template-rows: minmax(0, 1fr); }
-body.host-native #top,
-body.host-native #panel,
-body.host-native #tabs,
-body.host-native #camera-pane,
-body.host-native #status-pane,
-body.host-native #sheet,
-body.host-native #sheet-scrim { display: none !important; }
-body.host-native #stage { grid-template-rows: minmax(0, 1fr); }
-
 /* ─────────────────────────────────────────────── 머리 */
 
 #top {
@@ -502,3 +491,36 @@ dialog menu button.stop { border: 0; }
   .joint { min-height: 32px; }
   .hint { display: none; }
 }
+
+/* ─────────────────────────────────────────────── 맥 앱 안에서
+ *
+ * 맥은 **3D만** 품는다. 관절 슬라이더·카메라·정지 버튼·권한은 네이티브 SwiftUI가 같은
+ * 자리를 맡으므로, 이 페이지는 캔버스 하나로 줄어든다.
+ *
+ * 이 블록이 파일 **맨 끝에** 있는 이유가 있다. 위쪽에 두었더니 뒤따라오는
+ * `body.tab-drive #stage` 규칙이 같은 명시도로 이겼고(둘 다 0,2,1이라 나중에 온 쪽이
+ * 이긴다), 그래서 맥에서 3D가 카메라 자리(0.28fr)를 비워 둔 채 120px로 눌렸다. 화면에는
+ * 검은 사각형만 남았는데 페이지는 "준비됐다"고 말하고 있었다 — 실제로 그 화면을 봤다.
+ * 반응형 규칙들도 전부 위에 있으므로, 창 크기나 방향이 무엇이든 여기서 끝난다. */
+body.host-native {
+  grid-template-rows: minmax(0, 1fr) !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+body.host-native #top,
+body.host-native #banner,
+body.host-native #panel,
+body.host-native #tabs,
+body.host-native #camera-pane,
+body.host-native #status-pane,
+body.host-native #sheet,
+body.host-native #sheet-scrim { display: none !important; }
+body.host-native #stage {
+  grid-column: 1 !important;
+  grid-row: 1 !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+body.host-native #view-pane { display: block !important; }
+/* 시점 단추는 맥에서도 쓸모가 있다 — 끝점 모드에서는 화면이 고정되기 때문이다.
+   다만 앱이 자기 툴바에도 같은 단추를 두므로, 3D 위에는 그리지 않는다. */
+body.host-native #view-controls { display: none !important; }

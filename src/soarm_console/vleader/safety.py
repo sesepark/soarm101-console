@@ -54,6 +54,7 @@ class Trip:
 
     OVERLOAD = "OVERLOAD"
     OVERCURRENT = "OVERCURRENT"
+    STALLED = "STALLED"
     FOLLOWING_ERROR = "FOLLOWING_ERROR"
     OVER_TEMPERATURE = "OVER_TEMPERATURE"
     COMMAND_TIMEOUT = "COMMAND_TIMEOUT"
@@ -65,6 +66,7 @@ class Trip:
 
 TRIP_KOREAN = {
     Trip.OVERLOAD: "부하가 계속 높습니다 — 무언가에 닿았을 수 있습니다",
+    Trip.STALLED: "밀고 있는데 움직이지 않습니다 — 무언가에 막혀 있습니다",
     Trip.OVERCURRENT: "전류가 계속 높습니다 — 무언가에 닿았을 수 있습니다",
     Trip.FOLLOWING_ERROR: "목표와 실제 위치가 계속 벌어집니다 — 팔이 막혀 있습니다",
     Trip.OVER_TEMPERATURE: "모터가 뜨겁습니다",
@@ -167,6 +169,19 @@ class VLeaderSettings:
     stall_epsilon: float = field(
         default_factory=lambda: _env_float("SOARM_VL_STALL_EPSILON", 0.6)
     )
+    #: 막힌 채로 **밀고 있는가**. 부하만 보면 자유롭게 움직일 때와 구별되지 않고(실측
+    #: 24~100 대 48~128), 사람이 요청한 값과의 벌어짐만 보면 기계적 끝단에 닿았을 때를
+    #: 놓친다 — 집게를 끝까지 닫으면 남은 벌어짐이 1.6%뿐이라 추종오차 문턱(2%)에 닿지
+    #: 않는다. 2026-09-01 실측에서 그 상태로 20초 동안 부하 120으로 밀고 있었는데 사다리
+    #: 어느 칸에도 걸리지 않았다. 남은 보호는 온도뿐이었고 그것은 분 단위로 느리다.
+    #:
+    #: 그래서 셋을 함께 본다. 목표가 실제보다 앞서 있고(밀고 있다), 팔은 서 있고, 부하가
+    #: 높다. 가만히 자세를 버티는 것과 구별되는 이유는 첫 번째 조건이다 — 버티기만 할
+    #: 때는 목표가 실제와 같은 자리에 있다.
+    stall_load: int = field(default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD", 80))
+    stall_load_ms: int = field(
+        default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD_MS", 500)
+    )
     following_error_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 400)
     )
@@ -223,6 +238,8 @@ class VLeaderSettings:
             "following_error_deg": self.following_error_deg,
             "following_error_percent": self.following_error_percent,
             "stall_epsilon": self.stall_epsilon,
+            "stall_load": self.stall_load,
+            "stall_load_ms": self.stall_load_ms,
             "following_error_ms": self.following_error_ms,
             "temperature_warn_c": self.temperature_warn_c,
             "temperature_trip_c": self.temperature_trip_c,
@@ -407,6 +424,26 @@ class TripDetector:
                     name,
                     f"{self.specs[name].label}의 전류가 {settings.current_trip_ms}ms 넘게 {value * 6.5:.0f}mA입니다",
                 )
+        # 막힌 채 **밀고 있는** 관절. 위의 부하 검사(문턱 400)는 실물에서 걸린 적이 없고,
+        # 아래 추종오차 검사는 사람이 요청한 값과의 벌어짐을 보므로 기계적 끝단에서는
+        # 벌어질 자리가 없어 걸리지 않는다. 이 칸이 그 사이를 메운다.
+        for name, spec in self.specs.items():
+            if name not in goal or name not in present:
+                self._since.pop((name, Trip.STALLED), None)
+                continue
+            pushing = abs(goal[name] - present[name]) >= settings.stall_epsilon
+            standing = (moved or {}).get(name, float("inf")) < settings.stall_epsilon
+            heavy = abs(load.get(name, 0.0)) >= settings.stall_load
+            if self._sustained(
+                (name, Trip.STALLED), pushing and standing and heavy, now, settings.stall_load_ms
+            ):
+                return (
+                    Trip.STALLED,
+                    name,
+                    f"{spec.label}를 밀고 있는데 {settings.stall_load_ms}ms 넘게 제자리이고 "
+                    f"부하가 {abs(load.get(name, 0.0)):.0f}입니다 — 무언가에 막혀 있습니다",
+                )
+
         # 막힌 관절을 찾는 자리.
         #
         # 처음에는 **틱당 잘린 목표**와 실제의 차이를 봤다. 그 차이는 자라지 않는다 —

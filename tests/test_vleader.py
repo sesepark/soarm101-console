@@ -239,6 +239,48 @@ def test_a_joint_that_is_asked_to_move_but_stands_still_trips(specs, settings):
     assert "닿았습니다" in trip[2]
 
 
+def test_pushing_against_a_hard_stop_trips_even_with_nowhere_left_to_ask(specs, settings):
+    """기계적 끝단에 닿으면 벌어질 자리가 없어 추종오차로는 걸리지 않는다.
+
+    2026-09-01 실물: 집게를 0%로 계속 보내는데 팔은 1.6%에 서 있었다. 남은 벌어짐이
+    추종오차 문턱(2%)보다 작아 20초 동안 부하 120으로 밀고 있는데도 사다리 어느 칸에도
+    걸리지 않았다. 남은 보호는 온도뿐이었고 그것은 분 단위로 느리다.
+    """
+    detector = TripDetector(specs, settings)
+    present = {"gripper": 1.6}
+    goal = {"gripper": 1.6 - settings.stall_epsilon * 2}
+    standing = {"gripper": 0.0}
+    load = {"gripper": settings.stall_load + 40}
+    now = time.monotonic()
+    detector.inspect(now=now, present=present, goal=goal, load=load, current={},
+                     temperature={}, requested=goal, moved=standing)
+    trip = detector.inspect(
+        now=now + settings.stall_load_ms / 1000.0 + 0.01,
+        present=present, goal=goal, load=load, current={}, temperature={},
+        requested=goal, moved=standing,
+    )
+    assert trip is not None and trip[0] == Trip.STALLED
+    assert "막혀" in trip[2]
+
+
+def test_holding_a_pose_is_not_a_stall(specs, settings):
+    """가만히 자세를 버티는 것과 막힌 것을 가르는 것은 **목표가 앞서 있는가**이다.
+
+    버티기만 할 때 목표는 실제와 같은 자리에 있다. 이것을 함께 보지 않으면 무거운
+    자세를 버티는 관절이 조작하지도 않았는데 계속 걸린다.
+    """
+    detector = TripDetector(specs, settings)
+    present = {"shoulder_lift": 40.0}
+    standing = {"shoulder_lift": 0.0}
+    load = {"shoulder_lift": settings.stall_load + 60}
+    now = time.monotonic()
+    for step in range(6):
+        assert detector.inspect(
+            now=now + step * 0.2, present=present, goal=present, load=load, current={},
+            temperature={}, requested=present, moved=standing,
+        ) is None
+
+
 def test_catching_up_is_not_a_collision(specs, settings):
     """빠르게 끌면 요청은 늘 앞서간다. 그때마다 서면 조작 자체가 되지 않는다.
 

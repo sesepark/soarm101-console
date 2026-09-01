@@ -1,0 +1,16 @@
+[Unit]
+Description=SO-ARM101 console, reachable inside the tailnet only
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/deploy/Project/so-arm-101
+ExecStart=/usr/bin/python3 /home/deploy/Project/so-arm-101/scripts/tailnet_proxy.py
+Environment=PYTHONUNBUFFERED=1
+# Tailscale이 아직 올라오지 않았으면 주소를 못 찾고 끝난다. 그때는 다시 시도한다 —
+# 아무 주소에나 붙는 것보다 늦게 열리는 편이 낫다.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -5,6 +5,7 @@ import re
 import json
 import threading
 import time
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from lerobot.utils.keyboard_input import apply_recording_control
 
 from .calibration import validate_calibration
 from .config import Settings
+from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
 from .vleader import teleoperator as teleoperator_module
 from .vleader.teleoperator import SOArmVirtualLeaderConfig
 
@@ -97,6 +99,9 @@ def build_record_config(
         id=settings.follower_id,
         cameras=cameras,
         max_relative_target=settings.max_relative_target,
+        # record loop의 정상 종료나 예외가 torque-off가 되면 팔이 떨어진다. 해제는 사람이
+        # 팔을 받친 뒤 명시적으로만 한다.
+        disable_torque_on_disconnect=False,
     )
     if teleop_source == "virtual":
         # 물리 리더 팔이 없다. 관절 목표는 콘솔이 검증해 들고 있는 것을 가져온다.
@@ -150,19 +155,32 @@ def main() -> None:
     task = os.getenv("SOARM_TASK", "")
     default_name = "soarm101_" + datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     dataset_name = os.getenv("SOARM_DATASET_NAME", default_name)
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    CONTROL_PATH.unlink(missing_ok=True)
-    _write_status(phase="starting", dataset_name=dataset_name, task=task, teleop=teleop_source)
-    lerobot_record.init_keyboard_listener = _init_gui_listener
     try:
-        _write_status(phase="recording")
-        lerobot_record.record(
-            build_record_config(settings, task, dataset_name, teleop_source=teleop_source)
+        devices = [settings.follower_port, settings.scene_camera, settings.wrist_camera]
+        if teleop_source == "leader":
+            devices.append(settings.leader_port)
+        lock_context = (
+            nullcontext()
+            if inherited_locks_cover(devices)
+            else DeviceLockSet.acquire(devices, f"record-{teleop_source}")
         )
-        _write_status(phase="complete")
-    except BaseException:
-        _write_status(phase="error")
-        raise
+    except DeviceLockError as exc:
+        raise SystemExit(f"Refusing record: {exc}") from exc
+
+    with lock_context:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        CONTROL_PATH.unlink(missing_ok=True)
+        _write_status(phase="starting", dataset_name=dataset_name, task=task, teleop=teleop_source)
+        lerobot_record.init_keyboard_listener = _init_gui_listener
+        try:
+            _write_status(phase="recording")
+            lerobot_record.record(
+                build_record_config(settings, task, dataset_name, teleop_source=teleop_source)
+            )
+            _write_status(phase="complete")
+        except BaseException:
+            _write_status(phase="error")
+            raise
 
 
 if __name__ == "__main__":

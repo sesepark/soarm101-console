@@ -7,6 +7,7 @@ from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
 from .config import Settings
+from .owner_lock import DeviceLockError, DeviceLockSet
 
 
 MOTORS = {
@@ -35,7 +36,7 @@ class ArmDiagnostic:
     error: str | None = None
 
 
-def inspect_arm(role: str, port: str) -> ArmDiagnostic:
+def _inspect_arm_unlocked(role: str, port: str) -> ArmDiagnostic:
     """Read motor state without writing motor registers or changing torque."""
     bus = FeetechMotorsBus(port=port, motors=MOTORS)
     try:
@@ -82,6 +83,32 @@ def inspect_arm(role: str, port: str) -> ArmDiagnostic:
             bus.disconnect(disable_torque=False)
 
 
+def inspect_arm(role: str, port: str, *, acquire_owner_lock: bool = True) -> ArmDiagnostic:
+    """장치를 예약한 뒤 read-only 진단한다.
+
+    lock을 이미 가진 owner의 시작 절차만 `acquire_owner_lock=False`를 쓴다. 진단은 motor
+    register를 쓰지 않지만 serial packet은 보내므로, 다른 owner와 동시에 붙을 수 없다.
+    """
+    if not acquire_owner_lock:
+        return _inspect_arm_unlocked(role, port)
+    try:
+        with DeviceLockSet.acquire([port], "hardware-doctor"):
+            return _inspect_arm_unlocked(role, port)
+    except DeviceLockError as exc:
+        return ArmDiagnostic(
+            role=role,
+            port=port,
+            healthy=False,
+            safe_for_motion_start=False,
+            models={},
+            firmware={},
+            positions_raw={},
+            voltage_raw={},
+            torque_enabled={},
+            error=str(exc),
+        )
+
+
 def run_hardware_doctor(settings: Settings) -> dict[str, object]:
     arms = {
         "leader": inspect_arm("leader", settings.leader_port),
@@ -93,4 +120,3 @@ def run_hardware_doctor(settings: Settings) -> dict[str, object]:
         "safe_for_motion_start": all(arm.safe_for_motion_start for arm in arms.values()),
         "arms": {name: asdict(arm) for name, arm in arms.items()},
     }
-

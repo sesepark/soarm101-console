@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from soarm_console.config import Settings  # noqa: E402
 from soarm_console.diagnostics import MOTORS  # noqa: E402
+from soarm_console.owner_lock import DeviceLockError, DeviceLockSet  # noqa: E402
 
 
 PHASES = ("quiescent", "handled", "holding", "contact")
@@ -59,10 +60,24 @@ def summarise(samples: list[float]) -> dict[str, float]:
     ordered = sorted(samples)
     return {
         "n": len(ordered),
+        "min": round(ordered[0], 1),
         "p50": round(statistics.median(ordered), 1),
         "p95": round(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))], 1),
         "max": round(ordered[-1], 1),
     }
+
+
+def summarise_temperature(samples: list[float]) -> dict[str, float]:
+    summary = summarise(samples)
+    if samples:
+        summary.update(
+            {
+                "start": round(samples[0], 1),
+                "end": round(samples[-1], 1),
+                "rise": round(samples[-1] - samples[0], 1),
+            }
+        )
+    return summary
 
 
 def measure(phase: str, seconds: float, hz: float) -> dict[str, object]:
@@ -74,9 +89,10 @@ def measure(phase: str, seconds: float, hz: float) -> dict[str, object]:
         name: {"load": [], "current": [], "temperature": []} for name in MOTORS
     }
     torque_seen: set[int] = set()
-    bus.connect(handshake=False)
-    bus.set_baudrate(1_000_000)
+    owner_locks = DeviceLockSet.acquire([settings.follower_port], f"contact-measure-{phase}")
     try:
+        bus.connect(handshake=False)
+        bus.set_baudrate(1_000_000)
         deadline = time.monotonic() + seconds
         period = 1.0 / hz
         while time.monotonic() < deadline:
@@ -93,7 +109,9 @@ def measure(phase: str, seconds: float, hz: float) -> dict[str, object]:
             time.sleep(max(0.0, period - (time.perf_counter() - started)))
     finally:
         # 토크는 건드리지 않는다. 이 스크립트가 팔을 떨어뜨리는 일은 없어야 한다.
-        bus.disconnect(disable_torque=False)
+        if bus.is_connected:
+            bus.disconnect(disable_torque=False)
+        owner_locks.release()
 
     return {
         "phase": phase,
@@ -103,7 +121,10 @@ def measure(phase: str, seconds: float, hz: float) -> dict[str, object]:
         "torque_enabled_during": sorted(torque_seen),
         "milliamps_per_count": MILLIAMPS_PER_COUNT,
         "joints": {
-            name: {kind: summarise(values) for kind, values in kinds.items()}
+            name: {
+                kind: summarise_temperature(values) if kind == "temperature" else summarise(values)
+                for kind, values in kinds.items()
+            }
             for name, kinds in readings.items()
         },
     }
@@ -114,15 +135,20 @@ def report(result: dict[str, object]) -> str:
         f"# {result['phase']} · {result['seconds']}초 · {result['hz']}Hz · {result['measured_at']}",
         f"# 측정 중 토크: {result['torque_enabled_during']} (0=꺼짐, 1=걸림)",
         "",
-        f"{'관절':<16}{'부하 p50':>9}{'p95':>7}{'max':>7}"
-        f"{'전류 p50':>9}{'p95':>7}{'max':>7}{'(mA max)':>10}{'온도 max':>9}",
+        f"{'관절':<16}{'부하 min':>9}{'p50':>7}{'p95':>7}{'max':>7}"
+        f"{'전류 min':>9}{'p50':>7}{'p95':>7}{'max':>7}{'(mA max)':>10}"
+        f"{'온도 시작':>10}{'끝':>6}{'상승':>7}{'max':>6}",
     ]
     for name, kinds in result["joints"].items():
         load, current, temperature = kinds["load"], kinds["current"], kinds["temperature"]
         lines.append(
-            f"{name:<16}{load['p50']:>9.0f}{load['p95']:>7.0f}{load['max']:>7.0f}"
-            f"{current['p50']:>9.0f}{current['p95']:>7.0f}{current['max']:>7.0f}"
-            f"{current['max'] * MILLIAMPS_PER_COUNT:>10.0f}{temperature['max']:>9.0f}"
+            f"{name:<16}{load['min']:>9.0f}{load['p50']:>7.0f}"
+            f"{load['p95']:>7.0f}{load['max']:>7.0f}"
+            f"{current['min']:>9.0f}{current['p50']:>7.0f}"
+            f"{current['p95']:>7.0f}{current['max']:>7.0f}"
+            f"{current['max'] * MILLIAMPS_PER_COUNT:>10.0f}"
+            f"{temperature['start']:>10.0f}{temperature['end']:>6.0f}"
+            f"{temperature['rise']:>+7.0f}{temperature['max']:>6.0f}"
         )
     return "\n".join(lines)
 
@@ -132,7 +158,7 @@ def main() -> None:
     parser.add_argument("phase", choices=PHASES)
     parser.add_argument("--seconds", type=float, default=30.0)
     parser.add_argument("--hz", type=float, default=10.0)
-    parser.add_argument("--json", type=Path, help="원자료를 이 파일에 남긴다")
+    parser.add_argument("--json", type=Path, help="요약 결과를 이 JSON 파일에 남긴다")
     arguments = parser.parse_args()
 
     if arguments.phase in {"holding", "contact"}:
@@ -143,16 +169,25 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    result = measure(arguments.phase, arguments.seconds, arguments.hz)
+    try:
+        result = measure(arguments.phase, arguments.seconds, arguments.hz)
+    except DeviceLockError as exc:
+        raise SystemExit(f"측정 거부: {exc}") from exc
     print(report(result))
     if arguments.json:
         arguments.json.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(f"\n원자료: {arguments.json}", file=sys.stderr)
+        print(f"\n요약 결과: {arguments.json}", file=sys.stderr)
 
-    if arguments.phase in {"holding", "contact"} and result["torque_enabled_during"] == [0]:
+    if arguments.phase in {"holding", "contact"} and result["torque_enabled_during"] != [1]:
         print(
             "\n주의: 측정하는 동안 토크가 걸려 있지 않았습니다. 이 숫자는 이 단계의 값이"
             " 아닙니다.",
+            file=sys.stderr,
+        )
+    if arguments.phase in {"quiescent", "handled"} and 1 in result["torque_enabled_during"]:
+        print(
+            "\n주의: 토크가 꺼져 있어야 하는 단계에서 켜진 표본이 있습니다. 이 숫자는 이"
+            " 단계의 값이 아닙니다.",
             file=sys.stderr,
         )
 

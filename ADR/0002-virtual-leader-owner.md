@@ -27,7 +27,7 @@ Manager, Safety Validator, watchdog은 문서 상태로 남아 있었다.
 - 현재 관절 위치·부하·전류·온도를 읽어 WebSocket으로 내보낸다.
 - 검증을 통과한 목표 관절값을 받아 `SOFollower.send_action()`으로 쓴다.
 - 기존 `lerobot-teleoperate` 텔레옵, `lerobot-record` 수집과 **상호배타**다. 셋 중 하나만
-  장치를 연다(ADR 0001의 불변조건).
+  장치를 연다(ADR 0001의 불변조건). 프로세스 경계의 장치별 lock은 ADR 0003에서 구현했다.
 
 명령 권한은 ADR 0001이 정한 대로 lease다. Follower motion lease는 동시에 하나만 발급하고,
 빼앗기는 없으며 명시적 반납이나 만료로만 풀린다. 관찰 구독은 여럿을 허용한다.

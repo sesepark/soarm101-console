@@ -85,6 +85,17 @@ def test_observation_needs_nothing_and_motion_needs_a_token(console):
     ).status_code == 401
 
 
+def test_motion_token_can_be_checked_without_an_operation_or_confirmation_phrase(console):
+    client, _ = console
+    assert client.get("/api/vleader/motion-auth").status_code == 401
+    response = client.get(
+        "/api/vleader/motion-auth", headers={"X-SOARM-Motion-Token": TOKEN}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"authorized": True}
+    assert "MOVE SOARM101" not in response.text
+
+
 def test_the_arm_confirmation_is_not_pre_filled_and_must_match(console):
     client, _ = console
     motion(client, "POST", "/api/vleader/start")

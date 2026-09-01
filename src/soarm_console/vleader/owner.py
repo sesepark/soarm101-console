@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 
+from ..owner_lock import DeviceLockError, DeviceLockSet
 from .authority import AuthorityManager, Lease
 from .backend import FollowerBackend, HardwareError, make_backend
 from .safety import (
@@ -117,6 +119,7 @@ class VirtualLeaderOwner:
         self._listeners: list = []
         #: 중계 모드인가. 장치를 열지 않고 목표만 들고 있는 상태.
         self._relay = False
+        self._owner_locks: DeviceLockSet | None = None
 
     # MARK: 수명
 
@@ -128,7 +131,12 @@ class VirtualLeaderOwner:
     def state(self) -> str:
         return self._state
 
-    def start(self, *, relay_from: dict[str, float] | None = None) -> None:
+    def start(
+        self,
+        *,
+        relay_from: dict[str, float] | None = None,
+        owner_locks: DeviceLockSet | None = None,
+    ) -> None:
         """루프를 띄운다.
 
         `relay_from`이 주어지면 **중계 모드**다. 팔로워 serial을 열지 않고, 검증을 통과한
@@ -150,10 +158,26 @@ class VirtualLeaderOwner:
                     max_relative_target=self.settings.step_deg,
                     specs=self.specs,
                 )
-                backend.connect()
+                # 흉내 백엔드는 실제 장치를 예약하지 않는다. 실물 백엔드는 connect보다
+                # 먼저 lock을 잡아, 다른 정상 진입점과 serial open이 경합할 틈을 없앤다.
+                if os.getenv("SOARM_VL_BACKEND", "real").strip().lower() != "simulated":
+                    try:
+                        owner_locks = owner_locks or DeviceLockSet.acquire(
+                            [self.port], "virtual-leader"
+                        )
+                    except DeviceLockError as exc:
+                        raise HardwareError(str(exc)) from exc
+                try:
+                    backend.connect()
+                except BaseException:
+                    if owner_locks is not None:
+                        owner_locks.release()
+                    raise
+                self._owner_locks = owner_locks
                 self._backend = backend
             else:
                 self._backend = None
+                self._owner_locks = None
                 self._present = dict(relay_from)
                 self._goal = dict(relay_from)
                 self._hold_goal = dict(relay_from)
@@ -193,6 +217,9 @@ class VirtualLeaderOwner:
             if self._backend is not None:
                 self._backend.disconnect()
             self._backend = None
+            if self._owner_locks is not None:
+                self._owner_locks.release()
+            self._owner_locks = None
             self._thread = None
             self._state = State.STOPPED
 

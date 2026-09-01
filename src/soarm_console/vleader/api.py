@@ -289,6 +289,16 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
     def describe() -> dict[str, object]:
         return vleader.status()
 
+    @router.get("/motion-auth")
+    def verify_motion_auth(request: Request) -> dict[str, bool]:
+        """동작 없이 Tailscale 경로의 application token만 확인한다.
+
+        확인 문구나 그 길이는 내보내지 않는다. 이 endpoint의 200은 장치 준비나 동작 허가가
+        아니라, 요청이 현재 token을 알고 있다는 한 가지만 뜻한다.
+        """
+        _authorise_motion(_token_from(request))
+        return {"authorized": True}
+
     @router.post("/start")
     def start() -> dict[str, object]:
         """팔로워 serial을 잡고 관찰을 시작한다. 토크는 아직 걸지 않는다.

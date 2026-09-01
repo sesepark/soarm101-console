@@ -1,11 +1,8 @@
-# SO-ARM101 Operations Runbook
+# SO-ARM101 운영 Runbook
 
-현재 구현된 로컬 제어 기능과 향후 network 기능을 구분한다. 로컬 UI에는 observation-only
-gate, 단일 teleop/record mode, read-only doctor, camera 단일 소유, calibration 검증,
-SIGINT 정지가 있다.
-
-`PROTOCOL.md`의 network lease, heartbeat, watchdog, HOLD는 **가상 리더 경로에서는
-구현되어 있다**(아래 6절). 기존 물리 리더 텔레옵 경로에는 없다.
+현재 구현된 기능과 현장 검증 전 절차를 구분한다. 이 프로젝트는 안전 인증 시스템이 아니며,
+독립 actuator power cutoff와 물리 E-stop은 없다. 실제 팔을 움직이거나 토크를 거는 단계는
+현장에 사람이 있고 팔을 받칠 수 있을 때만 한다.
 
 ## 1. 기본 검증
 
@@ -16,11 +13,9 @@ uv sync --all-groups
 ./scripts/doctor.sh
 ```
 
-`doctor.sh`는 모터 상태를 읽기만 한다. 기대 결과는 arm별 ID 1–6, model 777, 적정 voltage,
-그리고 motion 시작 전 torque disabled다.
-
-웹 서비스는 `sg dialout`으로 실행된다. 셸 doctor는 성공하지만 웹 doctor만 port open에
-실패하면 `systemctl --user restart soarm-console.service` 후 서비스 child의 그룹을 확인한다.
+`doctor.sh`는 모터 register를 바꾸지 않고 ID 1–6, model 777, voltage, position, torque 상태를
+읽는다. 읽기도 serial packet을 보내므로 다른 owner가 있으면 장치 lock이 거절한다. motion
+시작 전 기대값은 두 팔 모두 healthy이고 torque가 꺼진 상태다.
 
 ## 2. Observation-only 웹 UI
 
@@ -29,162 +24,200 @@ grep '^SOARM_ENABLE_MOTION=' config/soarm.env
 ./scripts/run_web.sh
 ```
 
-기대값은 `SOARM_ENABLE_MOTION=0`이다. <http://127.0.0.1:8088>에서 다음을 확인한다.
+처음 기대값은 `SOARM_ENABLE_MOTION=0`이다. <http://127.0.0.1:8088>에서 확인한다.
 
-MacBook에서 접속할 때는 Mac 터미널에서 다음을 먼저 실행한다.
+1. `환경 진단`이 양쪽 bus 상태를 표시한다.
+2. Scene/Wrist preview가 각각 열리고 frame을 받는다.
+3. Preview 중지 후 camera owner가 해제된다.
+4. calibration이 없으면 teleop/record가 잠긴다.
+5. 잘못된 확인 문구는 hardware 접근 전에 HTTP 400으로 거부된다.
+
+MacBook에서 SSH tunnel로 관찰할 때는 Mac에서 실행한다.
 
 ```bash
 ssh -N -L 8088:127.0.0.1:8088 deploy@192.168.0.20
 ```
 
-터널이 유지되는 동안 Mac의 `127.0.0.1:8088`이 서버 웹 UI로 전달된다.
-
-1. `환경 진단`이 양쪽 bus 상태를 표시한다.
-2. Scene/Wrist preview가 각각 열리고 동시에 frame을 수신한다.
-3. Preview 중지 후 camera owner가 해제된다.
-4. Calibration이 없으면 teleop/record가 잠긴다.
-5. 잘못된 확인 문구는 hardware 접근 전에 HTTP 400으로 거부된다.
-
 ## 3. Calibration
 
-이 단계부터 실제 arm을 손으로 움직인다. 작업공간, clamp, cable, 전원 차단 수단을 먼저 확인한다.
+이 단계부터 실제 팔을 손으로 움직인다. 작업공간, clamp, cable, 전원 차단 수단을 먼저
+확인한다.
 
 ```bash
 ./scripts/calibrate_follower.sh
 ./scripts/calibrate_leader.sh
 ```
 
-Follower와 Leader의 가운데 자세를 잡고 각 관절을 순서대로 유효 범위 안에서 움직인다.
-생성될 파일은 다음과 같다.
+Follower와 Leader를 안전한 가운데 자세에 두고, 안내되는 관절을 하나씩 실사용 범위 안에서
+움직인다. 결과 파일은 다음 위치에 생긴다.
 
 ```text
 ~/.cache/huggingface/lerobot/calibration/robots/so_follower/soarm101_follower.json
 ~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/soarm101_leader.json
 ```
 
-웹 backend는 JSON motor name, ID 1–6, 필수 field, range min/max를 검사한다.
+웹 backend는 motor name, ID 1–6, range min/max를 검사한다. calibration 변경은 active motion과
+분리한다.
 
-## 4. 첫 Teleoperation
+## 4. 첫 물리 리더 Teleoperation
 
 1. 두 팔을 대응되는 비슷한 자세로 손으로 맞춘다.
 2. 현장에 사람이 있고 follower 주변에 장애물이 없는지 확인한다.
-3. `config/soarm.env`에서 `SOARM_ENABLE_MOTION=1`로 변경한다.
-4. 웹 서비스를 재시작한다.
-5. 웹 `환경 진단`에서 bus healthy와 torque disabled를 확인한다.
-6. `텔레옵 시작` → 현장 checkbox → `START SOARM101`을 입력한다.
-7. 작은 leader 변화로 방향과 joint mapping을 하나씩 확인한다.
-8. 문제가 있으면 `현재 모드 중지` 후 물리 전원 차단을 준비한다.
+3. `config/soarm.env`의 `SOARM_ENABLE_MOTION=1`을 확인하고 웹 서비스를 재시작한다.
+4. 웹 `환경 진단`에서 healthy와 torque disabled를 확인한다.
+5. `텔레옵 시작`에서 현장 확인 문구를 사람이 직접 입력한다. UI가 미리 채우지 않는다.
+6. 작은 변화로 관절 방향을 하나씩 확인한다.
+7. 문제가 있으면 `현재 모드 중지`를 누르고 물리 전원 차단을 준비한다.
 
-Follower command에는 기본 `max_relative_target=2`가 적용된다. 이는 독립 E-stop이 아니다.
+물리 리더 경로에는 가상 리더의 lease/watchdog/health trip이 없다. LeRobot의
+`max_relative_target=2`와 현장 사람만 남는다. 종료나 예외에서 자동 torque-off하지 않도록
+설정되어 있으므로, 프로세스가 멈췄다는 사실을 팔의 무에너지 상태로 해석하지 않는다.
 
 ## 5. Dataset recording
 
-1. Scene을 작업공간 전체, Wrist를 gripper와 접촉 지점이 보이게 고정한다.
-2. 두 preview로 역할과 방향을 확인한다.
-3. `config/soarm.env`에서 `SOARM_CAMERA_ROLES_CONFIRMED=1`로 변경한다.
-4. 웹 서비스를 재시작한다.
-5. 단일 task 문장, episode 수, episode 시간을 입력한다.
-6. `RECORD SOARM101` 확인 후 새 local session을 시작한다.
-7. 성공은 `성공 저장`, 실패는 `실패 폐기`, 종료는 `전체 수집 종료`를 사용한다.
-8. `data/`의 metadata, Parquet, MP4, episode count를 검토한다.
-9. 검토가 끝난 dataset만 별도 명령으로 Hugging Face Hub에 upload한다.
+1. 작업공간 전체가 보이도록 Scene camera를, gripper와 접촉 지점이 보이도록 Wrist camera를
+   고정한다.
+2. 두 preview로 역할과 방향을 확인한 뒤 preview를 중지한다.
+3. `SOARM_CAMERA_ROLES_CONFIRMED=1`을 확인한다.
+4. 수집 확인 문구는 사람이 직접 입력하고 task, episode 수와 시간을 고른다.
+5. 성공은 오른쪽, 재시도는 왼쪽, 종료는 Esc에 해당하는 웹 제어로 기록한다.
+6. `data/`의 dataset과 `runtime/record/status.json` 상태를 확인한다.
 
-웹 camera preview와 recording은 같은 장치를 동시에 열 수 없다. Record 시작 시 preview를
-중지하며, camera가 다른 process에 점유돼 있으면 `scripts/record.sh`가 거부한다.
+수집 중 serial과 camera owner는 `lerobot-record`다. 가상 리더 수집이면 콘솔은 목표만
+중계한다. 이때 부하·전류·온도·추종오차 감지는 **아직 구현되지 않았다**. 조사 결과만
+[ADR 0004 초안](ADR/0004-recording-safety-ladder-draft.md)에 있다.
 
-## 6. 정상 종료
+## 6. 가상 리더
 
-1. 웹에서 `현재 모드 중지`를 누른다.
-2. Log에서 process return을 확인한다.
-3. Camera preview를 중지한다.
-4. 필요하면 웹 서비스를 종료한다.
-5. Serial/video owner가 없는지 확인한다.
+가상 리더는 물리 리더 팔 대신 3D viewer의 목표를 받아 follower를 제어한다. 설계는
+[ADR 0002](ADR/0002-virtual-leader-owner.md), 장치 소유권은
+[ADR 0003](ADR/0003-device-owner-lock.md)을 따른다.
 
-```bash
-fuser /dev/ttyACM0 /dev/ttyACM1 /dev/video0 /dev/video2
-```
+### 6.1 한 번만 하는 설정과 Tailscale Serve
 
-## 7. 장애 처리
-
-- Leader/Follower 단절: 새 action을 시작하지 말고 active mode를 중지한다.
-- Camera 단절: dataset recording을 중지하고 해당 episode를 사용하지 않는다.
-- Web/API 단절: systemd가 process group을 정리하는지 확인한다.
-- SIGINT 정지 실패: 독립 power cutoff를 사용한다. 자동 강제 재개하지 않는다.
-- SSH 단절: SSH 자체는 heartbeat가 아니다. 현재 network control은 구현되지 않았다.
-- Calibration mismatch: motion gate를 다시 닫고 두 calibration을 재검토한다.
-
-
-## 6. 가상 리더 (물리 리더 팔 없는 원격 텔레옵)
-
-3D로 그린 팔을 맥 앱이나 아이폰에서 끌면 팔로워가 따라온다. 설계 근거는
-[ADR 0002](ADR/0002-virtual-leader-owner.md), 문턱값과 미확인 항목은 맥 앱 저장소의
-`docs/원격_텔레옵_안전.md`에 있다.
-
-### 6.1 한 번만 하는 설정
+조작 토큰은 관찰에는 필요 없고 motion 권한 확인에만 쓴다. 실제 값은 응답이나 문서에 넣지
+않는다.
 
 ```bash
-# 조작 권한 토큰. 관찰에는 필요 없고 팔을 움직이는 요청에만 붙는다.
 python3 -c "import secrets; print(secrets.token_urlsafe(24))"
-# config/soarm.env 에 SOARM_MOTION_TOKEN=<값> 을 넣고
-systemctl --user restart soarm-console
+# 출력값을 config/soarm.env의 SOARM_MOTION_TOKEN에 저장한 뒤 서비스를 재시작한다.
 curl -s http://127.0.0.1:8088/api/vleader | python3 -m json.tool | head -20
 ```
 
-`preflight`가 비어 있어야 시작할 수 있다. 비어 있지 않으면 그 문장이 이유다.
+`preflight`가 비어 있어야 한다. 비어 있지 않으면 그 문장이 시작을 막는 이유다.
 
-아이폰에서 쓰려면 Tailscale Serve를 켠다. tailnet 안에서만 열리고 funnel은 쓰지 않는다.
+아이폰 경로는 Tailscale Serve만 쓰며 Funnel은 쓰지 않는다. 2026-09-01 이 노드에서 아래
+명령을 실행했을 때 Serve가 아직 tailnet에 활성화되지 않아 거절되었다.
+Serve는 tailnet 안에만 공개되고 HTTPS 인증서를 요구한다는 동작은
+[Tailscale 공식 Serve 문서](https://tailscale.com/docs/features/tailscale-serve)를 기준으로 한다.
+
+```bash
+tailscale serve --bg --https=443 8088
+```
+
+계정 소유자가 브라우저에서 한 번 열어 승인할 실제 활성화 주소는 다음과 같다.
+
+```text
+https://login.tailscale.com/f/serve?node=nDaRZnYuwm11CNTRL
+```
+
+이 주소는 이 Tailscale node에 대응한다. 승인 뒤 서버에서 다시 실행하고 공개된 tailnet URL을
+확인한다.
 
 ```bash
 tailscale serve --bg --https=443 8088
 tailscale serve status
+tailscale serve status --json
 ```
 
-`Serve is not enabled on your tailnet`이 나오면 안내된 주소를 브라우저에서 한 번 열어
-켠 뒤 다시 실행한다.
+`Available within your tailnet` 아래의 `https://<node>.<tailnet>.ts.net`을 `TAILNET_URL`로
+쓴다. 다음 검사는 viewer를 열 뿐 팔을 시작하거나 토크를 걸거나 목표를 보내지 않는다.
+
+```bash
+TAILNET_URL='https://<tailscale-serve-status에 표시된 주소>'
+
+# 관찰 화면은 200이어야 한다.
+curl -sS -o /dev/null -w 'viewer=%{http_code}\n' "$TAILNET_URL/viewer/"
+
+# application token이 없으면 401이어야 한다.
+curl -sS -o /dev/null -w 'token 없음=%{http_code}\n' \
+  "$TAILNET_URL/api/vleader/motion-auth"
+
+# 다른 tailnet 장치에서 토큰을 화면에 보이지 않게 입력한다. 이 GET은 motion을 하지 않는다.
+read -rsp 'SOARM_MOTION_TOKEN: ' MOTION_TOKEN; echo
+printf 'header = "X-SOARM-Motion-Token: %s"\n' "$MOTION_TOKEN" | \
+  curl --config - -sS -o /dev/null -w 'token 있음=%{http_code}\n' \
+  "$TAILNET_URL/api/vleader/motion-auth"
+unset MOTION_TOKEN
+```
+
+기대 코드는 차례대로 `200`, `401`, `200`이다. 마지막 200은 토큰이 맞다는 뜻뿐이며 장치 준비,
+확인 문구 통과, motion 허가를 뜻하지 않는다. 이 점검 endpoint는 확인 문구와 그 값을 반환하지
+않는다. Serve 승인 전이므로 이 tailnet 실검증은 **아직 수행되지 않았다**.
 
 ### 6.2 평소 순서
 
-1. `POST /api/vleader/start` — 팔로워 serial을 잡고 30Hz 관찰. **토크는 걸지 않는다.**
-2. 토크를 걸기 전에 팔을 손으로 움직여 3D가 같은 방향으로 도는지 본다.
-3. `POST /api/vleader/arm` + `MOVE SOARM101` — 토크를 건다.
-4. `POST /api/vleader/lease` — 조작 권한 하나. 동시에 하나만 발급된다.
-5. 조작. 손을 떼면 팔은 그 자리에 선다.
-6. `DELETE /api/vleader/lease/{id}` — 반납. 팔은 자세를 유지한다.
-7. `POST /api/vleader/stop` — 루프를 내린다. **토크가 걸려 있으면 거절한다.**
+아래 3번부터는 실제 팔 절차다. 이번 변경 작업에서는 실행하지 않았다.
 
-### 6.3 멈췄을 때
+1. `POST /api/vleader/start` — follower serial을 잡고 30Hz로 관찰한다. 토크는 걸지 않는다.
+2. 토크가 꺼진 채 팔을 손으로 움직여 3D가 같은 방향으로 도는지 확인한다.
+3. 현장 사람이 확인 문구를 직접 입력해 `POST /api/vleader/arm`을 수행한다.
+4. 다시 확인 문구를 직접 입력해 `POST /api/vleader/lease`로 조작 권한 하나를 받는다.
+5. 작은 범위부터 조작한다. 손을 떼면 팔은 그 자세를 유지한다.
+6. `DELETE /api/vleader/lease/{id}`로 반납한다. 팔은 자세를 유지한다.
+7. 사람이 팔을 받치고 별도 확인을 거친 torque release 뒤 `POST /api/vleader/stop`으로 루프를
+   내린다. 토크가 걸려 있으면 기본 stop은 거절한다.
+
+### 6.3 HOLD/FAULT
 
 ```bash
 curl -s http://127.0.0.1:8088/api/vleader | python3 -c \
   "import json,sys; d=json.load(sys.stdin); print(d['state'], d['fault'])"
 ```
 
-- `HOLD` + `fault.code` — 왜 멈췄는지가 그 안에 있다. 원인을 확인한 뒤
-  `POST /api/vleader/resume`. **이전 동작을 이어서 하지 않는다** — 다음 명령은 현재 자세
-  근처에서 시작해야 한다.
-- `FAULT` + `HARDWARE_ERROR` — serial이 흔들렸다. 토크는 그대로 두었다. 팔을 받치고
-  `POST /api/vleader/torque/release` + `RELEASE TORQUE SOARM101`로 내리거나,
-  버스가 돌아왔으면 `resume`.
-- **팔이 계속 움직이면** 소프트웨어를 믿지 말고 전원 플러그를 뽑는다. 독립 차단 수단은 없다.
+- `HOLD`이면 `fault.code`의 원인을 확인한 뒤 사람이 `resume`한다. 이전 동작은 자동 재개하지
+  않으며, 다음 명령은 현재 자세 근처에서 다시 시작한다.
+- `HARDWARE_ERROR`여도 자동으로 토크를 끄지 않는다. 버스가 돌아왔는지 확인하거나, 사람이
+  팔을 받친 뒤 별도 torque release 절차를 따른다.
+- 팔이 계속 움직이면 software stop을 믿지 말고 물리 전원을 차단한다.
 
-### 6.4 누가 쥐고 있는지 모를 때
+### 6.4 lease와 장치 owner 확인
 
 ```bash
 curl -s http://127.0.0.1:8088/api/vleader | python3 -c \
   "import json,sys; d=json.load(sys.stdin); print(d['lease'], d['lease_history'][-3:])"
-curl -s -X POST http://127.0.0.1:8088/api/vleader/hold   # 토큰도 리스도 필요 없다
+curl -s -X POST http://127.0.0.1:8088/api/vleader/hold
 ```
 
-리스는 5초 만에 만료되므로, 쥔 쪽이 사라졌다면 기다리면 풀린다. 강제로 빼앗는 길은 없다.
+lease는 5초 만에 만료되며 강제로 빼앗는 길은 없다. 장치 owner lock 기본 위치는
+`$XDG_RUNTIME_DIR/soarm-console/owner-locks/*.lock`이고, `XDG_RUNTIME_DIR`이 없으면
+`/tmp/soarm-console-$UID/owner-locks/*.lock`이다.
 
-### 6.5 상호배타 확인
+```bash
+lslocks -o PID,COMMAND,PATH | rg 'soarm-console|owner-locks'
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  OWNER_LOCK_DIR="$XDG_RUNTIME_DIR/soarm-console/owner-locks"
+else
+  OWNER_LOCK_DIR="/tmp/soarm-console-$UID/owner-locks"
+fi
+for lock in "$OWNER_LOCK_DIR"/*.lock; do
+  [ -e "$lock" ] && python3 -m json.tool "$lock"
+done
+```
 
-가상 리더가 도는 동안 `lerobot-teleoperate`와 `lerobot-record`(물리 리더)는 409로 막힌다.
-그 반대도 같다. 셋이 겹치면 같은 serial에 두 프로세스가 말을 걸어 status packet이 깨진다 —
-개발 중에 실제로 한 번 보았고, 그 상태의 로그는
-`Failed to read 'Present_Voltage' on id_=1 ... Incorrect status packet!`이다.
+active 여부는 JSON의 PID가 아니라 커널 `flock`이 결정한다. crash 뒤 파일이 남아도
+정상 시작이 자동으로 stale metadata를 덮어쓴다.
 
-### 6.6 하드웨어 없이 시험하기
+lock 파일을 삭제하거나 수정해 owner를 빼앗지 않는다. active owner이면 정상 stop/SIGINT를
+쓰고, 이미 죽었다면 원하는 정상 경로를 다시 시작한다. 계속 막히면 metadata, `lslocks`, 장치
+`fuser`를 함께 검토한다. `force-unlock` 경로는 없다.
+
+프로젝트가 제어하는 가상 리더·물리 텔레옵·수집은 프로세스가 달라도 lock으로 상호배타다.
+그러나 advisory lock을 무시하고 upstream `lerobot-teleoperate`를 직접 실행한 프로세스까지
+OS가 차단하지는 않는다. 직접 upstream 실행은 지원 운용 경로가 아니며, 막힌다고 가정하지
+않는다.
+
+### 6.5 하드웨어 없이 시험하기
 
 ```bash
 SOARM_VL_BACKEND=simulated SOARM_VL_SIM_OBSTACLE=elbow_flex:12 \
@@ -192,55 +225,144 @@ SOARM_VL_BACKEND=simulated SOARM_VL_SIM_OBSTACLE=elbow_flex:12 \
   .venv/bin/uvicorn soarm_console.app:app --app-dir src --port 8090
 ```
 
-흉내 백엔드는 serial을 열지 않는다. `SOARM_VL_SIM_OBSTACLE`로 지정한 각도에서 관절이 막혀
-접촉 트립과 물러남을 팔 없이 걸어 볼 수 있다.
+simulated backend는 실물 serial을 열거나 lock하지 않는다. 접촉 trip과 물러남을 팔 없이 확인할
+수 있다.
 
-### 6.7 접촉 문턱 실측
+### 6.6 접촉 문턱 실측
 
-`scripts/measure_contact.py`가 관절별 `Present_Load`/`Present_Current`/`Present_Temperature`를
-10Hz로 찍어 백분위수를 낸다. 이 스크립트는 **스스로 토크를 걸지 않는다** — 이미 걸려 있는
-상태를 읽기만 한다.
+`scripts/measure_contact.py`는 관절별 `Present_Load`, `Present_Current`,
+`Present_Temperature`를 10Hz로 읽는다. 스스로 토크를 걸거나 끄지 않는다. `handled`,
+`holding`, `contact`는 사람이 현장에 있을 때만 측정하며, 뒤의 두 단계는 이미 토크가 걸린
+상태를 요구한다.
+
+| 단계 | 무엇을 재는가 | 사람 | 토크 |
+|---|---|---|---|
+| `quiescent` | 팔을 건드리지 않은 바닥값 | 불필요 | 꺼짐 |
+| `handled` | 사람이 토크가 꺼진 팔을 손으로 움직이는 동안 | 필요 | 꺼짐 |
+| `holding` | 자세를 유지하며 중력을 버티는 동안 | 필요 | 걸림 |
+| `contact` | 사람이 통제해 팔을 물체에 접촉시키는 동안 | 필요 | 걸림 |
+
+실측할 때는 요약 결과 JSON을 각각 남긴다. 다음 명령은 절차 기록이며 이번 작업에서는 실행하지
+않았다.
 
 ```bash
-sg dialout -c ".venv/bin/python scripts/measure_contact.py quiescent --seconds 25"
+mkdir -p runtime/contact
+sg dialout -c ".venv/bin/python scripts/measure_contact.py handled --seconds 30 \
+  --json runtime/contact/handled.json"
+
+# 현장 절차로 토크를 건 뒤 가상 리더 loop만 내려 serial owner를 반납한다.
+sg dialout -c ".venv/bin/python scripts/measure_contact.py holding --seconds 30 \
+  --json runtime/contact/holding.json"
+# contact는 측정 창 전체에서 사람이 같은 접촉을 유지한 상태로 시작한다.
+sg dialout -c ".venv/bin/python scripts/measure_contact.py contact --seconds 30 \
+  --json runtime/contact/contact.json"
 ```
 
-네 단계가 있고, 뒤의 둘은 토크를 요구하므로 **사람이 현장에 있을 때만** 한다.
+가상 리더가 follower serial을 쥐고 있으면 측정기는 owner lock에서 거절된다. `holding`과
+`contact`를 재기 위해 loop만 강제 종료하는 기존 절차는 토크를 그대로 남긴다. 반드시 현장
+사람이 팔과 전원 플러그에 닿는 상태에서만 한다.
 
-| 단계 | 무엇을 재는가 | 사람 필요 |
-|---|---|---|
-| `quiescent` | 토크 끄고 가만히. 바닥값 | 아니오 |
-| `handled` | 토크 끄고 사람이 팔을 손으로 움직이는 동안 | 예 |
-| `holding` | 토크 걸고 자세를 유지하는 동안. 중력을 버티는 부하 | 예 |
-| `contact` | 토크 걸고 사람이 팔을 무언가에 대고 미는 동안 | 예 |
-
-**문턱은 `holding`의 최대값과 `contact`의 최소값 사이에 있어야 한다.** `holding`보다 낮으면
-가만히 있어도 걸리고, `contact`보다 높으면 닿아도 안 걸린다.
-
-가상 리더가 팔로워 serial을 쥐고 있으면 이 스크립트는 열지 못한다(소유자는 하나다).
-`holding`/`contact`를 재려면 토크를 건 뒤 `POST /api/vleader/stop?force=true`로 콘솔의 루프만
-내린다 — 토크는 그대로 남는다.
-
-#### 잰 값
+#### 실측값과 문턱 결정 규칙
 
 `quiescent` (2026-09-01, 25초, 10Hz, 토크 꺼짐, 팔 정지):
 
-```
-관절                 부하 p50    p95    max   전류 p50    p95    max  (mA max)   온도 max
-shoulder_pan            0      0      0        0      0      1         6       36
-shoulder_lift           0      0      0        0      0      0         0       36
-elbow_flex              0      0      0        0      0      1         6       34
-wrist_flex              0      0      0        0      0      0         0       36
-wrist_roll              0      0      0        0      0      1         6       41
-gripper                 0      0      0        0      0      0         0       48
+```text
+관절              부하 min  p50  p95  max  전류 min  p50  p95  max  (mA max)  온도 max
+shoulder_pan            0    0    0    0         0    0    0    1         6        36
+shoulder_lift           0    0    0    0         0    0    0    0         0        36
+elbow_flex              0    0    0    0         0    0    0    1         6        34
+wrist_flex              0    0    0    0         0    0    0    0         0        36
+wrist_roll              0    0    0    0         0    0    0    1         6        36
+gripper                 0    0    0    0         0    0    0    0         0        48
 ```
 
-읽는 법: 쉬는 중의 부하와 전류는 **0이다.** 지금 문턱(부하 400, 전류 108)은 그보다 한참
-위이므로, 가만히 있는 팔이 이유 없이 서는 일은 없다. 아직 모르는 것은 반대쪽 — 실제로
-닿았을 때 어떤 숫자가 나오는지다. `holding`과 `contact`를 재기 전까지 400과 108은 여전히
-유추값이다.
+남은 칸은 실측 전에는 채우지 않는다.
 
-온도는 다르다. **집게가 쉬는 중에도 48°C**로 다른 관절보다 12°C 이상 높다. 경고 문턱을
-처음 55°C로 잡았더니 집게는 평소에도 경고에 가까웠고, 그런 경고는 진짜로 뜨거워졌을 때
-아무도 믿지 않게 만든다. 그래서 58°C로 올렸다(정지 65°C, 서보 자체 차단 70°C는 그대로).
-`holding`을 재고 나면 이 값도 다시 봐야 한다.
+| 신호 | holding 최대 | contact 최소 | 허용 구간 | 선택값 |
+|---|---:|---:|---:|---:|
+| `Present_Load` | — 미측정 | — 미측정 | — | 현재 400 |
+| `Present_Current` | — 미측정 | — 미측정 | — | 현재 108 |
+
+문턱은 신호별로 반드시 다음을 만족해야 한다.
+
+```text
+holding에서 관측한 최대값 < 새 문턱 < contact에서 관측한 최소값
+```
+
+contact 시작 전의 비접촉 표본이나 접촉을 푸는 전환 표본이 섞이면 최소값으로 쓸 수 없으므로
+그 trial은 버리고 다시 잰다. 접촉 대상 관절과 방향별 유효 trial의 최소값만 비교한다.
+정상 holding보다 낮으면 자세 유지 중 오검출하고, contact 최소보다 높으면 접촉을 놓친다.
+반복 측정과 대상 관절에서 이 구간이 겹치지 않으면 임의의 중간값을 고르지 않는다. 단일 전역
+문턱으로 분리할 수 없다는 결과로 기록하고 관절별 문턱 또는 다른 신호 조합을 다시 설계한다.
+
+`holding`과 `contact`를 재기 전까지 `SOARM_VL_LOAD_TRIP=400`과
+`SOARM_VL_CURRENT_TRIP=108`은 여전히 데이터시트와 LeRobot 기본값에서 가져온 **유추값**이다.
+quiescent가 0이라는 사실만으로 접촉 검출이 검증되었다고 쓰지 않는다.
+
+### 6.7 온도 문턱 재검토
+
+quiescent에서 팔 관절은 34–36°C였지만 gripper는 48°C였다. 그래서 경고를 55°C에서 58°C로
+올렸고, 현재 정지는 65°C다. STS3215 자체 차단은 70°C에서 토크를 끊어 팔을 떨어뜨릴 수 있어,
+software 정지가 그보다 먼저 HOLD하기 위해 이 문턱들이 존재한다. 어떤 온도 fault에서도
+자동 torque-off하지 않는다.
+
+측정기는 이제 온도의 시작, 끝, 상승량, 최대를 함께 출력한다. holding 뒤 아래 칸을 채운다.
+
+| 관절 | 시작 °C | 끝 °C | 상승 °C/측정시간 | 최대 °C | 판정 |
+|---|---:|---:|---:|---:|---|
+| shoulder_pan | — | — | — | — | 미측정 |
+| shoulder_lift | — | — | — | — | 미측정 |
+| elbow_flex | — | — | — | — | 미측정 |
+| wrist_flex | — | — | — | — | 미측정 |
+| wrist_roll | — | — | — | — | 미측정 |
+| gripper | — | — | — | — | 미측정 |
+
+58–65°C의 7°C 간격이 쓸모 있는지는 다음으로 판단한다.
+
+1. 정상 holding 최대와 측정 변동이 58°C 아래에 있어 경고가 상시 켜지지 않는가.
+2. 관측된 가장 빠른 상승률에서 58°C 경고 후 65°C HOLD까지 현장 사람이 대응할 시간이 있는가.
+3. 65°C HOLD가 70°C 자체 torque 차단보다 충분히 먼저 작동하는가.
+
+실측 전에는 58/65가 검증되었다고 쓰지 않는다. 관절별 열 거동이 달라 전역 scalar가 유효하지
+않으면 다음 config 모양을 제안한다. **현재 구현은 이 TOML이나 관절별 override를 읽지 않는다.**
+
+```toml
+[virtual_leader.temperature.default]
+warn_c = 58
+trip_c = 65
+
+[virtual_leader.temperature.joints.gripper]
+warn_c = 60  # 예시 모양일 뿐, 실측값이 아니다.
+trip_c = 65
+```
+
+미지정 관절은 default를 쓰고, 모든 `trip_c`는 70°C보다 낮아야 한다. 실제 숫자는 holding 실측
+뒤에만 제안한다.
+
+## 7. 정상 종료
+
+1. 웹에서 `현재 모드 중지`를 누른다.
+2. process return과 fault를 확인한다.
+3. camera preview를 중지한다.
+4. 필요하면 웹 서비스를 종료한다.
+5. serial/video owner와 owner lock을 확인한다.
+
+```bash
+fuser /dev/ttyACM0 /dev/ttyACM1 /dev/video0 /dev/video2
+lslocks -o PID,COMMAND,PATH | rg 'soarm-console|owner-locks'
+```
+
+프로세스 종료는 torque-off를 뜻하지 않는다. 팔을 받치고 명시적으로 해제하지 않았다면 토크가
+남아 있다고 취급한다.
+
+## 8. 장애 처리
+
+- Leader/Follower 단절: 새 action을 시작하지 말고 active mode를 중지한다.
+- Camera 단절: recording을 중지하고 해당 episode를 사용하지 않는다.
+- Web/API 단절: process group 상태를 확인한다. 자동 motion 재개는 하지 않는다.
+- SIGINT 정지 실패: owner lock을 지우지 않는다. 프로세스와 장치 `fuser`를 조사하고, 실제
+  motion이 계속되면 물리 전원을 차단한다.
+- SSH 단절: SSH 자체는 heartbeat가 아니다.
+- Calibration mismatch: motion gate를 닫고 두 calibration을 재검토한다.
+- 어떤 software fault에서도 자동으로 torque를 끄지 않는다. 사람이 팔을 받친 뒤 별도 절차를
+  따른다.

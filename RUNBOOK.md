@@ -414,6 +414,37 @@ trip_c = 65
 미지정 관절은 default를 쓰고, 모든 `trip_c`는 70°C보다 낮아야 한다. 실제 숫자는 holding 실측
 뒤에만 제안한다.
 
+### 6.8 관찰은 팔을 뻣뻣하게 만들지 않는다
+
+`start`는 읽기다. 끝나고 나서 상태가 `SAFE`(토크 꺼짐)여야 한다. `READY`로 나온다면
+누군가 이미 토크를 걸어 둔 팔을 이어받은 것이고, 그때만 그렇다.
+
+한동안 그렇지 않았다. LeRobot의 `SOFollower.connect()`는 안에서 `configure()`를 부르고,
+그 안의 `with bus.torque_disabled():`가 **빠져나오면서 토크를 켠다.** 그래서 관찰만
+시작해도 팔이 뻣뻣해졌고, 확인을 요구하는 `arm` 게이트를 지나지 않고도 팔이 명령을 받을 수
+있는 상태가 되었다. 지금은 `connect()`를 통째로 부르지 않고 그 안의 일을 직접 하면서,
+붙기 전의 토크 상태를 기억해 원래대로 돌려놓는다. 확인하는 방법:
+
+```bash
+curl -sX POST 127.0.0.1:8088/api/vleader/start >/dev/null
+curl -s 127.0.0.1:8088/api/vleader | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["state"], d["torque_enabled"])'
+# SAFE False   ← 이래야 한다
+```
+
+### 6.9 내리기를 거절당한 뒤
+
+토크가 걸린 채 `stop`을 부르면 409로 거절한다. 정상이다 — 아무도 보지 않는 곳에 토크가
+걸린 팔을 남기지 않는다. 거절당한 뒤에도 `running`은 `true`여야 한다. `false`인데 다음
+`start`가 `Device is owned by virtual-leader (pid …)`로 막힌다면, 그 pid는 십중팔구
+콘솔 자기 자신이다. 서비스를 재시작하는 것 말고는 방법이 없다:
+
+```bash
+systemctl --user restart soarm-console
+```
+
+이 상태를 만들던 원인(참조를 먼저 버리고 그다음에 내리려 했다)은 고쳤다. 다시 나타난다면
+`VirtualLeaderService.stop()`의 순서를 먼저 본다.
+
 ## 7. 정상 종료
 
 1. 웹에서 `현재 모드 중지`를 누른다.

@@ -419,3 +419,49 @@ def test_handover_clears_a_released_hold_but_not_a_real_one(console):
     after = client.get("/api/vleader").json()
     assert after["state"] == "HOLD"
     assert after["fault"]["code"] == "OPERATOR_HOLD"
+
+
+def test_a_refused_stop_keeps_the_arm_reachable(console):
+    """내리기를 거절당해도 소유자를 놓치지 않는다.
+
+    순서가 반대였을 때 실제로 이런 일이 났다: 토크가 걸린 채 `stop`을 부르면 서비스가
+    참조를 먼저 버리고 그다음에 거절당했다. 루프는 계속 돌면서 장치와 lock을 쥐고 팔을
+    잡고 있는데 화면은 "꺼짐"이라고 말했고, 그 루프에는 다시 닿을 수 없었다 — 토크를
+    풀 수도, 다시 시작할 수도 없었다. 다음 `start`는 자기 자신이 쥔 lock에 막혔다.
+    """
+    client, vleader = console
+    assert start_and_arm(client).status_code == 200
+
+    refused = client.post("/api/vleader/stop")
+    assert refused.status_code == 409
+    # 거절당한 뒤에도 루프는 서비스의 것이다. 화면이 "꺼짐"이라고 말하지 않는다.
+    assert client.get("/api/vleader").json()["running"] is True
+
+    # 그래서 토크를 풀 수 있고, 그다음에는 내려간다.
+    released = motion(
+        client,
+        "POST",
+        "/api/vleader/torque/release",
+        json={"confirmation": "RELEASE TORQUE SOARM101"},
+    )
+    assert released.status_code == 200
+    assert client.post("/api/vleader/stop").status_code == 200
+    assert client.get("/api/vleader").json()["running"] is False
+
+
+def test_a_bus_that_fails_to_start_says_why_instead_of_500(console, monkeypatch):
+    """시작이 실패해도 이유가 남는다.
+
+    status packet 하나가 깨져 `ConnectionError`가 올라왔을 때 이 자리에서 500이 나갔고,
+    화면에는 "서버가 요청을 끝내지 못했습니다"만 떴다. 무엇이 잘못됐는지가 사라지면
+    사람은 다음에 무엇을 해야 할지 알 수 없다.
+    """
+    client, vleader = console
+
+    def explode():
+        raise ConnectionError("Failed to write 'Lock' on id_=5. [TxRxResult] There is no status packet!")
+
+    monkeypatch.setattr(vleader, "start", explode)
+    response = client.post("/api/vleader/start")
+    assert response.status_code == 409
+    assert "status packet" in response.json()["detail"]

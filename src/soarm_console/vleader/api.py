@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -34,6 +35,12 @@ class ArmRequest(BaseModel):
     confirmation: str
 
 
+class PolicyRequest(BaseModel):
+    """바꿀 값들. 이름은 `as_dict()`가 내놓는 것과 같다."""
+
+    values: dict[str, float] = {}
+
+
 class LeaseRequest(BaseModel):
     #: 조작 권한을 받는 순간의 확인 문구. 토크를 거는 자리에도 같은 것을 요구하지만,
     #: 그것만으로는 모자란다 — 토크가 이미 걸려 있으면 그 게이트를 지나치게 되고,
@@ -42,6 +49,53 @@ class LeaseRequest(BaseModel):
     confirmation: str = ""
     holder: str = "unknown"
     session_id: str = ""
+
+
+#: 앱에서 조절할 수 있는 값과 그 범위.
+#:
+#: 전부를 열지 않는다. 온도 문턱처럼 하드웨어를 지키는 값은 화면에서 만질 것이 아니고,
+#: 리스 만료처럼 프로토콜이 정하는 값은 양쪽이 같아야 한다. 여기 있는 것은 **조작감과
+#: 민감도** — 사람이 팔을 써 보고 "너무 약하다 / 너무 잘 멈춘다"고 느끼는 값들이다.
+#:
+#: 범위를 두는 이유는 오타 하나로 팔이 최고 속도로 출발하지 않게 하기 위해서다. 위쪽
+#: 끝(step_deg 15 = 450°/s)은 서보 무부하 속도(252°/s)보다 이미 위라 사실상 상한 없음이다.
+TUNABLES: dict[str, tuple[float, float, type, str]] = {
+    "step_deg": (1.0, 15.0, float, "SOARM_VL_STEP_DEG"),
+    "step_percent": (1.0, 12.0, float, "SOARM_VL_STEP_PERCENT"),
+    "sync_tolerance_deg": (2.0, 25.0, float, "SOARM_VL_SYNC_TOLERANCE_DEG"),
+    "following_error_deg": (1.0, 20.0, float, "SOARM_VL_FOLLOW_ERROR_DEG"),
+    "stall_load": (40, 500, int, "SOARM_VL_STALL_LOAD"),
+    "stall_load_ms": (200, 5000, int, "SOARM_VL_STALL_LOAD_MS"),
+    "retreat_deg": (1.0, 15.0, float, "SOARM_VL_RETREAT_DEG"),
+}
+
+
+def _persist_tunables(applied: dict[str, float]) -> str | None:
+    """바꾼 값을 `config/soarm.env`에 남긴다. 다음 재시작에도 살아 있어야 한다.
+
+    파일에는 조작 토큰도 들어 있으므로 통째로 다시 쓰지 않고, 해당 줄만 갈아 끼우거나
+    없으면 끝에 붙인다. 쓰지 못해도 지금 적용된 값은 살아 있다 — 그 사실을 호출한 쪽에
+    돌려준다.
+    """
+    # 시험이 진짜 설정 파일에 쓰지 않도록 자리를 바꿀 수 있게 둔다. 한 번 그렇게 쓰였고,
+    # 그 뒤로 서버의 step_deg가 시험이 정한 값으로 남아 있었다.
+    override = os.getenv("SOARM_ENV_FILE")
+    path = Path(override) if override else Path(__file__).resolve().parents[3] / "config" / "soarm.env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        for name, value in applied.items():
+            variable = TUNABLES[name][3]
+            rendered = f"{variable}={value}"
+            for index, line in enumerate(lines):
+                if line.strip().startswith(f"{variable}="):
+                    lines[index] = rendered
+                    break
+            else:
+                lines.append(rendered)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return None
+    except OSError as exc:  # noqa: BLE001 - 적용은 됐고 저장만 실패했다
+        return str(exc)
 
 
 class VirtualLeader:
@@ -61,6 +115,18 @@ class VirtualLeader:
         #: 루프가 뜨기 전에 붙은 연결은 영영 아무것도 받지 못한다 — 화면을 먼저 열고
         #: 조작 권한을 나중에 받는 것이 정상적인 순서인데도 그렇다.
         self._listeners: list = []
+
+    def retune(self, values: dict[str, float]) -> None:
+        """조작감 값들을 갈아 끼운다.
+
+        설정은 얼려 둔 값이다. 그 자리에서 고치는 대신 새 것을 만들어 **들고 있는 곳마다**
+        건네준다 — 권한 관리자와 제어 루프(그리고 루프 안의 검증기·감지기)가 각각 참조를
+        쥐고 있어서, 한 곳만 바꾸면 나머지가 옛 값으로 계속 판단한다.
+        """
+        self.policy = replace(self.policy, **values)
+        self.authority.settings = self.policy
+        if self._owner is not None:
+            self._owner.adopt_settings(self.policy)
 
     # MARK: 계약
 
@@ -413,6 +479,50 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             # 반납했다고 팔을 떨어뜨리지 않는다. 지금 자세에서 선다.
             owner.hold(Trip.LEASE_RELEASED)
         return {"released": released}
+
+    @router.get("/policy")
+    def read_policy() -> dict[str, object]:
+        return {
+            "policy": vleader.policy.as_dict(),
+            "tunable": {
+                name: {"min": low, "max": high, "integer": cast is int, "env": variable}
+                for name, (low, high, cast, variable) in TUNABLES.items()
+            },
+        }
+
+    @router.post("/policy")
+    def write_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
+        """조작감과 민감도를 바꾼다.
+
+        **팔이 움직이는 중에는 받지 않는다.** 틱당 상한이 커지는 순간 목표가 한 번에
+        멀어지고, 그러면 팔이 튀어 나간다. 세워 두고 바꾸는 것이 맞다.
+        """
+        _authorise_motion(_token_from(request))
+        owner = vleader.owner
+        if owner is not None and owner.state == State.ACTIVE:
+            raise HTTPException(
+                status_code=409,
+                detail="팔이 움직이는 중에는 바꿀 수 없습니다. 먼저 정지하세요.",
+            )
+        applied: dict[str, float] = {}
+        for name, raw in (body.values or {}).items():
+            if name not in TUNABLES:
+                raise HTTPException(status_code=400, detail=f"바꿀 수 없는 값입니다: {name}")
+            low, high, cast, _ = TUNABLES[name]
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"{name}: 숫자가 아닙니다") from exc
+            if not low <= value <= high:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{name}은(는) {low}에서 {high} 사이여야 합니다 (받은 값 {value})",
+                )
+            applied[name] = value
+        if applied:
+            vleader.retune(applied)
+        problem = _persist_tunables(applied)
+        return {"policy": vleader.policy.as_dict(), "applied": applied, "save_error": problem}
 
     @router.post("/hold")
     def hold() -> dict[str, object]:

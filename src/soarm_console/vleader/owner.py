@@ -500,6 +500,18 @@ class VirtualLeaderOwner:
         self.authority.require_resync()
         self._state = State.HOLD
 
+    def adopt_settings(self, settings) -> None:
+        """새 설정을 받아 든다.
+
+        설정은 얼려 둔(frozen) 값이라 그 자리에서 고치지 않고 통째로 갈아 끼운다. 들고
+        있는 곳이 넷이므로 한 곳이라도 빠뜨리면 어떤 검사만 옛 문턱으로 남는다 — 그런
+        어긋남은 화면에서 보이지 않는다.
+        """
+        with self._lock:
+            self.settings = settings
+            self.validator.settings = settings
+            self.detector.settings = settings
+
     def _movement(self) -> dict[str, float]:
         """최근 창 동안 관절이 실제로 얼마나 움직였는가.
 

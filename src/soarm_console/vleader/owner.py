@@ -137,6 +137,20 @@ class VirtualLeaderOwner:
         #: 조작하던 사람은 자기 쪽 연결을 의심하게 되는데, 사실은 서버가 이유를 갖고
         #: 되돌려보내고 있었다.
         self._last_reject: tuple[str, str, float] | None = None
+        #: 명령이 잠깐 끊겨 목표를 지금 자리에 붙여 둔 상태인가. HOLD가 아니라 잠깐
+        #: 선 것이고, 화면은 이 둘을 다르게 말해야 한다.
+        self._stalled_by_silence = False
+        #: 서보에 속도 상한을 다시 써 넣어야 하는가.
+        self._pending_speed = False
+        #: 그 쓰기가 실패했다면 그 이유. 읽기가 성공했다고 지워지지 않는다.
+        self._speed_error: str | None = None
+        #: 자기 끝에 닿아 선 관절과, 그때 서 있던 자리.
+        #:
+        #: 자리를 함께 들고 있는 이유는 떨림 때문이다. 미는 것을 그만두면 위치 오차가
+        #: 0이 되어 부하가 빠지고, 그러면 관절이 조금 되돌아온다. 그 순간 "움직였다"가
+        #: 되어 다시 밀고, 다시 서고, 다시 밀게 된다. 한 번 끝이라고 본 자리를 붙잡고
+        #: 있으면 그 왕복이 생기지 않는다.
+        self._end_stop: dict[str, float] = {}
         self._owner_locks: DeviceLockSet | None = None
 
     # MARK: 수명
@@ -173,7 +187,7 @@ class VirtualLeaderOwner:
                 backend = make_backend(
                     port=self.port,
                     robot_id=self.robot_id,
-                    max_relative_target=self.settings.step_deg,
+                    max_relative_target=self.settings.lead_deg,
                     specs=self.specs,
                 )
                 # 흉내 백엔드는 실제 장치를 예약하지 않는다. 실물 백엔드는 connect보다
@@ -328,24 +342,33 @@ class VirtualLeaderOwner:
             # 마지막 목표로 되돌아가는 일이 없어야 한다.
             merged = dict(self._goal or self._present)
             merged.update(targets)
-            # 지난 명령 이후 흐른 시간만큼만 움직일 수 있다. 명령을 더 자주 보낸다고
-            # 팔이 더 빨라지지 않는다.
-            elapsed = now - self._last_command_at if self._last_command_at else 1.0
-            goal, limited = self.validator.clamp_step(
-                merged, self._present, scale=elapsed * self.settings.hz
-            )
 
-            self._goal = goal
-            self._requested = dict(merged)
+            # **목표는 사람이 말한 절대 자세 그대로 남는다.**
+            #
+            # 예전에는 여기서 틱당 상한으로 잘라 `present + step`을 목표로 삼았다. 그
+            # 순간 절대 목표가 사라진다 — 서버가 들고 있는 것은 "지금 자리에서 한 걸음"
+            # 이라는 증분이고, 다음 명령이 오지 않으면 팔은 목표에 닿지 못한 채 선다.
+            # 그것은 이 구조가 하려던 것과 반대다. 리더가 절대 자세를 말하고 팔로워가
+            # 거기로 수렴한다는 것이 요점이고, 그래야 한 프레임이 밀리거나 늦어도 오차가
+            # 쌓이지 않는다.
+            #
+            # 부작용도 함께 사라졌다. 잘린 목표는 매 틱 실제 위치에 다시 붙으므로
+            # `goal - present`가 정의상 벌어지지 않았고, 그래서 "막혔다"를 알아보려면
+            # 사람이 요청한 값을 따로 들고 다녀야 했다(`_requested`). 이제 목표가 그
+            # 값이다.
+            self._goal = merged
+            self._requested = merged
+            _, limited = self.validator.clamp_lead(merged, self._present)
             self._limited = limited
             self._last_command_at = now
+            self._stalled_by_silence = False
             valid = self._validity_seconds(valid_for_ms)
             self._goal_expires_at = now + valid
             self.authority.mark_synced(lease.lease_id)
             self._state = State.ACTIVE
             return {
                 "sequence": sequence,
-                "goal": {name: round(value, 3) for name, value in goal.items()},
+                "goal": {name: round(value, 3) for name, value in merged.items()},
                 "rate_limited": limited,
                 "valid_for_ms": int(valid * 1000),
             }
@@ -401,6 +424,7 @@ class VirtualLeaderOwner:
                 return
             backend = self._backend
             self._fault = None
+            self._stalled_by_silence = False
             self.detector.reset()
             self._goal = dict(self._present)
             self._hold_goal = dict(self._present)
@@ -451,11 +475,19 @@ class VirtualLeaderOwner:
                         "current": round(self._current.get(spec.name, 0.0), 1),
                         "temperature": round(self._temperature.get(spec.name, 0.0), 1),
                         "rate_limited": spec.name in self._limited,
+                        # 자기 끝에 닿아 선 관절. 고장이 아니므로 배너가 아니라 이 표로만
+                        # 말한다 — 화면은 "더 갈 곳이 없다"고 적으면 된다.
+                        "at_limit": spec.name in self._end_stop,
                     }
                     for spec in self.specs
                 ],
+                # 서보가 실제로 들고 있는 속도 상한(눈금/초). 우리가 부탁한 값이 아니라
+                # 되읽은 값이다 — 화면이 "걸렸다"고 말하려면 그 근거가 팔에서 와야 한다.
+                "speed_ticks": dict(getattr(backend, "speed_ticks", {}) or {}) if backend else {},
+                # 명령이 잠깐 끊겨 선 것인지. HOLD와 달리 확인을 요구하지 않는다.
+                "command_stalled": self._stalled_by_silence and self._state == State.ACTIVE,
                 "fault": self._fault.as_dict() if self._fault else None,
-                "warnings": self.detector.warnings(self._temperature),
+                "warnings": self._warnings(),
                 "lease": lease.as_dict() if lease else None,
                 "error": self._error,
                 "command_age_ms": (
@@ -464,6 +496,12 @@ class VirtualLeaderOwner:
                     else None
                 ),
             }
+
+    def _warnings(self) -> list[dict[str, object]]:
+        lines = self.detector.warnings(self._temperature)
+        if self._speed_error:
+            lines.insert(0, {"joint": None, "code": "SPEED_LIMIT", "message": self._speed_error})
+        return lines
 
     def add_listener(self, callback) -> None:
         with self._lock:
@@ -490,6 +528,8 @@ class VirtualLeaderOwner:
         return f"{base} (조작하는 쪽에서 아무것도 오지 않았습니다)"
 
     def _enter_hold(self, code: str, joint: str | None, message: str) -> None:
+        self._stalled_by_silence = False
+        self._end_stop.clear()
         self._hold_goal = dict(self._present)
         self._goal = dict(self._present)
         # 요청도 지운다. 남겨 두면 사람이 `확인하고 계속`을 누르는 순간 아직 살아 있는
@@ -511,6 +551,9 @@ class VirtualLeaderOwner:
             self.settings = settings
             self.validator.settings = settings
             self.detector.settings = settings
+            # 속도 상한은 서보 안에 있다. 여기서 부탁만 남기고, 실제로 써 넣는 것은
+            # 제어 루프다 — serial 버스에 말을 거는 스레드는 하나여야 한다.
+            self._pending_speed = True
 
     def _movement(self) -> dict[str, float]:
         """최근 창 동안 관절이 실제로 얼마나 움직였는가.
@@ -524,6 +567,47 @@ class VirtualLeaderOwner:
         return {
             name: abs(value - oldest.get(name, value)) for name, value in self._present.items()
         }
+
+    def _relax_at_end_stops(self, goal: dict[str, float], state: str) -> dict[str, float]:
+        """자기 끝에 닿아 선 관절은 그만 민다.
+
+        끝에 닿는 것은 고장이 아니라 기하학이다. 그래서 팔을 세우지도, 사람에게 확인을
+        요구하지도 않는다 — 집게를 끝까지 닫을 때마다 `확인하고 계속`을 눌러야 한다면
+        그것은 보호가 아니라 방해다. 대신 그 관절의 목표를 서 있는 자리에 붙여 두어
+        서보가 힘을 쓰지 않게 한다. 나머지 관절은 그대로 조작된다.
+
+        실측(2026-09-02): 집게가 1.25%에서 부하 84로 6초 내내 밀고 있었고 사다리의 어느
+        칸에도 걸리지 않았다. 걸리지 않는 것이 맞다 — 84는 아무것도 부수지 않는다.
+        다만 그동안 모터는 계속 뜨거워지고, 그것을 끊는 것은 온도 문턱뿐이었다.
+        """
+        if state != State.ACTIVE:
+            self._end_stop.clear()
+            return goal
+        moved = self._movement()
+        result = dict(goal)
+        for spec in self.specs:
+            name = spec.name
+            if name not in result or name not in self._present:
+                continue
+            here = self._present[name]
+            wanted = self._goal.get(name, here)
+            latched = self._end_stop.get(name)
+            if latched is not None:
+                # 붙잡아 둔 자리에서 풀리는 조건은 하나다 — 사람이 목표를 끝에서
+                # 되돌렸을 때. 위치가 조금 흔들렸다고 다시 밀기 시작하면 그 왕복이
+                # 곧 이 장치가 없애려던 것이다.
+                if abs(wanted - latched) > self.settings.limit_epsilon * 2 and (
+                    (latched - spec.minimum <= self.settings.limit_epsilon and wanted > latched)
+                    or (spec.maximum - latched <= self.settings.limit_epsilon and wanted < latched)
+                ):
+                    self._end_stop.pop(name, None)
+                    continue
+                result[name] = latched
+                continue
+            if self.validator.at_end_stop(name, wanted, here, moved.get(name)):
+                self._end_stop[name] = here
+                result[name] = here
+        return result
 
     def _retreat_goal(self, joint: str) -> dict[str, float]:
         """걸린 관절만 밀던 방향의 반대로 물러난다.
@@ -547,11 +631,66 @@ class VirtualLeaderOwner:
         return target
 
     def _run(self) -> None:
+        """제어 루프. **어떤 이유로도 조용히 죽지 않는다.**
+
+        죽은 루프는 이 시스템에서 가장 나쁜 상태다. serial과 owner lock을 쥔 채로 남고,
+        토크는 걸려 있을 수 있는데 아무도 그것을 내리지 못한다. 화면은 `Virtual leader
+        is not running`이라고만 말하고, 다시 시작하려 하면 자기 자신이 쥔 lock에 막힌다.
+        서비스를 재시작하는 것 말고는 빠져나올 길이 없다.
+
+        실제로 그 상태를 만들었다(2026-09-02). 토크를 거는 중에 Feetech 상태 패킷 하나가
+        깨져 `ConnectionError`가 올라왔는데, 그 종류는 아래의 `except HardwareError`에
+        걸리지 않았다. 예외 하나가 팔을 통째로 잠근 셈이다.
+
+        이제 두 겹이다. 안쪽에서는 각 단계가 어떤 예외든 잡아 `FAULT`로 적고 계속 돌고,
+        바깥에서는 그래도 빠져나오는 것이 있으면 여기서 잡아 **정리까지 하고** 끝낸다.
+        정리를 해 두면 다음 `start`가 통한다 — 그것이 사람이 앱에서 빠져나올 길이다.
+        """
+        try:
+            self._loop()
+        except BaseException as exc:  # noqa: BLE001 - 여기서 새는 것은 없어야 한다
+            logger.exception("virtual leader loop died")
+            with self._lock:
+                self._error = f"제어 루프가 멈췄습니다: {exc}"
+                self._fault = Fault(Trip.HARDWARE_ERROR, None, self._error, time.time())
+                self._state = State.FAULT
+                self.authority.release_all("loop_died")
+            raise
+        finally:
+            # 루프가 끝나면 장치도 놓는다. 잡은 채로 사라지면 다음 시작이 자기 자신이
+            # 쥔 lock에 막힌다.
+            self._release_device_if_orphaned()
+
+    def _release_device_if_orphaned(self) -> None:
+        """루프가 스스로 끝난 뒤의 뒷정리.
+
+        `stop()`을 거쳐 내려온 경우에는 이미 정리되어 있으므로 아무 일도 하지 않는다.
+        여기서 정리하는 것은 **예상치 못하게** 끝난 경우다.
+        """
+        with self._lock:
+            if not self._stop.is_set() and self._backend is not None:
+                backend, self._backend = self._backend, None
+                locks, self._owner_locks = self._owner_locks, None
+            else:
+                return
+        try:
+            backend.disconnect()
+        except Exception:  # noqa: BLE001 - 정리하는 길은 어떤 이유로도 막히지 않는다
+            logger.debug("disconnect after loop death failed", exc_info=True)
+        if locks is not None:
+            locks.release()
+
+    def _loop(self) -> None:
         period = 1.0 / max(1, self.settings.hz)
         # 부하·전류·온도는 매 틱 읽지 않는다. 30Hz에서 sync_read 네 번은 예산을 넘기고,
         # 우리가 보는 창(300~400ms 연속 초과)에 비하면 10Hz로도 촘촘하다.
         health_every = max(1, self.settings.hz // 10)
         tick = 0
+        # 붙자마자 한 번 써 넣는다. `Goal_Velocity`는 SRAM이라 전원을 내리면 0(제한
+        # 없음)으로 돌아간다. 시작할 때마다 다시 세우지 않으면 어느 날은 상한이 있고
+        # 어느 날은 없는 팔이 된다.
+        with self._lock:
+            self._pending_speed = True
         retreat_target: dict[str, float] | None = None
         retreat_reason: tuple[str, str | None, str] | None = None
         retreat_started_at = 0.0
@@ -563,6 +702,24 @@ class VirtualLeaderOwner:
             # 바깥에서 남긴 토크 부탁을 여기서 처리한다. 버스를 만지는 것은 이 스레드뿐이다.
             with self._lock:
                 pending, self._pending_torque = self._pending_torque, None
+            with self._lock:
+                speed_wanted, self._pending_speed = self._pending_speed, False
+            if speed_wanted and self._backend is not None:
+                try:
+                    self._backend.apply_speed_limit(self.settings)
+                    with self._lock:
+                        self._speed_error = None
+                except Exception as exc:  # noqa: BLE001
+                    # 속도 상한을 못 썼다고 팔을 세우지는 않는다 — 못 쓰면 서보는 예전
+                    # 값(대개 제한 없음)으로 도는데, 그때 조용히 넘어가면 화면은 상한이
+                    # 걸린 줄 안다.
+                    #
+                    # `_error`에 적지 않는 이유: 그 칸은 바로 다음 줄의 읽기가 성공하면
+                    # 지워진다. 실패를 적자마자 지우는 자리에 적는 것은 적지 않는 것과
+                    # 같다. 이것은 사람이 볼 때까지 남아 있어야 하는 경고다.
+                    with self._lock:
+                        self._speed_error = f"속도 상한을 서보에 쓰지 못했습니다: {exc}"
+
             if pending is not None and self._backend is not None:
                 try:
                     self._backend.set_torque(pending)
@@ -580,7 +737,7 @@ class VirtualLeaderOwner:
                             self._goal = {}
                             self._hold_goal = {}
                             self._state = State.SAFE
-                except HardwareError as exc:
+                except Exception as exc:  # noqa: BLE001 - 루프를 죽이는 예외는 없다
                     with self._lock:
                         self._error = str(exc)
                         self._fault = Fault(Trip.HARDWARE_ERROR, None, str(exc), time.time())
@@ -594,7 +751,7 @@ class VirtualLeaderOwner:
             else:
                 try:
                     frame = self._backend.read(include_health=tick % health_every == 0)
-                except HardwareError as exc:
+                except Exception as exc:  # noqa: BLE001
                     with self._lock:
                         self._error = str(exc)
                         self._fault = Fault(Trip.HARDWARE_ERROR, None, str(exc), time.time())
@@ -625,18 +782,33 @@ class VirtualLeaderOwner:
                     state = self._state
 
                 # 2. 명령이 끊겼는가. 마지막 명령을 무한히 반복하지 않는다.
+                #
+                # 두 단계로 나눈다. **서는 것과 사람에게 확인을 요구하는 것은 다른 일**
+                # 이기 때문이다. 예전에는 300ms 침묵이 곧바로 HOLD였고, HOLD는 `확인하고
+                # 계속`을 눌러야 풀린다. 30Hz에서 300ms는 무선 구간이 한 번 흔들리기에
+                # 충분한 시간이라, 폰으로 조작하면 아무 잘못 없이 멈추고 그때마다 버튼을
+                # 눌러야 했다 — 사용자가 "왜 안 되지" 하던 자리 가운데 하나가 이것이다.
+                #
+                # 이제 짧은 침묵에는 목표를 지금 자리에 붙이기만 한다. 팔은 곧바로
+                # 서지만 상태는 `ACTIVE`로 남고, 명령이 다시 오면 그대로 이어진다.
+                # 침묵이 `command_hold_ms`까지 이어지면 그때 HOLD다 — 그쯤이면 잠깐
+                # 흔들린 것이 아니라 조작하던 쪽이 사라진 것이다.
                 if state == State.ACTIVE:
                     silent_ms = (now - self._last_command_at) * 1000.0
-                    if silent_ms > self.settings.command_timeout_ms:
+                    expired = now > self._goal_expires_at
+                    if silent_ms > self.settings.command_hold_ms:
                         self._enter_hold(
                             Trip.COMMAND_TIMEOUT, None, self._silenceReason(silent_ms, now)
                         )
                         state = self._state
-                    elif now > self._goal_expires_at:
-                        self._enter_hold(
-                            Trip.COMMAND_TIMEOUT, None, "마지막 명령의 유효기간이 지났습니다"
-                        )
-                        state = self._state
+                    elif silent_ms > self.settings.command_timeout_ms or expired:
+                        # 선다. 그러나 이유를 세우지는 않는다.
+                        self._goal = dict(self._present)
+                        self._requested = {}
+                        self._limited = []
+                        self._stalled_by_silence = True
+                    else:
+                        self._stalled_by_silence = False
 
                 # 3. 관측이 거는 정지. 토크가 걸려 있을 때만 볼 이유가 있다.
                 if backend is not None and backend.torque_enabled and state in (State.ACTIVE, State.READY):
@@ -699,9 +871,16 @@ class VirtualLeaderOwner:
 
             if write and not self._relay:
                 try:
-                    clamped, _ = self.validator.clamp_step(write, self._present)
+                    # 절대 목표를 그대로 쓰지 않고 `lead`만큼만 앞세워 쓴다. 이것이
+                    # 막혔을 때 서보가 내는 힘의 상한이다. 속도는 서보의 `Goal_Velocity`가
+                    # 지키므로 이 자르기가 팔을 느리게 만들지 않는다 — 자유롭게 움직이는
+                    # 동안 목표와 실제의 거리는 서보의 추종오차만큼밖에 되지 않는다.
+                    clamped, limited = self.validator.clamp_lead(write, self._present)
+                    clamped = self._relax_at_end_stops(clamped, state)
+                    if state == State.ACTIVE:
+                        self._limited = limited
                     self._backend.write(clamped)
-                except HardwareError as exc:
+                except Exception as exc:  # noqa: BLE001
                     with self._lock:
                         self._error = str(exc)
                         self._fault = Fault(Trip.HARDWARE_ERROR, None, str(exc), time.time())

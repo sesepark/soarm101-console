@@ -125,22 +125,77 @@ def test_the_first_command_after_a_lease_must_start_from_where_the_arm_is(specs,
     assert validator.validate({"elbow_flex": 3.0}, present=present, needs_sync=True)
 
 
-def test_step_limit_clamps_instead_of_refusing(specs, settings):
+def test_the_lead_limit_clamps_instead_of_refusing(specs, settings):
     """빠르게 끌면 목표는 늘 멀리 있다. 그때마다 거절하면 조작 자체가 되지 않는다."""
     validator = CommandValidator(specs, settings)
     present = {spec.name: 0.0 for spec in specs}
-    goal, limited = validator.clamp_step({"elbow_flex": 90.0}, present)
-    assert goal["elbow_flex"] == pytest.approx(settings.step_deg)
+    goal, limited = validator.clamp_lead({"elbow_flex": 90.0}, present)
+    assert goal["elbow_flex"] == pytest.approx(settings.lead_deg)
     assert limited == ["elbow_flex"]
 
 
-def test_sending_faster_does_not_move_the_arm_faster(specs, settings):
-    """상한이 '명령당'이면 초당 300번 보내는 클라이언트가 초당 600도를 움직인다."""
+def test_the_lead_limit_does_not_depend_on_how_often_commands_arrive(specs, settings):
+    """상한이 시간에 비례하던 시절에는, 느린 연결에서 팔이 느려졌다.
+
+    속도를 서보가 지키게 되면서 그 보정이 필요 없어졌다. 10Hz로 보내든 30Hz로 보내든
+    한 번에 앞세울 수 있는 거리는 같고, 실제 속도는 `Goal_Velocity`가 정한다.
+    """
     validator = CommandValidator(specs, settings)
     present = {spec.name: 0.0 for spec in specs}
-    tenth_of_a_tick = 0.1
-    goal, _ = validator.clamp_step({"elbow_flex": 90.0}, present, scale=tenth_of_a_tick)
-    assert goal["elbow_flex"] == pytest.approx(settings.step_deg * tenth_of_a_tick)
+    first, _ = validator.clamp_lead({"elbow_flex": 90.0}, present)
+    second, _ = validator.clamp_lead({"elbow_flex": 90.0}, present)
+    assert first == second
+
+
+def test_the_speed_limit_is_expressed_in_servo_ticks_per_second(specs, settings):
+    """`Goal_Velocity` 한 칸은 초당 위치 눈금 하나다 (2026-09-02 집게로 실측).
+
+    200 → 21°/s, 500 → 47°/s, 1000 → 93°/s. 즉 눈금 하나가 360/4096도이므로
+    N칸 ≈ N × 0.0879 °/s이고, 뒤집으면 °/s ÷ 0.0879 = 칸이다.
+    """
+    from dataclasses import replace
+
+    arm = next(spec for spec in specs if spec.name == "elbow_flex")
+    gripper = next(spec for spec in specs if spec.name == "gripper")
+    tuned = replace(settings, max_deg_per_s=90.0, max_percent_per_s=100.0)
+    assert tuned.ticks_per_second(arm) == pytest.approx(90.0 / (360.0 / 4096.0), rel=0.01)
+    # 집게는 퍼센트다. 0~100%가 calibration 범위(1656~3100)에 펴지므로 100%/s는
+    # 1444눈금/s(약 127°/s)이고, 같은 숫자라도 팔 관절과 다른 속도를 뜻한다.
+    assert tuned.ticks_per_second(gripper) == 1444
+    # 서보가 낼 수 없는 값을 써 넣지 않는다. 0은 "제한 없음"이라 최소 1로 올린다.
+    assert replace(settings, max_deg_per_s=0.0).ticks_per_second(arm) == 1
+    assert replace(settings, max_deg_per_s=9999.0).ticks_per_second(arm) == 4000
+
+
+def test_a_profile_moves_speed_and_force_together(specs):
+    """세 값을 따로 고르면 어긋난다 — 빠르면서 예민하면 정상 조작 중에 자꾸 선다."""
+    from dataclasses import replace
+
+    from soarm_console.vleader.safety import PROFILES, profile_of
+
+    base = VLeaderSettings()
+    for name, values in PROFILES.items():
+        tuned = replace(base, **values)
+        assert profile_of(tuned) == name
+    gentle = replace(base, **PROFILES["gentle"])
+    quick = replace(base, **PROFILES["quick"])
+    assert gentle.max_deg_per_s < quick.max_deg_per_s
+    assert gentle.lead_deg < quick.lead_deg
+    # 예민함도 함께 움직인다. 빠른 쪽이 더 오래 참는다.
+    assert gentle.following_error_ms < quick.following_error_ms
+
+
+def test_a_hand_written_env_value_wins_over_the_profile(monkeypatch):
+    """프로필은 고르는 것이고 env는 재 본 뒤 못 박는 것이다."""
+    from soarm_console.vleader.safety import PROFILES, load_settings
+
+    monkeypatch.setenv("SOARM_VL_PROFILE", "quick")
+    monkeypatch.delenv("SOARM_VL_LEAD_DEG", raising=False)
+    assert load_settings().lead_deg == PROFILES["quick"]["lead_deg"]
+    monkeypatch.setenv("SOARM_VL_LEAD_DEG", "7.5")
+    assert load_settings().lead_deg == pytest.approx(7.5)
+    # 프로필이 정하는 나머지 값은 그대로 온다.
+    assert load_settings().max_deg_per_s == PROFILES["quick"]["max_deg_per_s"]
 
 
 # --------------------------------------------------------------- 권한
@@ -391,8 +446,60 @@ def test_silence_puts_the_arm_on_hold_rather_than_repeating_the_last_command(own
     lease = owner.authority.grant("테스트", "s")
     drive(owner, lease, {"elbow_flex": 1.0}, 1)
     assert owner.snapshot()["state"] == State.ACTIVE
-    assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=2.0)
+    assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=4.0)
     assert owner.snapshot()["fault"]["code"] == Trip.COMMAND_TIMEOUT
+
+
+def test_a_short_gap_stops_the_arm_without_asking_the_person_anything(owner):
+    """서는 것과 사람에게 확인을 요구하는 것은 다른 일이다.
+
+    무선 구간이 한 번 흔들려 300ms가 비면 팔은 곧바로 서야 한다. 그러나 그때마다
+    `확인하고 계속`을 눌러야 하면 폰으로는 조작이 되지 않는다 — 사용자가 "왜 안 되지"
+    하던 자리 가운데 하나가 이것이었다. 짧은 침묵에는 목표만 지금 자리에 붙이고,
+    명령이 다시 오면 그대로 이어 간다.
+    """
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    lease = owner.authority.grant("테스트", "s")
+    present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+    drive(owner, lease, {"elbow_flex": present["elbow_flex"] + 4.0}, 1)
+    # 워치독의 첫 단계가 지나갈 만큼만 기다린다. HOLD 문턱보다는 한참 짧다.
+    time.sleep((owner.settings.command_timeout_ms + 150) / 1000.0)
+    snapshot = owner.snapshot()
+    assert snapshot["state"] == State.ACTIVE, "짧은 침묵으로 HOLD에 떨어지지 않는다"
+    assert snapshot["command_stalled"] is True, "선 것은 화면이 알 수 있어야 한다"
+    # 목표가 지금 자리에 붙어 있으므로 팔은 더 가지 않는다.
+    stood = {j["name"]: j["goal"] for j in snapshot["joints"]}
+    assert abs(stood["elbow_flex"] - snapshot["joints"][2]["present"]) < 0.6
+    # 그리고 확인 없이 그대로 이어진다.
+    present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+    assert drive(owner, lease, {"elbow_flex": present["elbow_flex"] + 4.0}, 2)
+    assert owner.snapshot()["command_stalled"] is False
+
+
+def test_the_goal_stays_the_absolute_pose_the_operator_asked_for(owner):
+    """가상 리더가 말하는 것은 절대 자세다. 서버가 그것을 증분으로 바꾸지 않는다.
+
+    예전에는 여기서 목표를 `present + step`으로 잘라 두었다. 그 순간 절대 목표가
+    사라지고, 다음 명령이 오지 않으면 팔은 목표에 닿지 못한 채 선다. 한 프레임이 밀려도
+    팔이 스스로 수렴한다는 것이 이 구조의 요점이므로, 목표는 사람이 말한 자리 그대로
+    남아 있어야 한다.
+    """
+    wait_for(lambda: owner.snapshot()["observation"] > 2)
+    owner.arm()
+    lease = owner.authority.grant("테스트", "s")
+    present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+    far = present["elbow_flex"] + owner.settings.sync_tolerance_deg * 0.5
+    answer = drive(owner, lease, {"elbow_flex": far}, 1)
+    assert answer["goal"]["elbow_flex"] == pytest.approx(far, abs=0.01)
+    # 명령을 한 번만 보내도 팔은 목표까지 간다 — 다음 명령을 기다리지 않는다.
+    assert wait_for(
+        lambda: abs(
+            next(j for j in owner.snapshot()["joints"] if j["name"] == "elbow_flex")["present"] - far
+        )
+        < 0.6,
+        timeout=2.0,
+    )
 
 
 def test_hold_needs_a_person_before_it_accepts_motion_again(owner):
@@ -511,3 +618,80 @@ def test_a_blocked_joint_backs_off_and_then_holds(specs, settings, monkeypatch):
         assert present["elbow_flex"] < 5.0
     finally:
         owner.stop(force=True)
+
+
+# --------------------------------------------------------------- 루프는 죽지 않는다
+
+
+def test_a_corrupted_packet_while_arming_does_not_kill_the_control_loop(specs, monkeypatch):
+    """예외 하나가 팔을 통째로 잠그던 일.
+
+    2026-09-02, 토크를 거는 중에 Feetech 상태 패킷 하나가 깨져 LeRobot이
+    `ConnectionError`를 올렸다. 그 종류는 제어 루프의 `except HardwareError`에 걸리지
+    않아 스레드를 통째로 죽였다. 죽은 루프는 serial과 owner lock을 쥔 채 남았고, 화면은
+    `Virtual leader is not running`만 말했다. 다시 시작하려 해도 자기 자신이 쥔 lock에
+    막혔다 — 서비스를 재시작하는 것 말고는 빠져나올 길이 없었다.
+
+    이제 루프는 그 예외를 잡아 `FAULT`로 적고 **계속 돈다.** 팔을 다시 잡을 수 있다.
+    """
+    monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
+    settings = VLeaderSettings()
+    authority = AuthorityManager(settings)
+    owner = VirtualLeaderOwner(
+        specs=specs, settings=settings, port="/dev/null", robot_id="test", authority=authority
+    )
+    owner.start()
+    try:
+        assert wait_for(lambda: owner.snapshot()["observation"] > 2)
+        backend = owner._backend
+        calls = {"n": 0}
+        real = backend.set_torque
+
+        def flaky(enabled):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # LeRobot이 올리는 것과 같은 종류. `HardwareError`가 아니다.
+                raise ConnectionError("Failed to write 'Lock' on id_=1 ... There is no status packet!")
+            return real(enabled)
+
+        backend.set_torque = flaky
+        with pytest.raises(Exception):
+            owner.arm()
+        # 루프는 살아 있다. 이것이 이 시험의 전부다.
+        assert owner.running, "예외 하나로 제어 루프가 죽으면 안 된다"
+        assert owner.snapshot()["state"] == State.FAULT
+        # 이유는 `fault`에 남는다. `error`는 다음 성공한 읽기가 지우는 자리라 —
+        # "지금 버스가 이상하다"는 뜻이지 "무엇 때문에 섰다"는 뜻이 아니다.
+        assert "status packet" in owner.snapshot()["fault"]["message"]
+        # 그리고 사람이 다시 잡을 수 있다.
+        owner.resume()
+        owner.arm()
+        assert owner.snapshot()["torque_enabled"] is True
+    finally:
+        owner.stop(force=True)
+
+
+def test_the_loop_lets_go_of_the_device_if_it_ever_does_die(specs, monkeypatch):
+    """그래도 루프가 끝나면, 장치를 쥔 채 사라지지 않는다.
+
+    쥔 채 사라지면 다음 시작이 **자기 자신이 쥔 lock**에 막힌다. 실제로 그 상태를
+    만들었고, 거절 문구에 적힌 pid가 콘솔 자신이었다.
+    """
+    monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
+    settings = VLeaderSettings()
+    authority = AuthorityManager(settings)
+    owner = VirtualLeaderOwner(
+        specs=specs, settings=settings, port="/dev/null", robot_id="test", authority=authority
+    )
+    owner.start()
+    assert wait_for(lambda: owner.snapshot()["observation"] > 2)
+    # 루프 안에서 아무도 잡지 않는 예외를 낸다.
+    def explode(*args, **kwargs):
+        raise BaseException("루프를 뚫고 나가는 것")
+
+    owner.validator.clamp_lead = explode
+    owner._backend.read = explode
+    assert wait_for(lambda: not owner.running, timeout=3.0)
+    # 장치를 놓았는가. 놓았으면 참조가 비어 있다.
+    assert owner._backend is None
+    assert owner._owner_locks is None

@@ -207,8 +207,13 @@ def test_the_socket_drives_the_arm_and_reports_what_it_clamped(console):
             }
         )
         ack = next_of_type(socket, "ack")
+        # 목표는 **사람이 말한 절대 자세 그대로** 돌아온다. 서버가 그것을 증분으로
+        # 바꿔 두면 팔은 다음 명령이 올 때까지만 가고, 프레임 하나가 밀릴 때마다
+        # 목표를 놓친다. 팔이 거기까지 가는 속도는 서보의 `Goal_Velocity`가 정한다.
+        assert ack["goal"]["elbow_flex"] == pytest.approx(present["elbow_flex"] + 60, abs=0.01)
+        # 다만 지금 이 순간 모터에 실리는 값은 `lead`만큼만 앞선다는 것을 함께 알린다 —
+        # 화면이 "따라가는 중"이라고 말할 수 있어야 한다.
         assert ack["rate_limited"] == ["elbow_flex"]
-        assert abs(ack["goal"]["elbow_flex"] - present["elbow_flex"]) <= 2.001
 
 
 def test_a_command_out_of_the_absolute_limit_is_refused_by_code(console):
@@ -470,27 +475,42 @@ def test_a_bus_that_fails_to_start_says_why_instead_of_500(console, monkeypatch)
     assert "status packet" in response.json()["detail"]
 
 
-def test_the_app_can_retune_the_feel_but_not_past_the_rails(console):
-    """조작감은 화면에서 바꿀 수 있어야 한다. 다만 난간 밖으로는 못 간다.
+def test_the_app_can_choose_a_feel_without_guessing_numbers(console):
+    """숫자를 직접 고르라고 하면 아무도 고를 수 없다.
 
-    `step_deg`는 최대 속도와 서보가 보는 위치 오차(= 토크)를 동시에 정한다. 2.0에서는
-    어깨가 팔을 들지 못했고 8.0에서 움직였다 — 팔마다 다르니 사람이 만져 봐야 하는
-    값이다. 그렇다고 오타 하나로 팔이 최고 속도로 출발해서는 안 된다.
+    `lead_deg`가 12여야 하는지 15여야 하는지는 이 팔을 만든 사람도 재 보기 전에는
+    모르고, 속도·힘·민감도는 서로 짝이 맞아야 하는 값들이라 따로 고르면 어긋난다 —
+    빠르게 움직이면서 예민하게 멈추면 정상 조작 중에 자꾸 선다. 그래서 화면의 첫 번째
+    선택지는 이름이 붙은 세 가지이고, 숫자는 그 아래 `고급`에 접어 둔다.
     """
     client, _ = console
-    before = client.get("/api/vleader/policy").json()
     # 진짜 설정 파일을 건드리지 않는다.
     os.environ["SOARM_ENV_FILE"] = str(Path(tempfile.mkdtemp()) / "soarm.env")
-    assert "step_deg" in before["tunable"]
+    before = client.get("/api/vleader/policy").json()
+    assert [item["name"] for item in before["profiles"]] == ["gentle", "normal", "quick"]
+    assert all(item["title"] and item["detail"] for item in before["profiles"])
+    assert "lead_deg" in before["tunable"]
+    assert "max_deg_per_s" in before["tunable"]
 
-    ok = motion(client, "POST", "/api/vleader/policy",
-                json={"values": {"step_deg": 6.5, "stall_load": 140}})
+    ok = motion(client, "POST", "/api/vleader/policy", json={"profile": "gentle"})
     assert ok.status_code == 200, ok.text
-    assert ok.json()["policy"]["step_deg"] == 6.5
-    assert ok.json()["policy"]["stall_load"] == 140
+    assert ok.json()["profile"] == "gentle"
+    assert ok.json()["policy"]["max_deg_per_s"] == 45.0
+    assert ok.json()["policy"]["lead_deg"] == 8.0
 
-    # 범위 밖은 거절한다.
-    too_much = motion(client, "POST", "/api/vleader/policy", json={"values": {"step_deg": 90}})
+    # 고급에서 값 하나만 옮기면 더 이상 어느 프로필도 아니다. 화면이 세 칸 중 하나를
+    # 켜 두면 실제와 다른 말을 하게 되므로, 그때는 아무것도 켜지 않아야 한다.
+    tuned = motion(client, "POST", "/api/vleader/policy", json={"values": {"lead_deg": 9.5}})
+    assert tuned.status_code == 200
+    assert tuned.json()["profile"] is None
+    assert tuned.json()["policy"]["lead_deg"] == 9.5
+
+    unknown = motion(client, "POST", "/api/vleader/policy", json={"profile": "warp"})
+    assert unknown.status_code == 400
+
+    # 범위 밖은 거절한다. 서보가 낼 수 없는 속도를 적어 두면 화면만 그 값을 믿는다.
+    too_much = motion(client, "POST", "/api/vleader/policy",
+                      json={"values": {"max_deg_per_s": 900}})
     assert too_much.status_code == 400
     assert "사이여야" in too_much.json()["detail"]
 
@@ -500,5 +520,41 @@ def test_the_app_can_retune_the_feel_but_not_past_the_rails(console):
     assert not_open.status_code == 400
 
     # 토큰 없이는 못 바꾼다. 조작감을 바꾸는 것도 조작이다.
-    assert client.post("/api/vleader/policy", json={"values": {"step_deg": 3.0}}).status_code == 401
+    assert client.post("/api/vleader/policy", json={"profile": "normal"}).status_code == 401
     os.environ.pop("SOARM_ENV_FILE", None)
+
+
+def test_taking_over_from_an_operator_who_vanished_needs_no_extra_confirmation(console):
+    """앞 사람이 사라져서 선 팔은, 새 사람이 권한을 받는 것으로 풀린다.
+
+    반납만 그렇게 두었더니 창이 그냥 닫힌 경우 — 그쪽이 훨씬 흔하다 — 새 사람은 권한을
+    받고도 움직일 수 없었다. 화면에는 "1524ms 동안 통과한 명령이 없습니다"라고만 적혀
+    있었고, 그것은 다음 사람이 확인할 만한 내용이 아니다.
+
+    반대로 **팔에 일어난 일**은 그대로 남는다. 접촉으로 멈춘 팔이 권한을 새로 받는 것만으로
+    풀리면, 멈춘 이유를 아무도 보지 않은 채 다시 움직이게 된다.
+    """
+    client, vleader = console
+    start_and_arm(client)
+    owner = vleader.owner
+
+    for code in ("LEASE_RELEASED", "LEASE_EXPIRED", "COMMAND_TIMEOUT"):
+        owner.resume()
+        owner.hold(code, None, f"흉내: {code}")
+        assert owner.state == "HOLD"
+        lease = motion(client, "POST", "/api/vleader/lease",
+                       json={"confirmation": "MOVE SOARM101", "holder": "다음 사람"})
+        assert lease.status_code == 200, lease.text
+        assert owner.state != "HOLD", f"{code}는 권한을 받는 것으로 풀려야 한다"
+        motion(client, "DELETE", f"/api/vleader/lease/{lease.json()['lease_id']}")
+
+    for code in ("OPERATOR_HOLD", "STALLED", "OVER_TEMPERATURE", "HARDWARE_ERROR"):
+        owner.resume()
+        owner.hold(code, "elbow_flex", f"흉내: {code}")
+        assert owner.state == "HOLD"
+        lease = motion(client, "POST", "/api/vleader/lease",
+                       json={"confirmation": "MOVE SOARM101", "holder": "다음 사람"})
+        assert lease.status_code == 200
+        assert owner.state == "HOLD", f"{code}는 사람이 읽고 확인해야 풀린다"
+        assert owner.snapshot()["fault"]["code"] == code
+        motion(client, "DELETE", f"/api/vleader/lease/{lease.json()['lease_id']}")

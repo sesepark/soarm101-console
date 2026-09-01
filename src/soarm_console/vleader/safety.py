@@ -178,9 +178,14 @@ class VLeaderSettings:
     #: 그래서 셋을 함께 본다. 목표가 실제보다 앞서 있고(밀고 있다), 팔은 서 있고, 부하가
     #: 높다. 가만히 자세를 버티는 것과 구별되는 이유는 첫 번째 조건이다 — 버티기만 할
     #: 때는 목표가 실제와 같은 자리에 있다.
-    stall_load: int = field(default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD", 80))
+    #: 문턱과 창은 팔 관절에서 다시 쟀다(2026-09-01 저녁). 집게만 보고 80/500ms로 잡았더니
+    #: 팔 관절이 **움직이기 시작하는 순간** 걸렸다 — 정지 마찰을 이기는 동안 관절은 잠깐
+    #: 서 있고 부하는 96~144까지 오른다. 막혔을 때의 부하(100~144)와 구간이 겹치므로
+    #: 부하로는 둘을 가를 수 없고, 가르는 것은 **얼마나 오래 서 있는가**다. 정말 막힌
+    #: 관절은 계속 서 있고, 떨어지려는 관절은 1초 안에 움직이기 시작한다.
+    stall_load: int = field(default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD", 100))
     stall_load_ms: int = field(
-        default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD_MS", 500)
+        default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD_MS", 1500)
     )
     following_error_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 400)

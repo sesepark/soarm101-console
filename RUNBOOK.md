@@ -35,8 +35,12 @@ grep '^SOARM_ENABLE_MOTION=' config/soarm.env
 MacBook에서 SSH tunnel로 관찰할 때는 Mac에서 실행한다.
 
 ```bash
-ssh -N -L 8088:127.0.0.1:8088 deploy@192.168.0.20
+ssh -N -L 8088:127.0.0.1:8088 <계정>@<서버 주소>
 ```
+
+주소와 계정은 이 저장소가 공개이므로 여기 적지 않는다. Mac 앱을 쓴다면 그 값은
+`~/Library/Application Support/SeoulLocalAgent/soarm-console.json`에 있고, 앱이 같은 터널을
+스스로 연다.
 
 ## 3. Calibration
 
@@ -149,14 +153,11 @@ Serve는 tailnet 안에만 공개되고 HTTPS 인증서를 요구한다는 동�
 tailscale serve --bg --https=443 8088
 ```
 
-계정 소유자가 브라우저에서 한 번 열어 승인할 실제 활성화 주소는 다음과 같다.
-
-```text
-https://login.tailscale.com/f/serve?node=nDaRZnYuwm11CNTRL
-```
-
-이 주소는 이 Tailscale node에 대응한다. 승인 뒤 서버에서 다시 실행하고 공개된 tailnet URL을
-확인한다.
+Serve가 아직 켜져 있지 않으면 위 명령이 `Serve is not enabled on your tailnet`과 함께
+**활성화 주소를 그 자리에서 출력한다.** 그 주소는 이 tailnet의 특정 node를 가리키므로 여기
+적어 두지 않는다 — 이 저장소는 공개이고, 명령을 한 번 돌리면 언제든 다시 나온다. 계정
+소유자가 그 주소를 브라우저에서 한 번 열어 승인한 뒤, 서버에서 다시 실행하고 공개된 tailnet
+URL을 확인한다.
 
 ```bash
 tailscale serve --bg --https=443 8088

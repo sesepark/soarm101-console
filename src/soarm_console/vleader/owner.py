@@ -639,7 +639,7 @@ class VirtualLeaderOwner:
                     )
                     if trip is not None:
                         code, joint, message = trip
-                        if code in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR) and joint:
+                        if code in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR, Trip.STALLED) and joint:
                             retreat_target = self._retreat_goal(joint)
                             retreat_reason = (code, joint, message)
                             self._state = State.RETREATING

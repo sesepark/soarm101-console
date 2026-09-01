@@ -1196,6 +1196,34 @@ function startCameras() {
   openCamera();
 }
 
+/** 방금 그린 화면에서 배경이 아닌 픽셀의 비율.
+ *
+ * `preserveDrawingBuffer`를 켜지 않았으므로 그린 **직후에** 읽어야 한다. 격자와 팔이 함께
+ * 들어오므로, 팔이 보이면 대체로 0.05를 넘고 아무것도 못 그렸으면 0이다.
+ */
+function paintedFraction() {
+  try {
+    renderer.render(scene, camera);
+    const gl = renderer.getContext();
+    // **가운데**를 본다. 모서리는 대개 빈 격자라, 거기를 재면 팔이 그려졌는지와 상관없이
+    // 늘 1% 언저리가 나온다 — 실제로 그 숫자를 보고 한 번 헤맸다.
+    const width = Math.min(240, gl.drawingBufferWidth);
+    const height = Math.min(180, gl.drawingBufferHeight);
+    if (!width || !height) return 0;
+    const x = Math.max(0, Math.floor((gl.drawingBufferWidth - width) / 2));
+    const y = Math.max(0, Math.floor((gl.drawingBufferHeight - height) / 2));
+    const buffer = new Uint8Array(width * height * 4);
+    gl.readPixels(x, y, width, height, gl.RGBA, gl.UNSIGNED_BYTE, buffer);
+    let lit = 0;
+    for (let i = 0; i < buffer.length; i += 4) {
+      if (buffer[i] + buffer[i + 1] + buffer[i + 2] > 24) lit += 1;
+    }
+    return Number((lit / (width * height)).toFixed(4));
+  } catch (error) {
+    return -1;
+  }
+}
+
 // ---------------------------------------------------------------- 네이티브 다리
 
 let nativeEnabled = false;
@@ -1244,6 +1272,10 @@ window.soarmViewer = {
   debugState() {
     const tcp = ghost ? forward(target) : null;
     return {
+      // **정말로 그려지고 있는가.** 캔버스를 밖에서 찍으면 창이 가려졌을 때 검게 나오는데,
+      // 그것이 "그리지 못한 것"인지 "찍지 못한 것"인지 구별할 방법이 없었다. 여기서는
+      // 그린 직후 프레임버퍼를 직접 읽으므로, 답이 화면 바깥 사정과 무관하다.
+      painted: paintedFraction(),
       mode,
       state: telemetry?.state ?? null,
       commanding,

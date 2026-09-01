@@ -2,10 +2,11 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <!-- `viewport-fit=cover`와 `interactive-widget`이 함께 있어야 아이폰에서 키보드가
-       올라올 때 화면이 밀려 올라가지 않는다. 조작 화면은 스크롤이 없으므로, 밀려 올라간
-       만큼이 그대로 잘려 나간다. -->
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no,interactive-widget=resizes-content">
+  <!-- `viewport-fit=cover`로 노치와 홈 인디케이터 아래까지 그리고, 안전 영역은 CSS가
+       `env(safe-area-inset-*)`로 피한다. `interactive-widget`은 넣지 않는다 — 크롬만
+       아는 키라 사파리는 콘솔에 오류를 적고 무시하고, 이 화면에는 조작 중에 뜨는 입력칸이
+       없어서 얻는 것도 없다. -->
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
   <meta name="theme-color" content="#070b12">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">

@@ -542,6 +542,7 @@ class VirtualLeaderOwner:
         tick = 0
         retreat_target: dict[str, float] | None = None
         retreat_reason: tuple[str, str | None, str] | None = None
+        retreat_started_at = 0.0
 
         while not self._stop.is_set():
             started = time.perf_counter()
@@ -642,6 +643,7 @@ class VirtualLeaderOwner:
                         if code in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR, Trip.STALLED) and joint:
                             retreat_target = self._retreat_goal(joint)
                             retreat_reason = (code, joint, message)
+                            retreat_started_at = now
                             self._state = State.RETREATING
                             self._fault = Fault(code, joint, message, time.time())
                             self.authority.require_resync()
@@ -661,8 +663,20 @@ class VirtualLeaderOwner:
                             abs(retreat_target.get(name, value) - value) < 0.5
                             for name, value in self._present.items()
                         )
-                        if done:
+                        # 물러남에는 끝이 있어야 한다. 물러날 곳이 없는 자리(걸린 방향의
+                        # 반대편에도 무언가가 있는 경우)에서는 목표에 영영 닿지 못하고,
+                        # 그 자리에서 계속 밀게 된다. 물러나는 동안에는 관측 정지도 보지
+                        # 않으므로 아무것도 그것을 끊지 못한다. 시간이 다 되면 지금 자리에
+                        # 그대로 세운다 — 세우는 것은 언제나 할 수 있다.
+                        stuck = (now - retreat_started_at) * 1000.0 > self.settings.retreat_ms
+                        if done or stuck:
                             code, joint, message = retreat_reason or (Trip.OPERATOR_HOLD, None, "")
+                            if stuck and not done:
+                                message = (
+                                    f"{message} 물러나려 했지만 "
+                                    f"{self.settings.retreat_ms}ms 안에 빠져나오지 못해 "
+                                    "그 자리에서 세웁니다"
+                                )
                             self._enter_hold(code, joint, message)
                             retreat_target = None
                             retreat_reason = None

@@ -210,6 +210,14 @@ class VLeaderSettings:
     )
     #: 접촉으로 걸렸을 때 최근 경로를 따라 물러나는 양.
     retreat_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_RETREAT_DEG", 4.0))
+    #: 물러나는 데 줄 수 있는 시간. **물러남에는 반드시 끝이 있어야 한다.**
+    #:
+    #: 물러남은 목표에 닿을 때까지 이어지는데, 닿지 못하는 자리가 있다. 걸린 방향의
+    #: 반대편에 또 무언가가 있으면(책상 위에서 위로 밀다 걸리면 아래는 책상이다) 팔은
+    #: 물러날 곳이 없고, 그 자리에서 부하 100으로 계속 밀게 된다. 2026-09-01 실물에서
+    #: `shoulder_lift`가 그 상태로 53초 넘게 서 있는 것을 봤다 — 게다가 물러나는 동안에는
+    #: 관측 정지(막힘·과열)를 보지 않으므로 아무것도 그것을 끊지 못했다.
+    retreat_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_RETREAT_MS", 1500))
 
     def step_limit(self, spec: JointSpec) -> float:
         return self.step_percent if spec.unit == "percent" else self.step_deg
@@ -245,6 +253,7 @@ class VLeaderSettings:
             "temperature_trip_c": self.temperature_trip_c,
             "temperature_trip_ms": self.temperature_trip_ms,
             "retreat_deg": self.retreat_deg,
+            "retreat_ms": self.retreat_ms,
         }
 
 

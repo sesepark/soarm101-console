@@ -725,7 +725,7 @@ function showReject(message) {
   banner.hidden = false;
   banner.classList.add('warn');
   el('banner-title').textContent = '거절됨';
-  el('banner-detail').textContent = message.message || message.code;
+  el('banner-detail').textContent = korean(message.message || message.code);
   el('banner-resume').hidden = true;
   clearTimeout(showReject.timer);
   showReject.timer = setTimeout(() => {
@@ -816,13 +816,20 @@ function paintState() {
 
 // ---------------------------------------------------------------- 조작판 짓기
 
-function jointRow(item, index) {
+/** 관절 한 줄.
+ *
+ * `scope`가 필요한 이유: 손목 둘과 집게는 `관절` 판과 `끝점` 판 **양쪽에** 나온다. 같은
+ * `id`를 두 번 쓰면 문서에 중복 id가 생기고, `<label for>`가 늘 먼저 나온 쪽을 가리켜
+ * 끝점 판에서 이름을 눌렀을 때 관절 판의 슬라이더가 잡혔다.
+ */
+function jointRow(item, index, scope) {
   const row = document.createElement('div');
   row.className = 'joint';
   row.dataset.joint = item.name;
+  const id = `slider-${scope}-${item.name}`;
   row.innerHTML = `
-    <label for="slider-${item.name}">${index === null ? '' : `${index + 1}. `}${item.label}</label>
-    <input id="slider-${item.name}" type="range" min="${item.min}" max="${item.max}" step="0.1" value="0">
+    <label for="${id}">${index === null ? '' : `${index + 1}. `}${item.label}</label>
+    <input id="${id}" type="range" min="${item.min}" max="${item.max}" step="0.1" value="0">
     <output>0</output>`;
   const slider = row.querySelector('input');
   slider.addEventListener('pointerdown', () => {
@@ -845,13 +852,13 @@ function jointRow(item, index) {
 function buildControls() {
   const joints = el('joint-controls');
   joints.innerHTML = '';
-  spec.forEach((item, index) => joints.append(jointRow(item, index)));
+  spec.forEach((item, index) => joints.append(jointRow(item, index, 'joint')));
 
   const wrists = el('wrist-controls');
   wrists.innerHTML = '';
   for (const name of HAND_JOINTS) {
     const item = specByName.get(name);
-    if (item) wrists.append(jointRow(item, null));
+    if (item) wrists.append(jointRow(item, null, 'hand'));
   }
 
   const readings = el('joint-readings');
@@ -994,6 +1001,36 @@ el('release-confirm').addEventListener('change', refreshTakeButton);
 
 const savedToken = localStorage.getItem('soarm-motion-token');
 if (savedToken) el('token').value = savedToken;
+
+/** 서버가 영어로 돌려주는 거절을, 무엇을 해야 하는지로 옮긴다.
+ *
+ * 맥 앱은 이미 그렇게 하고 있었는데 폰 화면은 원문을 그대로 띄웠다. 빨간 띠에
+ * `Motion token is missing or wrong`이라고만 떠 있으면, 읽는 사람은 그것이 자기 토큰
+ * 이야기인지 서버 설정 이야기인지 알 수 없다. **모르는 문장은 원문을 남긴다** — 옮기지
+ * 못한 것을 지어내는 것보다 낫다. */
+const ENGLISH = [
+  [/Motion token is missing or wrong/i,
+   '조작 토큰이 다릅니다. 서버의 SOARM_MOTION_TOKEN과 같은 값인지 확인하세요.'],
+  [/is not configured on the server/i,
+   '서버에 조작 토큰이 설정되어 있지 않습니다. 그동안은 어떤 조작 권한도 발급되지 않습니다.'],
+  [/Confirmation phrase does not match/i,
+   '확인 문구가 맞지 않습니다.'],
+  [/Enable torque first/i,
+   '먼저 토크를 걸어야 합니다. 토크가 없으면 팔은 목표를 따라갈 수 없습니다.'],
+  [/already running/i, '이미 돌고 있습니다.'],
+  [/Torque is still enabled/i,
+   '토크가 걸려 있어 내릴 수 없습니다. 팔을 받칠 수 있을 때 토크를 먼저 푸세요.'],
+  [/Device is owned by ([^\s:]+)/i, '다른 프로그램이 팔을 쥐고 있습니다: $1'],
+  [/held by ([^\s]+)/i, '$1가 조작 권한을 쥐고 있습니다.'],
+];
+
+function korean(message) {
+  const text = String(message ?? '');
+  for (const [pattern, replacement] of ENGLISH) {
+    if (pattern.test(text)) return text.replace(pattern, replacement);
+  }
+  return text;
+}
 
 async function post(path, body) {
   const response = await fetch(path, {

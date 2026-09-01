@@ -117,6 +117,7 @@ class VirtualLeader:
                 "state": State.STOPPED,
                 "state_korean": "꺼짐",
                 "torque_enabled": False,
+                "torque_known": False,
                 "joints": [],
                 "fault": None,
                 "warnings": [],
@@ -158,10 +159,15 @@ class VirtualLeader:
             report = inspect_arm("follower", self.settings.follower_port)
             if not report.healthy:
                 raise HardwareError(report.error or "Follower bus did not read back healthy")
-            if not report.safe_for_motion_start:
-                raise HardwareError(
-                    "Follower motors still have torque enabled; the read-only doctor will not start motion from there"
-                )
+            # **토크가 걸려 있다고 시작을 막지 않는다.**
+            #
+            # 처음에는 여기서 막았다. 그랬더니 막다른 골목이 생겼다 — 토크를 걸어 둔 채
+            # 루프를 내리면(서비스 재시작이면 충분하다) 팔은 뻣뻣한 채로 남는데, 다시
+            # 시작하려면 토크가 꺼져 있어야 하고, 토크를 끄려면 루프가 돌아야 한다.
+            # 앱으로는 그 팔을 아무것도 할 수 없게 된다. 실제로 그 상태를 한 번 만들었다.
+            #
+            # 여기서 시작하는 것은 **읽기**다. 움직임의 게이트는 `arm`에 있고 거기에는
+            # 확인과 토큰이 붙어 있다. 지금 어떤 상태인지는 화면이 그대로 말해 준다.
         owner = VirtualLeaderOwner(
             specs=specs,
             settings=self.policy,

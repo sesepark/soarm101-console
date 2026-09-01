@@ -108,6 +108,12 @@ class VirtualLeaderOwner:
         self._current: dict[str, float] = {}
         self._temperature: dict[str, float] = {}
         self._goal: dict[str, float] = {}
+        #: 사람이 **요청한** 값. 틱당 상한으로 자르기 전의 것이다.
+        #:
+        #: 자른 목표는 매 틱 실제 위치에 다시 붙으므로 절대 벌어지지 않는다. 무언가에
+        #: 닿았다는 것을 알아보려면 "계속 요청하는데 팔이 안 움직인다"를 봐야 하고,
+        #: 그 "요청"이 이 값이다.
+        self._requested: dict[str, float] = {}
         self._hold_goal: dict[str, float] = {}
         self._limited: list[str] = []
         self._observation = 0
@@ -119,6 +125,18 @@ class VirtualLeaderOwner:
         self._listeners: list = []
         #: 중계 모드인가. 장치를 열지 않고 목표만 들고 있는 상태.
         self._relay = False
+        #: 제어 루프에게 시킬 토크 조작. `True`면 걸고 `False`면 푼다.
+        #:
+        #: 여기 두는 이유는 **serial bus를 만지는 스레드가 하나여야 하기 때문**이다.
+        #: 토크를 HTTP 스레드에서 직접 걸었더니, 30Hz로 읽고 있는 제어 루프와 같은 포트를
+        #: 동시에 쓰게 되어 `[TxRxResult] Port is in use!`로 루프가 통째로 FAULT에 빠졌다.
+        #: 버스에 말을 거는 일은 전부 루프의 몫이고, 바깥에서는 부탁만 남긴다.
+        self._pending_torque: bool | None = None
+        #: 마지막으로 거절한 명령. 워치독이 걸렸을 때 "명령이 오지 않았다"와 "명령이
+        #: 오긴 했는데 전부 거절당했다"를 구별해 주기 위한 것이다. 화면에 앞의 말만 뜨면
+        #: 조작하던 사람은 자기 쪽 연결을 의심하게 되는데, 사실은 서버가 이유를 갖고
+        #: 되돌려보내고 있었다.
+        self._last_reject: tuple[str, str, float] | None = None
         self._owner_locks: DeviceLockSet | None = None
 
     # MARK: 수명
@@ -190,7 +208,12 @@ class VirtualLeaderOwner:
             self.detector.reset()
             self._relay = relay_from is not None
             # 중계 모드에는 토크 게이트가 없다. 토크를 쥔 쪽은 record 프로세스다.
-            self._state = State.READY if self._relay else State.SAFE
+            #
+            # 실물에서는 붙었을 때 이미 토크가 걸려 있을 수 있다 — 앞서 누가 걸어 두고
+            # 루프만 내린 경우다. 그때 `SAFE`라고 말하면 화면이 "관찰 전용"이라고 하는데
+            # 팔은 뻣뻣하게 힘을 주고 있다. 있는 그대로 `READY`로 이어받는다.
+            armed = self._backend is not None and self._backend.torque_enabled
+            self._state = State.READY if (self._relay or armed) else State.SAFE
             thread = threading.Thread(target=self._run, name="soarm-vleader", daemon=True)
             self._thread = thread
             thread.start()
@@ -226,21 +249,19 @@ class VirtualLeaderOwner:
     # MARK: 토크
 
     def arm(self) -> None:
-        """토크를 건다. 여기서부터 팔은 자기 자세를 스스로 버틴다."""
+        """토크를 건다. 여기서부터 팔은 자기 자세를 스스로 버틴다.
+
+        실제로 거는 것은 제어 루프다. 여기서는 부탁만 남기고 결과를 기다린다 — 버스에
+        말을 거는 스레드는 하나여야 한다.
+        """
         with self._lock:
             if self._relay:
                 raise HardwareError("Torque belongs to the recording process while relaying")
-            backend = self._require_backend()
+            self._require_backend()
             if self._state in (State.FAULT,):
                 raise HardwareError("Clear the fault before arming")
-            backend.set_torque(True)
-            # 지금 자세를 그대로 목표로 잡는다. 이것이 없으면 첫 write가 어디로 갈지
-            # 모터의 마지막 Goal_Position에 달리게 되고, 그 값은 우리가 모른다.
-            self._hold_goal = dict(self._present)
-            self._goal = dict(self._present)
-            self._state = State.READY
-            self._fault = None
-            self.detector.reset()
+            self._pending_torque = True
+        self._await_torque(True)
 
     def release_torque(self) -> None:
         """토크를 푼다. **팔이 떨어질 수 있다.**
@@ -251,12 +272,10 @@ class VirtualLeaderOwner:
         with self._lock:
             if self._relay:
                 raise HardwareError("Torque belongs to the recording process while relaying")
-            backend = self._require_backend()
+            self._require_backend()
             self.authority.release_all("torque_released")
-            backend.set_torque(False)
-            self._goal = {}
-            self._hold_goal = {}
-            self._state = State.SAFE
+            self._pending_torque = False
+        self._await_torque(False)
 
     # MARK: 명령
 
@@ -276,6 +295,17 @@ class VirtualLeaderOwner:
         있는가*에 답하기 때문이고, 형식 검사보다 싸기 때문이다.
         """
         now = time.monotonic()
+        try:
+            return self._submit(
+                payload=payload, lease_id=lease_id, sequence=sequence,
+                valid_for_ms=valid_for_ms, observation=observation, now=now,
+            )
+        except RejectError as reject:
+            with self._lock:
+                self._last_reject = (reject.code, reject.detail, now)
+            raise
+
+    def _submit(self, *, payload, lease_id, sequence, valid_for_ms, observation, now):
         with self._lock:
             lease = self.authority.authorise(lease_id, sequence, now)
             self._check_command_freshness(observation)
@@ -306,6 +336,7 @@ class VirtualLeaderOwner:
             )
 
             self._goal = goal
+            self._requested = dict(merged)
             self._limited = limited
             self._last_command_at = now
             valid = self._validity_seconds(valid_for_ms)
@@ -376,6 +407,23 @@ class VirtualLeaderOwner:
             self.authority.require_resync()
             self._state = State.READY if (self._relay or (backend and backend.torque_enabled)) else State.SAFE
 
+    def _await_torque(self, expected: bool, seconds: float = 3.0) -> None:
+        """루프가 부탁을 처리할 때까지 기다린다. 못 하면 그 이유를 그대로 올린다."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            with self._lock:
+                pending = self._pending_torque
+                backend = self._backend
+                error = self._error
+                state = self._state
+            if pending is None:
+                if backend is not None and backend.torque_enabled == expected:
+                    return
+                if state == State.FAULT:
+                    raise HardwareError(error or "토크를 바꾸지 못했습니다")
+            time.sleep(0.02)
+        raise HardwareError("제어 루프가 토크 요청에 답하지 않았습니다")
+
     # MARK: 상태
 
     def snapshot(self) -> dict[str, object]:
@@ -388,6 +436,10 @@ class VirtualLeaderOwner:
                 "state": self._state,
                 "state_korean": STATE_KOREAN.get(self._state, self._state),
                 "torque_enabled": bool(backend.torque_enabled) if backend else False,
+                # 루프가 돌지 않으면 토크가 걸려 있는지 **알 수 없다**. 그때 거짓을
+                # 돌려주면 화면은 힘을 주고 서 있는 팔을 두고 "토크 없음"이라고 말한다.
+                # 실제로 그 화면을 봤다 — 모터 여섯 개가 전부 켜져 있는데도.
+                "torque_known": backend is not None,
                 "observation": self._observation,
                 "loop_ms": round(self._loop_ms, 2),
                 "joints": [
@@ -429,13 +481,37 @@ class VirtualLeaderOwner:
             raise HardwareError("Virtual leader is not running")
         return self._backend
 
+    def _silenceReason(self, silent_ms: float, now: float) -> str:
+        """왜 명령이 끊겼는지. 오지 않은 것과 거절당한 것은 다른 일이다."""
+        base = f"{int(silent_ms)}ms 동안 통과한 명령이 없습니다"
+        reject = self._last_reject
+        if reject is not None and (now - reject[2]) * 1000 <= silent_ms + self.settings.command_timeout_ms:
+            return f"{base} — 마지막 명령은 {reject[0]}로 거절되었습니다: {reject[1]}"
+        return f"{base} (조작하는 쪽에서 아무것도 오지 않았습니다)"
+
     def _enter_hold(self, code: str, joint: str | None, message: str) -> None:
         self._hold_goal = dict(self._present)
         self._goal = dict(self._present)
+        # 요청도 지운다. 남겨 두면 사람이 `확인하고 계속`을 누르는 순간 아직 살아 있는
+        # 옛 요청으로 곧바로 다시 걸린다.
+        self._requested = {}
         self._limited = []
         self._fault = Fault(code=code, joint=joint, message=message, at=time.time())
         self.authority.require_resync()
         self._state = State.HOLD
+
+    def _movement(self) -> dict[str, float]:
+        """최근 창 동안 관절이 실제로 얼마나 움직였는가.
+
+        `_trail`은 30틱(1초)치를 들고 있다. 그보다 짧게 보면 천천히 미는 동안에도 "서 있다"로
+        읽히고, 길게 보면 이미 닿은 뒤에도 한참 알아채지 못한다.
+        """
+        if len(self._trail) < 2:
+            return {}
+        oldest = self._trail[0]
+        return {
+            name: abs(value - oldest.get(name, value)) for name, value in self._present.items()
+        }
 
     def _retreat_goal(self, joint: str) -> dict[str, float]:
         """걸린 관절만 밀던 방향의 반대로 물러난다.
@@ -448,7 +524,9 @@ class VirtualLeaderOwner:
         target = dict(self._present)
         if spec is None:
             return target
-        pushing = self._goal.get(joint, self._present.get(joint, 0.0)) - self._present.get(joint, 0.0)
+        pushing = self._requested.get(
+            joint, self._goal.get(joint, self._present.get(joint, 0.0))
+        ) - self._present.get(joint, 0.0)
         if abs(pushing) < 1e-6 and len(self._trail) > 1:
             pushing = self._present.get(joint, 0.0) - self._trail[0].get(joint, 0.0)
         direction = 1.0 if pushing >= 0 else -1.0
@@ -468,6 +546,34 @@ class VirtualLeaderOwner:
         while not self._stop.is_set():
             started = time.perf_counter()
             tick += 1
+
+            # 바깥에서 남긴 토크 부탁을 여기서 처리한다. 버스를 만지는 것은 이 스레드뿐이다.
+            with self._lock:
+                pending, self._pending_torque = self._pending_torque, None
+            if pending is not None and self._backend is not None:
+                try:
+                    self._backend.set_torque(pending)
+                    with self._lock:
+                        if pending:
+                            # 지금 자세를 그대로 목표로 잡는다. 이것이 없으면 첫 write가
+                            # 어디로 갈지 모터의 마지막 Goal_Position에 달린다.
+                            self._hold_goal = dict(self._present)
+                            self._goal = dict(self._present)
+                            self._state = State.READY
+                            self._fault = None
+                            self._error = None
+                            self.detector.reset()
+                        else:
+                            self._goal = {}
+                            self._hold_goal = {}
+                            self._state = State.SAFE
+                except HardwareError as exc:
+                    with self._lock:
+                        self._error = str(exc)
+                        self._fault = Fault(Trip.HARDWARE_ERROR, None, str(exc), time.time())
+                        self._state = State.FAULT
+                        self.authority.require_resync()
+
             if self._relay:
                 # 중계 모드에는 읽을 버스가 없다. 마지막으로 통과한 목표가 곧 우리가 아는
                 # 전부이고, 뷰어에는 그것이 "명령한 자세"로 표시된다.
@@ -510,9 +616,7 @@ class VirtualLeaderOwner:
                     silent_ms = (now - self._last_command_at) * 1000.0
                     if silent_ms > self.settings.command_timeout_ms:
                         self._enter_hold(
-                            Trip.COMMAND_TIMEOUT,
-                            None,
-                            f"{int(silent_ms)}ms 동안 명령이 오지 않았습니다",
+                            Trip.COMMAND_TIMEOUT, None, self._silenceReason(silent_ms, now)
                         )
                         state = self._state
                     elif now > self._goal_expires_at:
@@ -530,6 +634,8 @@ class VirtualLeaderOwner:
                         load=self._load,
                         current=self._current,
                         temperature=self._temperature,
+                        requested=self._requested,
+                        moved=self._movement(),
                     )
                     if trip is not None:
                         code, joint, message = trip

@@ -75,9 +75,19 @@ class RealFollower:
                 raise HardwareError("Follower calibration file is missing; run scripts/calibrate_follower.sh")
             robot.bus.write_calibration(robot.calibration)
         self._robot = robot
-        # 붙자마자 토크를 걸지 않는다. 관찰만 하는 동안 팔은 손으로 움직일 수 있어야 하고,
-        # 그 상태에서 3D 모델이 실물을 따라오는지 확인하는 것이 첫 점검이다.
-        self.set_torque(False)
+        # **붙는다고 토크를 건드리지 않는다.**
+        #
+        # 처음에는 여기서 토크를 껐다. 관찰만 하는 동안 팔을 손으로 움직일 수 있어야 한다는
+        # 이유였는데, 그 코드는 이미 토크를 물고 자세를 유지하던 팔에 붙는 순간 그 팔을
+        # 놓아 버린다. 팔이 들려 있었다면 떨어진다. 붙는 것은 관찰의 시작이지 상태를 바꿀
+        # 이유가 아니다 — 토크는 확인 문구가 있는 자리에서만 바뀐다.
+        #
+        # 대신 지금 어떤 상태인지 읽어서 그대로 들고 간다. 화면은 사실을 말해야 한다.
+        try:
+            torque = robot.bus.sync_read("Torque_Enable", normalize=False, num_retry=2)
+            self._torque = any(int(value) != 0 for value in torque.values())
+        except Exception:  # noqa: BLE001 - 읽지 못하면 걸려 있다고 보는 쪽이 안전하다
+            self._torque = True
 
     def disconnect(self) -> None:
         robot, self._robot = self._robot, None
@@ -93,10 +103,25 @@ class RealFollower:
         return self._torque
 
     def set_torque(self, enabled: bool) -> None:
+        """토크를 걸거나 푼다.
+
+        거는 쪽에는 순서가 있다. **지금 자세를 목표로 먼저 써 넣고 그다음에 토크를 건다.**
+        서보의 `Goal_Position`에는 지난번에 쓴 값이 그대로 남아 있고, 토크가 걸리는 순간
+        서보는 그 값을 향해 스스로 달린다 — 우리 제어 루프가 첫 목표를 쓰기까지의 한 틱이
+        그 틈이다. 33ms지만 전속력이다.
+
+        토크가 꺼진 상태에서도 `Goal_Position`은 쓸 수 있다. 써 두면 토크를 거는 순간
+        서보가 겨냥하는 곳이 지금 있는 자리가 되어, 팔은 제자리에 선 채로 뻣뻣해진다.
+        """
         if self._robot is None:
             raise HardwareError("Follower is not connected")
         bus = self._robot.bus
         if enabled:
+            try:
+                present = bus.sync_read("Present_Position", num_retry=2)
+                bus.sync_write("Goal_Position", present)
+            except Exception as exc:  # noqa: BLE001 - 겨냥할 곳을 모르면 토크를 걸지 않는다
+                raise HardwareError(f"Could not aim the servos at their present position: {exc}") from exc
             bus.enable_torque()
         else:
             bus.disable_torque()
@@ -180,6 +205,10 @@ class SimulatedFollower:
     def set_torque(self, enabled: bool) -> None:
         if not self._connected:
             raise HardwareError("Simulated follower is not connected")
+        if enabled:
+            # 실물과 같은 성질: 토크를 거는 순간 서보가 겨냥하는 곳은 지금 있는 자리다.
+            with self._lock:
+                self._goal = dict(self._position)
         self._torque = enabled
 
     def read(self, include_health: bool) -> dict[str, dict[str, float]]:

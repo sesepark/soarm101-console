@@ -426,6 +426,15 @@ function applyTelemetry(message) {
     framed = true;
     frameModel(live.stage);
   }
+  // 서버가 팔을 세웠으면 잡고 있던 손도 놓는다.
+  //
+  // 놓지 않으면 그리던 목표가 그대로 남는다. 팔이 책상에 닿아 멈춘 자리에서 목표만
+  // 35° 떨어진 곳에 서 있고, 다시 시작하는 순간 같은 곳으로 다시 밀어 붙어 400ms 만에
+  // 또 멈춘다 — 화면에서는 "부딪힌 뒤로는 아무리 해도 조작이 안 되는" 것으로 보인다.
+  // 멈춤은 의도를 지우는 일이기도 하다.
+  if (commanding && ['HOLD', 'FAULT', 'RETREATING'].includes(telemetry.state)) {
+    releaseGrip();
+  }
   if (!commanding) {
     target = { ...present };
     applyPose(ghost, target);

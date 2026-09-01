@@ -5,7 +5,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -112,9 +112,38 @@ def index() -> FileResponse:
 
 @app.get("/mobile", include_in_schema=False)
 @app.get("/mobile/", include_in_schema=False)
-def mobile() -> FileResponse:
-    """Phone-first, observation-only camera viewer."""
-    return FileResponse(static_dir / "mobile.html")
+def mobile() -> RedirectResponse:
+    """폰에서 여는 자리. 이제 조작 화면 하나로 모인다.
+
+    예전에는 여기가 카메라만 보여 주는 별도의 화면이었다. 화면이 둘이면 폰에서 영상을
+    보다가 조작하려고 다른 주소로 옮겨 가야 했고, 그 사이 화면 생김새도 달라졌다.
+    지금은 `/viewer/`의 `카메라` 칸이 같은 일을 하므로 이 주소는 그리로 보낸다 —
+    폰에 남아 있는 옛 북마크와 홈 화면 아이콘이 빈 자리로 가지 않게 하는 길이다.
+    """
+    return RedirectResponse("/viewer/?host=web", status_code=307)
+
+
+@app.get("/viewer/manifest.webmanifest", include_in_schema=False)
+def manifest() -> FileResponse:
+    """홈 화면 앱의 이름과 아이콘.
+
+    `StaticFiles`에 맡기지 않고 여기서 내보내는 이유는 미디어 타입 하나 때문이다.
+    파이썬의 `mimetypes`는 `.webmanifest`를 모르고, 그러면 `text/plain`으로 나간다.
+    크롬은 그 응답을 매니페스트로 읽지 않으므로 "홈 화면에 추가"가 제안되지 않는다.
+    """
+    return FileResponse(
+        static_dir / "viewer/manifest.webmanifest", media_type="application/manifest+json"
+    )
+
+
+@app.get("/viewer/sw.js", include_in_schema=False)
+def service_worker() -> FileResponse:
+    """서비스 워커. 캐시는 두지 않는다 — 오래된 조작 화면이 살아 돌아오는 것은 사고다.
+
+    범위(scope)를 `/`로 두려면 워커가 `/`에서 나가야 하는데, 여기서는 `/viewer/`면
+    충분하다. 그래서 `Service-Worker-Allowed`도 붙이지 않는다.
+    """
+    return FileResponse(static_dir / "viewer/sw.js", media_type="text/javascript")
 
 
 @app.get("/api/status")

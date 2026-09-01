@@ -19,6 +19,7 @@ class FollowerBackend(Protocol):
 
     def connect(self) -> None: ...
     def disconnect(self) -> None: ...
+    def apply_speed_limit(self, settings) -> None: ...
     def read(self, include_health: bool) -> dict[str, dict[str, float]]: ...
     def write(self, goal: dict[str, float]) -> dict[str, float]: ...
     def set_torque(self, enabled: bool) -> None: ...
@@ -48,6 +49,8 @@ class RealFollower:
         self.specs = {spec.name: spec for spec in specs}
         self._robot = None
         self._torque = False
+        #: 서보에서 되읽은 속도 상한(눈금/초). 화면이 "정말로 걸렸는가"를 말할 수 있게 한다.
+        self.speed_ticks: dict[str, int] = {}
 
     def connect(self) -> None:
         """팔로워에 붙는다. **붙었다는 이유로 토크가 바뀌지 않게** 한다.
@@ -168,10 +171,75 @@ class RealFollower:
                 bus.sync_write("Goal_Position", present)
             except Exception as exc:  # noqa: BLE001 - 겨냥할 곳을 모르면 토크를 걸지 않는다
                 raise HardwareError(f"Could not aim the servos at their present position: {exc}") from exc
-            bus.enable_torque()
-        else:
-            bus.disable_torque()
-        self._torque = enabled
+
+        # **한 번 더 해 본다.** Feetech 버스는 상태 패킷 하나가 깨지는 일이 드물지 않고,
+        # 그때 LeRobot은 `ConnectionError`를 올린다. 붙을 때(`connect`)는 이미 다시
+        # 시도하고 있었는데 여기는 그러지 않았다 — 2026-09-02에 `Failed to write 'Lock'
+        # on id_=1 ... There is no status packet!` 한 번으로 토크 걸기가 실패했다.
+        #
+        # 더 나쁜 것은 그 예외의 **종류**였다. `ConnectionError`는 제어 루프의
+        # `except HardwareError`에 걸리지 않아 스레드를 통째로 죽였고, 죽은 루프는
+        # serial과 owner lock을 쥔 채 남았다. 화면은 `Virtual leader is not running`만
+        # 말했고 다시 시작할 길이 없었다. 그래서 여기서 우리 예외로 바꿔 올린다.
+        failure: Exception | None = None
+        for _ in range(3):
+            try:
+                if enabled:
+                    bus.enable_torque()
+                else:
+                    bus.disable_torque()
+                self._torque = enabled
+                return
+            except Exception as exc:  # noqa: BLE001 - 버스 오류는 종류를 가리지 않는다
+                failure = exc
+        raise HardwareError(
+            f"Could not {'enable' if enabled else 'disable'} torque: {failure}"
+        ) from failure
+
+    def apply_speed_limit(self, settings) -> None:
+        """속도 상한을 **서보 안에** 세운다.
+
+        STS3215의 `Goal_Velocity`(주소 46)는 위치 모드에서 "목표까지 이 속도로 간다"는
+        뜻이고, 0이면 제한 없음이다(공장 기본값). 여기에 값을 써 넣으면 서보 안의 궤적
+        생성기가 스스로 속도를 지키므로, 우리는 목표를 **절대 자세 그대로** 던져 놓고
+        속도 걱정을 놓을 수 있다.
+
+        이것이 왜 중요한가. 예전에는 우리가 목표를 조금씩 앞세우는 방식으로 속도를
+        만들었고, 그 "조금"이 동시에 서보가 보는 위치 오차 — 즉 힘 — 이었다. 그래서
+        느리게 하면 팔이 약해졌다(2°에서 어깨가 팔을 들지 못했다). 속도를 서보에게
+        맡기고 나면 두 값이 서로를 붙잡지 않는다.
+
+        눈금은 실측했다(2026-09-02, 집게). `Goal_Velocity` 한 칸이 초당 위치 눈금 하나이고,
+        위치 눈금 하나는 360/4096도다. 200 → 21°/s, 500 → 47°/s, 1000 → 93°/s,
+        2000 → 150°/s에서 이 팔의 천장에 닿았다.
+
+        `Acceleration`(주소 41)도 함께 만져 보았으나 이 펌웨어(3.9)에서는 값을 바꿔도
+        도달 시간이 달라지지 않았다. 그래서 건드리지 않고 둔다 — 효과가 없는 쓰기를
+        루프에 남겨 두면 나중에 그것이 무언가를 지켜 준다고 믿게 된다.
+        """
+        if self._robot is None:
+            raise HardwareError("Follower is not connected")
+        bus = self._robot.bus
+        values = {spec.name: settings.ticks_per_second(spec) for spec in self.specs.values()}
+        try:
+            bus.sync_write("Goal_Velocity", values, normalize=False, num_retry=2)
+            # **되읽어 확인한다.** 이 한 번의 쓰기가 지금 이 팔의 속도 상한 전부이고,
+            # 실패하면 서보는 "제한 없음"(0)으로 남는다. 그 차이는 화면에서 보이지
+            # 않으므로 — 팔은 여전히 목표를 따라가고, 다만 최고 속도로 간다 — 여기서
+            # 확인하지 않으면 아무도 알아채지 못한다.
+            written = bus.sync_read("Goal_Velocity", normalize=False, num_retry=2)
+            self.speed_ticks = {name: int(value) for name, value in written.items()}
+        except Exception as exc:  # noqa: BLE001
+            raise HardwareError(str(exc)) from exc
+        wrong = [name for name, want in values.items() if self.speed_ticks.get(name) != want]
+        if wrong:
+            raise HardwareError(
+                "속도 상한이 서보에 들어가지 않았습니다: " + ", ".join(sorted(wrong))
+            )
+        self.max_relative_target = settings.lead_deg
+        # LeRobot의 `send_action`이 쓰는 상한도 함께 옮긴다. 두 겹으로 자르는 것이
+        # 이 사다리의 요점인데, 한쪽만 바뀌면 겹이 아니라 어긋남이 된다.
+        self._robot.config.max_relative_target = settings.lead_deg
 
     def read(self, include_health: bool) -> dict[str, dict[str, float]]:
         """관절 상태.
@@ -222,6 +290,9 @@ class SimulatedFollower:
     def __init__(self, specs: list[JointSpec], step: float = 2.0):
         self.specs = {spec.name: spec for spec in specs}
         self.step = step
+        #: 틱당 갈 수 있는 거리. `apply_speed_limit`이 채운다.
+        self.speed: dict[str, float] = {}
+        self.speed_ticks: dict[str, int] = {}
         self._lock = threading.Lock()
         self._position = {name: 0.0 for name in self.specs}
         self._goal = dict(self._position)
@@ -257,6 +328,21 @@ class SimulatedFollower:
                 self._goal = dict(self._position)
         self._torque = enabled
 
+    def apply_speed_limit(self, settings) -> None:
+        """흉내 백엔드에서도 속도는 서보가 지키는 것처럼 행동한다.
+
+        틱마다 갈 수 있는 거리를 속도에서 계산한다. 그러지 않으면 시험 안의 팔만
+        순간이동하고, 정작 확인하려는 것(목표가 절대값이어도 팔은 천천히 간다)이
+        시험에서 사라진다.
+        """
+        self.speed = {
+            name: settings.speed(spec) / max(1, settings.hz)
+            for name, spec in self.specs.items()
+        }
+        self.speed_ticks = {
+            name: settings.ticks_per_second(spec) for name, spec in self.specs.items()
+        }
+
     def read(self, include_health: bool) -> dict[str, dict[str, float]]:
         if not self._connected:
             raise HardwareError("Simulated follower is not connected")
@@ -284,7 +370,8 @@ class SimulatedFollower:
             for name, value in goal.items():
                 spec = self.specs[name]
                 current = self._position[name]
-                delta = max(-self.step, min(self.step, value - current))
+                cap = self.speed.get(name, self.step)
+                delta = max(-cap, min(cap, value - current))
                 target = spec.clamp(current + delta)
                 limit = self.obstacle.get(name)
                 if limit is not None and target > limit:

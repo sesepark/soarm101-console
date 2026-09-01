@@ -64,6 +64,19 @@ class Trip:
     HARDWARE_ERROR = "HARDWARE_ERROR"
 
 
+#: **조작하던 사람이 사라져서** 선 것들.
+#:
+#: 팔에 일어난 일이 아니라 조작면에 일어난 일이다. 읽을 현장이 없고, 확인할 것도 없다 —
+#: 앞 사람이 반납했거나, 리스가 만료됐거나, 스트림이 끊겼다는 뜻뿐이다. 그래서 새 사람이
+#: **확인 체크와 함께** 조작 권한을 받으면 이것들은 그 자리에서 풀린다.
+#:
+#: 나머지(접촉·과부하·과열·사람이 누른 정지·하드웨어 오류)는 풀리지 않는다. 그것들은
+#: 팔에 일어난 일이고, 다음 사람이 **읽어야 하는** 이유다. 권한을 새로 받는 것으로 조용히
+#: 지워지면 멈춘 이유를 아무도 보지 않은 채 다시 움직이게 된다.
+OPERATOR_GONE = frozenset(
+    {Trip.LEASE_RELEASED, Trip.LEASE_EXPIRED, Trip.COMMAND_TIMEOUT}
+)
+
 TRIP_KOREAN = {
     Trip.OVERLOAD: "부하가 계속 높습니다 — 무언가에 닿았을 수 있습니다",
     Trip.STALLED: "밀고 있는데 움직이지 않습니다 — 무언가에 막혀 있습니다",
@@ -105,127 +118,205 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+#: 서보 위치 눈금 하나가 몇 도인가. STS3215는 한 바퀴를 4096으로 센다.
+#:
+#: `Goal_Velocity`(주소 46)의 단위가 바로 이 눈금/초다. 2026-09-02에 집게로 실측했다 —
+#: 200을 써 넣으면 21°/s, 500이면 47°/s, 1000이면 93°/s, 2000이면 150°/s에서 천장에
+#: 닿았다(이 팔의 무부하 속도). 0은 "제한 없음"이고 공장 기본값이다.
+DEGREES_PER_TICK = 360.0 / 4096.0
+
+#: 집게의 0~100%가 몇 도에 해당하는가. calibration 범위(1656~3100 눈금)에서 나온다.
+#: 퍼센트로 말한 속도를 서보의 눈금/초로 바꿀 때 쓴다.
+GRIPPER_DEGREES_PER_PERCENT = (3100 - 1656) / 100.0 * DEGREES_PER_TICK
+
+
 @dataclass(frozen=True)
 class VLeaderSettings:
     """안전 사다리의 문턱값.
 
     전부 config로 뺀 이유는 SAFETY.md가 이 값들을 불변조건이 아니라 `DEFAULT` 정책으로
-    분류하기 때문이다. 기본값은 보수적으로 잡았고, 근거와 아직 실측하지 못한 것은
+    분류하기 때문이다. 기본값은 실측에 맞춰 잡았고, 아직 재지 못한 것은
     `docs/원격_텔레옵_안전.md`에 적어 두었다.
+
+    ## 속도와 힘은 이제 서로 다른 값이 정한다
+
+    예전에는 `step_deg` 하나가 둘을 함께 정했다. 목표를 실제 위치보다 한 틱에 몇 도까지
+    앞세울 수 있는지가 상한이었고, 그 값이 곧 최대 속도(step × hz)이면서 동시에 서보가
+    보는 위치 오차 — 즉 **힘** — 이었다. STS3215가 위치 P 제어이고 LeRobot이 P=16을 써
+    넣기 때문이다. 그래서 안전하게 낮추면 어깨가 팔을 들지 못했고(2°에서 실제로 그랬다),
+    들 수 있게 올리면 속도까지 함께 올라갔다. 두 요구가 한 손잡이에 묶여 있었다.
+
+    이제는 나눈다.
+
+    - **속도**는 서보 자신이 지킨다. `Goal_Velocity` 레지스터에 써 넣으면 서보 안의 궤적
+      생성기가 목표까지 그 속도로 미끄러진다. 명령을 얼마나 자주 보내는지와 무관하고,
+      위치 오차와도 무관하다.
+    - **힘**은 목표가 실제보다 앞설 수 있는 거리(`lead_deg`)가 정한다. 자유롭게 움직이는
+      동안 이 거리는 서보의 추종오차만큼밖에 벌어지지 않으므로 힘은 저절로 작다. 무언가에
+      막혔을 때만 이 거리까지 벌어지고, 그때 나오는 힘이 이 값의 뜻이다.
+
+    나누고 나서 얻은 것: 상한을 낮춰도 팔이 약해지지 않고, 힘을 올려도 팔이 빨라지지 않는다.
     """
 
-    #: 제어 루프 주기. 30Hz는 기존 `lerobot-teleoperate --fps=30`과 같은 값이라,
-    #: 물리 리더로 하던 것과 같은 속도로 돈다.
+    #: 제어 루프 주기. 30Hz는 기존 `lerobot-teleoperate --fps=30`과 같은 값이다.
     hz: int = field(default_factory=lambda: _env_int("SOARM_VL_HZ", 30))
-    #: 한 틱에 허용하는 최대 변화. LeRobot의 `max_relative_target`과 같은 뜻이고 같은
-    #: 단위(도)다. 서버는 이 값으로 먼저 자르고, LeRobot이 `send_action` 안에서 한 번 더
-    #: 자른다 — 두 겹이 겹쳐 있는 것이 맞다. 하나는 우리 것이고 하나는 라이브러리 것이라
-    #: 한쪽을 고쳐도 다른 쪽이 남는다.
-    step_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_STEP_DEG", 2.0))
-    step_percent: float = field(default_factory=lambda: _env_float("SOARM_VL_STEP_PERCENT", 3.0))
-    #: 명령이 이만큼 끊기면 HOLD. 30Hz에서 아홉 틱쯤이다. 무선 구간이 잠깐 끊겼다고
-    #: 매번 멈추지 않으면서, 조작하던 사람이 손을 떼면 곧바로 서는 길이.
+    #: 팔 관절의 최대 속도. 서보의 `Goal_Velocity`로 내려간다.
+    #:
+    #: 이 팔의 천장은 실측 150°/s다(집게, 무부하). 기본값을 그 아래에 두는 이유는 속도가
+    #: 곧 부딪혔을 때의 운동에너지이기 때문이지, 명령이 그보다 빠를 수 없어서가 아니다.
+    max_deg_per_s: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_MAX_DEG_PER_S", 90.0)
+    )
+    #: 집게의 최대 속도. 단위가 퍼센트라 따로 둔다. 100%가 약 127°이므로 118%/s가 천장이다.
+    max_percent_per_s: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_MAX_PERCENT_PER_S", 110.0)
+    )
+    #: 목표가 실제 위치보다 앞설 수 있는 거리 = **막혔을 때 내는 힘**.
+    #:
+    #: 실측(2026-09-01): 오차 2°에서 부하 100 — 어깨가 팔을 전혀 들지 못했다. 5°에서 236,
+    #: 팔이 올라오기 시작했다. 8°에서 304. 즉 부하는 오차에 거의 비례하고, 팔을 들려면
+    #: 최소 5°쯤이 필요하다. 12°는 그 두 배를 조금 넘는 여유이고, 막혔을 때의 부하는
+    #: 서보 자체 보호(Overload_Torque=80%, 즉 800)에 한참 못 미치는 자리에 온다.
+    lead_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_LEAD_DEG", 12.0))
+    #: 집게의 같은 값. 집게는 LeRobot이 `Max_Torque_Limit=500`으로 묶어 두어 더 약하다.
+    lead_percent: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_LEAD_PERCENT", 12.0)
+    )
+    #: 명령이 이만큼 끊기면 **목표를 지금 자리에 붙인다.** 팔은 선다. 아직 HOLD는 아니다.
+    #:
+    #: 예전에는 이 자리가 곧바로 HOLD였다. 30Hz에서 아홉 틱이면 무선 구간이 한 번
+    #: 흔들리기에 충분한 시간이라, 폰으로 조작하면 아무 잘못 없이 멈추고 그때마다
+    #: `확인하고 계속`을 눌러야 했다. 멈추는 것과 **사람에게 확인을 요구하는 것**은
+    #: 다른 일이다. 끊기면 즉시 서되, 확인은 정말로 사라졌을 때만 요구한다.
     command_timeout_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_COMMAND_TIMEOUT_MS", 300)
     )
+    #: 그 침묵이 이만큼 이어지면 그때 HOLD. 조작하던 쪽이 정말로 사라진 것이다.
+    command_hold_ms: int = field(
+        default_factory=lambda: _env_int("SOARM_VL_COMMAND_HOLD_MS", 1500)
+    )
     #: 명령 하나가 스스로 주장할 수 있는 유효기간의 상한. 이보다 긴 값을 실어 보내도
-    #: 이 값으로 자른다. 클라이언트가 "10초 동안 유효"라고 우기며 끊긴 뒤에도 마지막
-    #: 명령을 살려 두는 길을 막는다(SAFETY.md 불변조건 6).
+    #: 이 값으로 자른다(SAFETY.md 불변조건 6).
     command_valid_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_COMMAND_VALID_MS", 500)
     )
     lease_ttl_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_LEASE_TTL_MS", 5000))
     heartbeat_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_HEARTBEAT_MS", 1000))
     #: 리스를 잡은 직후 첫 명령이 실제 자세에서 이보다 멀면 거절한다.
+    #:
+    #: 속도를 서보가 지키게 되면서 이 값의 뜻이 달라졌다. 예전에는 먼 첫 목표가 곧 빠른
+    #: 출발이었지만, 이제 10°를 건너뛰어도 팔은 정해진 속도로 미끄러질 뿐이다. 그래서
+    #: 6°에서 10°로 넓혔다 — 좁은 창은 권한을 받을 때마다 화면이 조용히 거절당하는
+    #: 이유였고, 막아 주던 위험은 이제 다른 자리에서 막힌다.
     sync_tolerance_deg: float = field(
-        default_factory=lambda: _env_float("SOARM_VL_SYNC_TOLERANCE_DEG", 6.0)
+        default_factory=lambda: _env_float("SOARM_VL_SYNC_TOLERANCE_DEG", 10.0)
     )
     sync_tolerance_percent: float = field(
-        default_factory=lambda: _env_float("SOARM_VL_SYNC_TOLERANCE_PERCENT", 10.0)
+        default_factory=lambda: _env_float("SOARM_VL_SYNC_TOLERANCE_PERCENT", 15.0)
     )
-    #: STS3215 `Present_Load` raw. 0~1000이 0~100%에 대응한다. LeRobot이 집게에만
-    #: `Max_Torque_Limit=500`을 써 두었으므로 그 절반보다 낮은 자리에 우리 문턱을 둔다.
-    load_trip: int = field(default_factory=lambda: _env_int("SOARM_VL_LOAD_TRIP", 400))
-    load_trip_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_LOAD_TRIP_MS", 300))
-    #: `Present_Current` raw. STS3215의 눈금은 6.5mA이므로 108이면 약 0.7A다.
-    current_trip: int = field(default_factory=lambda: _env_int("SOARM_VL_CURRENT_TRIP", 108))
+    #: STS3215 `Present_Load` raw(0~1000). 서보 자신은 80%(=800)에서 토크를 20%로 떨어뜨린다
+    #: (`Overload_Torque`/`Protective_Torque`, 실측으로 읽었다). 우리는 그보다 먼저,
+    #: 떨어뜨리지 않는 방식으로 멈춘다.
+    load_trip: int = field(default_factory=lambda: _env_int("SOARM_VL_LOAD_TRIP", 550))
+    load_trip_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_LOAD_TRIP_MS", 400))
+    #: `Present_Current`. **이 하드웨어에서는 쓰지 않는다.**
+    #:
+    #: 실측에서 여섯 관절 모두, 자세를 버틸 때도 막혀서 물러날 때도 판독값이 0~3칸에
+    #: 머물렀다. 부하가 300을 넘는 순간에도 그랬다. 즉 이 레지스터는 이 팔에서 힘을
+    #: 말해 주지 않는다. 걸릴 수 없는 검사를 사다리에 남겨 두면 화면은 보호가 한 겹 더
+    #: 있다고 말하게 되고, 그것은 틀린 안심이다. 0이면 검사하지 않는다.
+    current_trip: int = field(default_factory=lambda: _env_int("SOARM_VL_CURRENT_TRIP", 0))
     current_trip_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_CURRENT_TRIP_MS", 300)
     )
-    #: **사람이 요청한 값**과 실제가 이만큼 벌어진 채, 실제가 거의 움직이지 않으면 막힌
-    #: 것으로 본다. 두 조건이 함께 있어야 하는 이유는 아래 `TripDetector`에 적었다.
-    #: 문턱이 작은 이유: 이 검사는 **서 있다**를 함께 요구한다. 벌어짐만 보던 때에는
-    #: 빠르게 끄는 동안에도 걸릴까 봐 크게 잡아야 했지만, 따라오는 중인 관절은 움직이고
-    #: 있으므로 그 걱정이 사라졌다. 남은 일은 목표에 도달해 미세하게 떠는 것과 진짜로
-    #: 막힌 것을 가르는 것뿐이고, 거기에는 몇 도면 충분하다.
+    #: 목표와 실제가 이만큼 벌어진 채 팔이 서 있으면 막힌 것으로 본다.
+    #:
+    #: 목표가 **절대 자세**가 되면서 이 검사가 비로소 제대로 선다. 예전에는 목표가 매 틱
+    #: 실제 위치에 다시 붙어 정의상 벌어지지 않았고(그래서 "사람이 요청한 값"을 따로
+    #: 들고 다녀야 했다), 지금은 목표가 사람이 말한 그 자리에 그대로 있다.
+    #:
+    #: 문턱은 `lead_deg`보다 조금 작아야 한다. 막히면 벌어짐은 `lead_deg`에서 멈추므로,
+    #: 그보다 크게 잡으면 영영 걸리지 않는다.
     following_error_deg: float = field(
-        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_DEG", 3.0)
+        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_DEG", 8.0)
     )
-    #: 집게는 단위가 퍼센트다. 도(degree)로 잰 문턱을 그대로 쓰면 뜻이 달라진다.
     following_error_percent: float = field(
-        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_PERCENT", 2.0)
+        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_PERCENT", 8.0)
     )
     #: 이 창 동안 실제 위치가 이만큼도 움직이지 않았으면 서 있는 것으로 본다.
     stall_epsilon: float = field(
         default_factory=lambda: _env_float("SOARM_VL_STALL_EPSILON", 0.6)
     )
-    #: 막힌 채로 **밀고 있는가**. 부하만 보면 자유롭게 움직일 때와 구별되지 않고(실측
-    #: 24~100 대 48~128), 사람이 요청한 값과의 벌어짐만 보면 기계적 끝단에 닿았을 때를
-    #: 놓친다 — 집게를 끝까지 닫으면 남은 벌어짐이 1.6%뿐이라 추종오차 문턱(2%)에 닿지
-    #: 않는다. 2026-09-01 실측에서 그 상태로 20초 동안 부하 120으로 밀고 있었는데 사다리
-    #: 어느 칸에도 걸리지 않았다. 남은 보호는 온도뿐이었고 그것은 분 단위로 느리다.
+    #: 막힌 채로 **밀고 있는가**. 목표가 앞서 있고, 팔은 서 있고, 부하가 높다.
     #:
-    #: 그래서 셋을 함께 본다. 목표가 실제보다 앞서 있고(밀고 있다), 팔은 서 있고, 부하가
-    #: 높다. 가만히 자세를 버티는 것과 구별되는 이유는 첫 번째 조건이다 — 버티기만 할
-    #: 때는 목표가 실제와 같은 자리에 있다.
-    #: 문턱과 창은 팔 관절에서 다시 쟀다(2026-09-01 저녁). 집게만 보고 80/500ms로 잡았더니
-    #: 팔 관절이 **움직이기 시작하는 순간** 걸렸다 — 정지 마찰을 이기는 동안 관절은 잠깐
-    #: 서 있고 부하는 96~144까지 오른다. 막혔을 때의 부하(100~144)와 구간이 겹치므로
-    #: 부하로는 둘을 가를 수 없고, 가르는 것은 **얼마나 오래 서 있는가**다. 정말 막힌
-    #: 관절은 계속 서 있고, 떨어지려는 관절은 1초 안에 움직이기 시작한다.
-    stall_load: int = field(default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD", 100))
+    #: 이 칸은 기계적 끝단을 위한 것이다. 끝단에서는 벌어짐이 자랄 자리가 없어 위의
+    #: 추종오차 검사가 걸리지 않는다 — 집게를 끝까지 닫으면 남은 벌어짐이 1.6%뿐이다.
+    #:
+    #: 문턱을 부하만으로 정할 수 없다는 것은 실측이 말해 주었다. 팔 관절이 정지 마찰을
+    #: 이기고 **움직이기 시작하는 순간** 부하가 96~144까지 오르는데, 그것은 진짜로 막혔을
+    #: 때와 겹친다. 가르는 것은 **얼마나 오래 서 있는가**다.
+    stall_load: int = field(default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD", 200))
     stall_load_ms: int = field(
-        default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD_MS", 1500)
+        default_factory=lambda: _env_int("SOARM_VL_STALL_LOAD_MS", 1200)
     )
     following_error_ms: int = field(
-        default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 400)
+        default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 600)
     )
-    #: 실측(2026-09-01, 토크 끄고 25초): 팔 관절은 34~36°C, **집게는 48°C**였다. 움직이지
-    #: 않고 쉬는 중에도 그렇다. 처음에 55°C로 잡았더니 집게는 평소에도 경고에 가까웠고,
-    #: 그런 경고는 진짜로 뜨거워졌을 때 아무도 믿지 않게 만든다. 정지 문턱(65°C)과의
-    #: 간격은 그대로 두면서 집게의 평상시보다 10°C 위로 올렸다.
+    #: 실측(2026-09-01, 토크 끄고 25초): 팔 관절은 34~36°C, **집게는 48°C**였다. 쉬는
+    #: 중에도 그렇다. 55°C로 잡았더니 집게는 평소에도 경고에 가까웠고, 그런 경고는 진짜로
+    #: 뜨거워졌을 때 아무도 믿지 않게 만든다.
     temperature_warn_c: int = field(
         default_factory=lambda: _env_int("SOARM_VL_TEMP_WARN_C", 58)
     )
-    #: STS3215의 자체 보호는 70°C에서 토크를 끊는다 — 그러면 팔이 떨어진다. 그보다
-    #: 먼저, 떨어뜨리지 않는 방식으로 우리가 멈춘다.
+    #: STS3215의 자체 보호는 70°C에서 토크를 끊는다 — 그러면 힘으로 버티던 자세만큼
+    #: 팔이 주저앉는다. 그보다 먼저, 떨어뜨리지 않는 방식으로 우리가 멈춘다.
     temperature_trip_c: int = field(
         default_factory=lambda: _env_int("SOARM_VL_TEMP_TRIP_C", 65)
     )
-    #: 온도도 연속 초과를 요구한다.
-    #:
-    #: 처음에는 온도만 즉시 봤다. "온도는 튀지 않는다"고 적어 두기까지 했는데, 실물에서
-    #: 45°C로 안정된 집게가 **한 번** 89°C로 읽혔고 팔이 그 자리에서 멈췄다. 튀지 않는
-    #: 것은 온도이지 **판독값**이 아니다 — Feetech 버스는 특히 여러 관절이 함께 움직일 때
-    #: 상태 패킷이 깨지는 것으로 알려져 있고, 그때 값은 그럴듯한 숫자로 들어온다.
-    #: 온도 판독은 10Hz이므로 500ms면 다섯 번 연속이다. 진짜 발열은 그 사이에 사라지지
-    #: 않고, 깨진 패킷 하나로 팔이 서는 일은 없어진다.
+    #: 온도도 연속 초과를 요구한다. 45°C로 안정된 집게가 **한 번** 89°C로 읽히고 팔이
+    #: 선 적이 있다. 튀지 않는 것은 온도이지 판독값이 아니다.
     temperature_trip_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_TEMP_TRIP_MS", 500)
     )
-    #: 접촉으로 걸렸을 때 최근 경로를 따라 물러나는 양.
-    retreat_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_RETREAT_DEG", 4.0))
-    #: 물러나는 데 줄 수 있는 시간. **물러남에는 반드시 끝이 있어야 한다.**
+    #: 관절이 자기 끝에 닿았다고 볼 거리.
     #:
-    #: 물러남은 목표에 닿을 때까지 이어지는데, 닿지 못하는 자리가 있다. 걸린 방향의
-    #: 반대편에 또 무언가가 있으면(책상 위에서 위로 밀다 걸리면 아래는 책상이다) 팔은
-    #: 물러날 곳이 없고, 그 자리에서 부하 100으로 계속 밀게 된다. 2026-09-01 실물에서
-    #: `shoulder_lift`가 그 상태로 53초 넘게 서 있는 것을 봤다 — 게다가 물러나는 동안에는
-    #: 관측 정지(막힘·과열)를 보지 않으므로 아무것도 그것을 끊지 못했다.
+    #: 끝에 닿아 서 있는 것은 **고장이 아니라 기하학**이다. 집게를 끝까지 닫으면 팔은
+    #: 거기서 서고, 그것이 정상이다. 그런데 목표를 계속 그 너머로 보내면 서보는 영원히
+    #: 조금씩 밀고 있게 된다 — 실측(2026-09-02)에서 집게가 1.25%에 선 채 부하 84로
+    #: 6초 내내 밀었고, 사다리의 어느 칸에도 걸리지 않았다. 걸리지 않는 것이 맞다:
+    #: 부하 84는 아무것도 부수지 않는다. 다만 모터는 그동안 계속 뜨거워진다.
+    #:
+    #: 그래서 세우는 대신 **미는 것을 그만둔다.** 끝에 닿아 서 있으면 그 관절의 목표를
+    #: 지금 자리에 붙여 두고, 화면에는 "끝까지 갔습니다"라고 적는다. 사람에게 확인을
+    #: 요구하지 않는다 — 집게를 끝까지 닫을 때마다 `확인하고 계속`을 눌러야 한다면
+    #: 그것은 보호가 아니라 방해다.
+    #:
+    #: 장애물과는 다르다. 장애물은 관절 **가운데**에서 팔을 세우고, 그때는 목표가
+    #: `lead`만큼 앞서므로 서보가 세게 민다. 그쪽은 아래 추종오차·막힘이 잡아 세운다.
+    limit_epsilon: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_LIMIT_EPSILON", 2.0)
+    )
+    #: 접촉으로 걸렸을 때 밀던 방향의 반대로 물러나는 양.
+    retreat_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_RETREAT_DEG", 4.0))
+    #: 물러나는 데 줄 수 있는 시간. **물러남에는 반드시 끝이 있어야 한다** — 걸린 방향의
+    #: 반대편에도 무언가가 있으면 팔은 물러날 곳이 없고, 그 자리에서 계속 밀게 된다.
     retreat_ms: int = field(default_factory=lambda: _env_int("SOARM_VL_RETREAT_MS", 1500))
 
-    def step_limit(self, spec: JointSpec) -> float:
-        return self.step_percent if spec.unit == "percent" else self.step_deg
+    # MARK: 단위가 다른 관절을 같은 식으로 다루기
+
+    def lead(self, spec: JointSpec) -> float:
+        return self.lead_percent if spec.unit == "percent" else self.lead_deg
+
+    def speed(self, spec: JointSpec) -> float:
+        """이 관절의 최대 속도. 단위는 그 관절의 단위/초다."""
+        return self.max_percent_per_s if spec.unit == "percent" else self.max_deg_per_s
+
+    def ticks_per_second(self, spec: JointSpec) -> int:
+        """서보의 `Goal_Velocity`에 써 넣을 값. 0은 제한 없음이므로 최소 1로 올린다."""
+        per_unit = (
+            GRIPPER_DEGREES_PER_PERCENT if spec.unit == "percent" else 1.0
+        ) / DEGREES_PER_TICK
+        return max(1, min(4000, int(round(self.speed(spec) * per_unit))))
 
     def following_error(self, spec: JointSpec) -> float:
         return self.following_error_percent if spec.unit == "percent" else self.following_error_deg
@@ -236,9 +327,16 @@ class VLeaderSettings:
     def as_dict(self) -> dict[str, object]:
         return {
             "hz": self.hz,
-            "step_deg": self.step_deg,
-            "step_percent": self.step_percent,
+            "max_deg_per_s": self.max_deg_per_s,
+            "max_percent_per_s": self.max_percent_per_s,
+            "lead_deg": self.lead_deg,
+            "lead_percent": self.lead_percent,
+            # 옛 이름. 이 값이 속도를 정하던 시절의 클라이언트가 아직 읽을 수 있으므로
+            # 남겨 두되, 뜻은 지금의 `lead_*`와 같다.
+            "step_deg": self.lead_deg,
+            "step_percent": self.lead_percent,
             "command_timeout_ms": self.command_timeout_ms,
+            "command_hold_ms": self.command_hold_ms,
             "command_valid_ms": self.command_valid_ms,
             "lease_ttl_ms": self.lease_ttl_ms,
             "heartbeat_ms": self.heartbeat_ms,
@@ -251,6 +349,7 @@ class VLeaderSettings:
             "following_error_deg": self.following_error_deg,
             "following_error_percent": self.following_error_percent,
             "stall_epsilon": self.stall_epsilon,
+            "limit_epsilon": self.limit_epsilon,
             "stall_load": self.stall_load,
             "stall_load_ms": self.stall_load_ms,
             "following_error_ms": self.following_error_ms,
@@ -260,6 +359,67 @@ class VLeaderSettings:
             "retreat_deg": self.retreat_deg,
             "retreat_ms": self.retreat_ms,
         }
+
+
+#: 사람이 고르는 세 가지 조작감.
+#:
+#: 숫자를 직접 고르라고 하면 아무도 고를 수 없다. `lead_deg`가 12여야 하는지 15여야
+#: 하는지는 이 팔을 만들어 본 사람도 재 보기 전에는 모르고, 쓰는 사람에게 물을 일은
+#: 더더욱 아니다. 그래서 화면에는 **한 줄로 설명되는 세 가지**만 두고, 숫자는 여기서
+#: 함께 움직인다. 속도와 힘과 민감도는 서로 짝이 맞아야 하는 값들이라 따로 고르면
+#: 어긋나기 쉽다 — 빠르게 움직이면서 예민하게 멈추면 정상 조작 중에 자꾸 선다.
+PROFILES: dict[str, dict[str, float]] = {
+    "gentle": {
+        "max_deg_per_s": 45.0,
+        "max_percent_per_s": 60.0,
+        "lead_deg": 8.0,
+        "lead_percent": 8.0,
+        "following_error_deg": 6.0,
+        "following_error_percent": 6.0,
+        "following_error_ms": 500,
+        "stall_load": 160,
+        "stall_load_ms": 1000,
+        "load_trip": 450,
+    },
+    "normal": {
+        "max_deg_per_s": 90.0,
+        "max_percent_per_s": 110.0,
+        "lead_deg": 12.0,
+        "lead_percent": 12.0,
+        "following_error_deg": 8.0,
+        "following_error_percent": 8.0,
+        "following_error_ms": 600,
+        "stall_load": 200,
+        "stall_load_ms": 1200,
+        "load_trip": 550,
+    },
+    "quick": {
+        "max_deg_per_s": 140.0,
+        "max_percent_per_s": 118.0,
+        "lead_deg": 18.0,
+        "lead_percent": 16.0,
+        "following_error_deg": 12.0,
+        "following_error_percent": 10.0,
+        "following_error_ms": 700,
+        "stall_load": 260,
+        "stall_load_ms": 1400,
+        "load_trip": 650,
+    },
+}
+
+PROFILE_KOREAN = {
+    "gentle": ("조심", "천천히 움직이고 조금만 막혀도 섭니다. 좁은 곳에서 다루거나 무언가를 집을 때."),
+    "normal": ("보통", "평소 조작에 맞춘 값입니다. 팔을 들 만큼 힘이 있고, 책상에 닿으면 곧 섭니다."),
+    "quick": ("빠름", "크게 움직일 때. 힘도 속도도 커지므로 팔 주변이 비어 있을 때만 쓰세요."),
+}
+
+
+def profile_of(settings: VLeaderSettings) -> str | None:
+    """지금 값이 어느 조작감인가. 손으로 하나만 바꿔 두었으면 `None`."""
+    for name, values in PROFILES.items():
+        if all(abs(float(getattr(settings, key)) - float(value)) < 1e-6 for key, value in values.items()):
+            return name
+    return None
 
 
 class RejectError(Exception):
@@ -342,30 +502,56 @@ class CommandValidator:
                     )
         return targets
 
-    def clamp_step(
-        self, targets: dict[str, float], present: dict[str, float], scale: float = 1.0
+    def clamp_lead(
+        self, targets: dict[str, float], present: dict[str, float]
     ) -> tuple[dict[str, float], list[str]]:
-        """틱당 변화량 상한.
+        """목표가 실제 위치보다 앞설 수 있는 거리를 자른다.
 
-        거절이 아니라 **자른다**. 화면에서 손가락을 빠르게 끌면 목표는 늘 현재보다 멀리
-        있게 마련이고, 그때마다 거절하면 조작 자체가 되지 않는다. 대신 자른 관절을 함께
-        돌려주어 화면이 "지금 최대 속도로 따라가는 중"이라고 말할 수 있게 한다.
+        **이것은 속도 제한이 아니다.** 속도는 서보의 `Goal_Velocity`가 지킨다. 여기서
+        자르는 것은 서보가 보는 위치 오차이고, 위치 P 제어에서 그것은 곧 **힘**이다.
+        막히지 않은 관절에서는 이 거리가 서보의 추종오차만큼밖에 벌어지지 않으므로 이
+        자르기는 아무 일도 하지 않는다. 무언가에 막혔을 때만 일한다.
 
-        `scale`은 **지난 명령 이후 흐른 시간**이다. 이것이 없으면 상한이 "명령당"이 되어,
-        초당 300번 보내는 클라이언트가 초당 600도를 움직일 수 있다. 시간으로 나눠 두면
-        메시지를 몇 번에 나눠 보내든 속도의 상한은 `step × hz`로 같다.
+        거절이 아니라 자르는 이유는 그대로다. 화면에서 손가락을 빠르게 끌면 목표는 늘
+        현재보다 멀리 있게 마련이고, 그때마다 거절하면 조작 자체가 되지 않는다. 대신
+        자른 관절을 함께 돌려주어 화면이 "따라가는 중"이라고 말할 수 있게 한다.
+
+        예전에는 여기에 `scale`(지난 명령 이후 흐른 시간)이 있었다. 이 자르기가 속도를
+        정하던 시절에는 그것이 필요했다 — 없으면 초당 300번 보내는 클라이언트가 초당
+        600도를 움직였다. 지금은 속도가 명령 빈도와 무관하므로 그 보정도 필요 없다.
+        오히려 없어서 좋아진 것이 있다: 명령이 드문드문 오는 느린 연결에서도 팔이
+        느려지지 않는다. 폰이 10Hz로만 보내도 서보는 정해진 속도로 목표까지 간다.
         """
         clamped: dict[str, float] = {}
         limited: list[str] = []
         for name, value in targets.items():
             spec = self.specs[name]
             current = present.get(name, value)
-            cap = self.settings.step_limit(spec) * max(0.02, min(1.0, scale))
+            cap = self.settings.lead(spec)
             delta = max(-cap, min(cap, value - current))
             if abs(value - current) > cap + 1e-9:
                 limited.append(name)
             clamped[name] = spec.clamp(current + delta)
         return clamped, limited
+
+    def at_end_stop(
+        self, name: str, target: float, present: float, moved: float | None
+    ) -> bool:
+        """이 관절이 자기 끝에 닿아 선 채로 더 밀리고 있는가.
+
+        셋이 함께여야 한다. **끝 근처에 있고**, **더 그쪽으로 가라는 목표를 받고 있고**,
+        **움직이지 않는다.** 하나라도 빠지면 정상 조작과 구별되지 않는다 — 끝을 향해
+        가는 중인 관절은 움직이고 있고, 끝에 서 있어도 목표가 돌아섰으면 미는 것이 아니다.
+        """
+        spec = self.specs.get(name)
+        if spec is None or moved is None:
+            return False
+        margin = self.settings.limit_epsilon
+        low = present - spec.minimum <= margin and target < present
+        high = spec.maximum - present <= margin and target > present
+        if not (low or high):
+            return False
+        return moved < self.settings.stall_epsilon
 
 
 class TripDetector:
@@ -430,7 +616,10 @@ class TripDetector:
                     name,
                     f"{self.specs[name].label}의 부하가 {settings.load_trip_ms}ms 넘게 {value:.0f}(문턱 {settings.load_trip})입니다",
                 )
-        for name in self.specs:
+        # 전류 문턱이 0이면 이 칸은 없다. 이 하드웨어에서 `Present_Current`가 힘을
+        # 말해 주지 않는다는 것이 실측으로 드러났고(부하 300에서도 판독값 0~3),
+        # 걸릴 수 없는 검사를 남겨 두면 화면이 보호가 한 겹 더 있다고 말하게 된다.
+        for name in self.specs if settings.current_trip > 0 else ():
             value = abs(current.get(name, 0.0))
             if self._sustained((name, Trip.OVERCURRENT), value >= settings.current_trip, now, settings.current_trip_ms):
                 return (
@@ -516,3 +705,43 @@ class TripDetector:
                     }
                 )
         return lines
+
+
+#: 프로필이 옮기는 값마다 대응하는 환경변수. `load_settings`가 "사람이 직접 적어 둔 값"과
+#: "프로필이 정한 값"을 가르는 데 쓴다.
+PROFILE_ENV = {
+    "max_deg_per_s": "SOARM_VL_MAX_DEG_PER_S",
+    "max_percent_per_s": "SOARM_VL_MAX_PERCENT_PER_S",
+    "lead_deg": "SOARM_VL_LEAD_DEG",
+    "lead_percent": "SOARM_VL_LEAD_PERCENT",
+    "following_error_deg": "SOARM_VL_FOLLOW_ERROR_DEG",
+    "following_error_percent": "SOARM_VL_FOLLOW_ERROR_PERCENT",
+    "following_error_ms": "SOARM_VL_FOLLOW_ERROR_MS",
+    "stall_load": "SOARM_VL_STALL_LOAD",
+    "stall_load_ms": "SOARM_VL_STALL_LOAD_MS",
+    "load_trip": "SOARM_VL_LOAD_TRIP",
+}
+
+
+def load_settings() -> VLeaderSettings:
+    """시작할 때의 정책 한 벌.
+
+    `SOARM_VL_PROFILE`이 있으면 그 조작감을 깔되, **env에 직접 적혀 있는 값은 건드리지
+    않는다.** 두 곳이 같은 값을 말할 수 있으므로 어느 쪽이 이기는지 정해 두어야 하고,
+    손으로 적은 쪽이 이기는 편이 맞다 — 프로필은 고르는 것이고 env는 재 본 뒤 못 박는
+    것이다.
+    """
+    base = VLeaderSettings()
+    name = os.getenv("SOARM_VL_PROFILE", "").strip().lower()
+    if name not in PROFILES:
+        return base
+    values = {
+        key: value
+        for key, value in PROFILES[name].items()
+        if os.getenv(PROFILE_ENV.get(key, "")) in (None, "")
+    }
+    if not values:
+        return base
+    from dataclasses import replace as _replace
+
+    return _replace(base, **values)

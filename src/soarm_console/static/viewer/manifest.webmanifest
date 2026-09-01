@@ -1,0 +1,19 @@
+{
+  "name": "SO-ARM 101 조작",
+  "short_name": "SO-ARM",
+  "description": "집 서버의 SO-ARM101을 카메라를 보면서 원격으로 조작합니다.",
+  "lang": "ko",
+  "dir": "ltr",
+  "start_url": "/viewer/?host=web",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#070b12",
+  "theme_color": "#070b12",
+  "icons": [
+    { "src": "/viewer/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "/viewer/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/viewer/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/viewer/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

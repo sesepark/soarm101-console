@@ -1,51 +1,172 @@
-/* 폰의 관찰 화면(mobile.css)과 같은 색과 같은 모양을 쓴다. 같은 로봇을 보는 두 화면이
-   서로 다르게 생기면 읽는 사람이 매번 다시 배워야 한다. */
+/* SO-ARM101 조작 화면.
+ *
+ * 폰을 먼저 맞춘다. 이 화면은 **스크롤이 없다** — 한 화면 안에 들어가지 않는 것은
+ * 탭으로 나누고, 탭 안에서도 넘치지 않게 짠다. 세로로 긴 페이지에서 조작하다 보면
+ * 팔이 움직이는 동안 화면을 굴려야 하고, 그때 손가락은 이미 다른 것을 누르고 있다.
+ *
+ * 크기를 자바스크립트로 계산해 넣는 자리는 두지 않는다. 아이폰의 주소창은 굴릴 때마다
+ * 접혔다 펴지고, 그때 `window.innerHeight`로 계산해 둔 높이는 전부 어긋난다. 대신
+ * `100dvh` + grid + `min-height:0`으로 브라우저가 알아서 나누게 한다.
+ */
+
 :root {
   color-scheme: dark;
   --ink: #f6f8fc;
   --muted: #8994a7;
-  --line: rgba(255,255,255,.1);
+  --line: rgba(255,255,255,.11);
   --blue: #5f82ff;
   --green: #43d695;
   --amber: #ffb648;
   --red: #ff707a;
   --panel: #111722;
+  --bg: #070b12;
+  /* 손가락 하나가 확실히 닿는 크기. 애플 휴먼 인터페이스가 말하는 44pt를 아래로
+     내려가지 않게 하는 기준선이고, 이 파일 안의 모든 누를 수 있는 것이 이 값을 쓴다. */
+  --touch: 44px;
+  --gap: 8px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
   font-family: Inter, Pretendard, "Pretendard SD KR", -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 * { box-sizing: border-box; }
+
+/* `hidden` 속성은 언제나 이긴다.
+ *
+ * UA 스타일시트의 `[hidden] { display: none }`은 명시도가 가장 낮아서, 클래스나 아이디로
+ * `display`를 정하는 순간 조용히 덮인다. 이 파일에서만 그 실수를 세 번 했다 — 멈춤 배너가
+ * 계속 떠 있었고, 권한 시트가 숨은 채로 아래 단추들의 터치를 가로챘고, `권한 받기`와
+ * `권한 반납`이 동시에 보였다. 셋 다 자바스크립트는 맞게 동작하고 있었고 화면만 거짓말을
+ * 했다. 규칙을 하나 두어 이 부류를 끝낸다. */
+[hidden] { display: none !important; }
 html, body { width: 100%; height: 100%; }
 body {
   margin: 0;
   color: var(--ink);
-  background: #070b12;
+  background: var(--bg);
+  /* 화면 자체는 절대 굴러가지 않는다. 넘치는 것이 있으면 그것은 배치가 틀린 것이지
+     사용자가 굴려서 해결할 일이 아니다. */
+  overflow: hidden;
   overscroll-behavior: none;
   -webkit-user-select: none;
   user-select: none;
+  -webkit-text-size-adjust: 100%;
   display: grid;
-  grid-template-rows: minmax(220px, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   height: 100dvh;
+  /* `dvh`를 모르는 판본을 위한 대비. 먼저 적어 두면 아는 쪽이 덮어쓴다. */
+  max-height: 100dvh;
 }
-button, a, input { font: inherit; -webkit-tap-highlight-color: transparent; }
+button, a, input, select { font: inherit; -webkit-tap-highlight-color: transparent; }
 a { color: var(--blue); }
 
-/* 맥은 3D만 품는다. 관절 슬라이더·부하 막대·카메라·정지 버튼은 네이티브 SwiftUI가 그린다. */
-body.host-native { grid-template-rows: 1fr; }
-body.host-native #chrome { display: none; }
+/* 맥은 3D만 품는다. 관절 슬라이더·카메라·정지 버튼은 네이티브 SwiftUI가 그린다. */
+body.host-native { grid-template-rows: minmax(0, 1fr); }
+body.host-native #top,
+body.host-native #panel,
+body.host-native #tabs,
+body.host-native #camera-pane,
+body.host-native #status-pane,
+body.host-native #sheet,
+body.host-native #sheet-scrim { display: none !important; }
+body.host-native #stage { grid-template-rows: minmax(0, 1fr); }
 
-#stage { position: relative; min-height: 0; }
+/* ─────────────────────────────────────────────── 머리 */
+
+#top {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  padding: max(6px, var(--safe-t)) max(10px, var(--safe-r)) 6px max(10px, var(--safe-l));
+  border-bottom: 1px solid var(--line);
+  background: #080d16;
+}
+.brand { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1; }
+.mark {
+  width: 30px; height: 30px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 9px; background: var(--blue); font-weight: 900; font-size: 15px;
+}
+.lines { display: grid; gap: 1px; min-width: 0; }
+.lines strong { font-size: 13px; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lines small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lines strong.live { color: var(--green); }
+.lines strong.warn { color: var(--amber); }
+.lines strong.stop { color: var(--red); }
+
+/* 정지는 언제나 같은 자리에 있고 언제나 누를 수 있다. 탭을 바꿔도, 권한이 없어도. */
+.stop {
+  flex: none;
+  min-width: 72px; min-height: var(--touch);
+  border: 0; border-radius: 999px;
+  background: var(--red); color: #fff; font-weight: 800;
+}
+.stop:disabled { opacity: .4; }
+
+/* ─────────────────────────────────────────────── 무대 */
+
+#stage {
+  position: relative;
+  min-height: 0;
+  display: grid;
+  gap: 1px;
+  background: var(--line);
+}
+#stage > section { position: relative; min-height: 0; overflow: hidden; background: var(--bg); }
+
+/* 조작: 카메라 띠 + 3D. 겹치지 않는다 — 겹치면 조작하는 손이 영상을 가린다.
+   비율은 3D 쪽을 넉넉히 준다. 끌어서 조작하는 것은 3D이고 카메라는 확인용이다. */
+body.tab-drive #stage { grid-template-rows: minmax(72px, 0.28fr) minmax(0, 1fr); }
+/* 끝점 모드에서는 3D가 조작 수단 그 자체다. 카메라는 여전히 보이되 자리를 조금 내준다. */
+body.mode-endpoint.tab-drive #stage,
+body.mode-endpoint.tab-lease #stage { grid-template-rows: minmax(64px, 0.2fr) minmax(0, 1fr); }
+body.tab-drive #status-pane { display: none; }
+
+/* 카메라: 무대 전체. */
+body.tab-camera #stage { grid-template-rows: minmax(0, 1fr); }
+body.tab-camera #view-pane,
+body.tab-camera #status-pane { display: none; }
+
+/* 상태: 무대 전체. 여기 하나만 안에서 굴러가도 된다 — 관절 여섯 개의 판독값은
+   화면보다 길 수 있고, 그것을 읽는 동안에는 팔을 만지고 있지 않다. */
+body.tab-status #stage { grid-template-rows: minmax(0, 1fr); }
+body.tab-status #camera-pane,
+body.tab-status #view-pane { display: none; }
+body.tab-status #status-pane { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+
+/* 권한: 3D와 카메라는 그대로 두고 시트만 올린다. 권한을 받는 동안에도 팔이 보여야 한다. */
+body.tab-lease #stage { grid-template-rows: minmax(72px, 0.28fr) minmax(0, 1fr); }
+body.tab-lease #status-pane { display: none; }
+
+#camera-image { width: 100%; height: 100%; object-fit: cover; display: block; background: #0d121c; }
+#camera-image.down { visibility: hidden; }
+.pane-note {
+  position: absolute; inset: 0;
+  display: grid; place-content: center;
+  color: var(--muted); font-size: 12px; text-align: center; padding: 12px;
+}
+.camera-chips {
+  position: absolute; left: 8px; bottom: 8px;
+  display: flex; gap: 6px;
+}
+.chip {
+  min-height: 30px; padding: 0 12px;
+  border-radius: 999px; border: 1px solid var(--line);
+  background: rgba(8,13,22,.78);
+  backdrop-filter: blur(10px);
+  color: var(--muted); font-size: 12px; font-weight: 600;
+}
+.chip.on { color: #fff; background: rgba(95,130,255,.9); border-color: transparent; }
+
 #canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 
 .overlay {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-content: center;
-  justify-items: center;
-  gap: 8px;
+  position: absolute; inset: 0;
+  display: grid; place-content: center; justify-items: center; gap: 8px;
   background: rgba(7,11,18,.86);
-  text-align: center;
-  padding: 20px;
+  text-align: center; padding: 20px;
 }
 .overlay small { color: var(--muted); font-size: 12px; }
 body:not(.loading) #boot { display: none; }
@@ -59,163 +180,325 @@ body:not(.loading) #boot { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .banner {
-  position: absolute;
-  left: 12px; right: 12px; top: 12px;
-  padding: 10px 12px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  border-radius: 14px;
-  border: 1px solid rgba(255,112,122,.45);
-  background: rgba(51,17,22,.92);
-  backdrop-filter: blur(12px);
-  font-size: 13px;
+  margin: 0;
+  padding: 9px max(10px, var(--safe-r)) 9px max(10px, var(--safe-l));
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  border-bottom: 1px solid rgba(255,112,122,.45);
+  background: rgba(51,17,22,.94);
+  font-size: 12.5px;
 }
-/* `display`를 클래스에서 정하면 `hidden` 속성의 UA 규칙(display:none)을 덮어쓴다.
-   그래서 숨겼다고 생각한 배너가 계속 떠 있었다. */
-.banner[hidden] { display: none; }
-.banner.warn { border-color: rgba(255,182,72,.45); background: rgba(50,38,16,.92); }
+.banner.warn { border-bottom-color: rgba(255,182,72,.45); background: rgba(50,38,16,.94); }
 .banner strong { color: var(--red); }
 .banner.warn strong { color: var(--amber); }
-.banner span { color: var(--ink); opacity: .9; flex: 1 1 200px; }
+.banner span { color: var(--ink); opacity: .92; flex: 1 1 160px; }
 .banner button {
-  border: 0; border-radius: 999px; padding: 7px 14px;
+  border: 0; border-radius: 999px; padding: 0 14px; min-height: 34px;
   background: var(--blue); color: #fff; font-weight: 700; font-size: 12px;
 }
 
+/* 시점 단추. `끝점` 모드에서만 쓸모가 있으므로 그때만 보인다 — 관절 모드에서는
+   손가락으로 화면을 돌리는 것이 곧 시점 조작이라 단추가 할 일이 없다. */
+#view-controls {
+  position: absolute; right: 8px; top: 8px;
+  display: none; gap: 4px;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(8,13,22,.8);
+  backdrop-filter: blur(10px);
+}
+body.mode-endpoint.tab-drive #view-controls,
+body.mode-endpoint.tab-lease #view-controls { display: flex; }
+#view-controls button {
+  min-width: 38px; min-height: 34px;
+  border: 0; border-radius: 999px; background: transparent; color: var(--ink);
+  font-size: 15px;
+}
+#view-name { font-size: 12px; font-weight: 700; color: var(--muted); min-width: 34px; }
+
 .grabbed {
-  position: absolute; left: 12px; bottom: 12px;
+  position: absolute; left: 8px; bottom: 8px;
   padding: 6px 11px;
   border-radius: 999px;
   border: 1px solid var(--line);
-  background: rgba(17,23,34,.9);
-  font-size: 12px;
-  color: var(--muted);
+  background: rgba(17,23,34,.92);
+  font-size: 12px; color: var(--muted);
+  pointer-events: none;
 }
 .grabbed b { color: var(--ink); }
+.hint-pill { display: none; left: 8px; bottom: 8px; }
+body.mode-endpoint.tab-drive .hint-pill,
+body.mode-endpoint.tab-lease .hint-pill { display: block; }
+body.mode-endpoint #grabbed:not([hidden]) ~ .hint-pill { display: none; }
 
-#chrome {
-  display: grid;
-  gap: 10px;
-  padding: 10px max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
-  overflow-y: auto;
-  max-height: 62dvh;
-  border-top: 1px solid var(--line);
-  background: #080d16;
-}
-
-.bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.mark {
-  width: 34px; height: 34px; flex: none;
-  display: grid; place-items: center;
-  border-radius: 11px; background: var(--blue); font-weight: 900;
-}
-.brand div { display: grid; gap: 2px; min-width: 0; }
-.brand strong { font-size: 13px; letter-spacing: -.02em; }
-.brand small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.brand small.live { color: var(--green); }
-.brand small.warn { color: var(--amber); }
-.brand small.stop { color: var(--red); }
-
-button.danger { background: var(--red); color: #fff; border: 0; border-radius: 999px; padding: 10px 18px; font-weight: 800; }
-button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
-
-.cameras { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.camera { margin: 0; position: relative; border-radius: 12px; overflow: hidden; background: #0d121c; border: 1px solid var(--line); aspect-ratio: 4 / 3; }
-/* 영상이 아직 없을 때 alt 문구가 타일을 뚫고 나온다. 카메라 이름은 아래 캡션에 이미
-   있으므로, 여기서는 빈 자리로 두는 편이 낫다. */
-.camera img { width: 100%; height: 100%; object-fit: cover; display: block; color: transparent; font-size: 0; }
-.camera img.down { visibility: hidden; }
-.camera figcaption {
-  position: absolute; left: 0; right: 0; bottom: 0;
-  padding: 4px 8px; font-size: 10px; letter-spacing: .06em;
-  color: var(--muted); background: linear-gradient(transparent, rgba(0,0,0,.75));
-}
-
-.joints { display: grid; gap: 8px; }
-/* 한 줄이 이름·슬라이더·값·부하 막대·계기까지 다섯 조각이라, 줄 사이를 벌리는 것만으로는
-   마지막 조각이 어느 관절 것인지 읽히지 않았다. 줄마다 밑줄을 그어 경계를 분명히 한다. */
-.joint {
-  display: grid; grid-template-columns: 82px 1fr minmax(56px, auto);
-  align-items: center; gap: 8px; padding-bottom: 8px;
-  border-bottom: 1px solid var(--line);
-}
-.joint:last-child { border-bottom: 0; padding-bottom: 0; }
-.joint > label { font-size: 12px; color: var(--muted); }
-.joint output { font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
-.joint input[type=range] { width: 100%; accent-color: var(--blue); }
-.joint.limited input[type=range] { accent-color: var(--amber); }
-.joint .load {
-  grid-column: 1 / -1; height: 3px; border-radius: 2px;
-  background: rgba(255,255,255,.08); overflow: hidden;
-}
-.joint .load i { display: block; height: 100%; width: 0; background: var(--green); transition: width .12s linear; }
-.joint.hot .load i { background: var(--amber); }
-.joint.tripped .load i { background: var(--red); }
-.joint .reading {
-  /* 자기 관절에 붙어 보이도록 위쪽 간격을 지운다. 줄 사이(14px)보다 좁아야 한다. */
-  grid-column: 1 / -1; margin-top: -4px; text-align: right; font-size: 10px;
-  font-variant-numeric: tabular-nums; color: var(--muted);
-}
-.joint .reading.warm { color: var(--amber); }
-.joint .reading.bad { color: var(--red); }
-
-.authority { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
-.authority p { margin: 0; font-size: 12px; color: var(--muted); }
-.authority label { display: grid; gap: 4px; font-size: 11px; color: var(--muted); }
-.authority code { color: var(--ink); font-size: 12px; }
-.authority input {
-  padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line);
-  background: #0b101a; color: var(--ink);
-}
-.authority button {
-  padding: 11px 14px; border-radius: 12px; border: 0;
-  background: var(--blue); color: #fff; font-weight: 700;
-}
-.authority button:disabled { opacity: .38; }
-
-.note { color: var(--muted); font-size: 11px; display: grid; gap: 4px; }
-.note p { margin: 0; }
-
-dialog { border: 1px solid var(--line); border-radius: 16px; background: var(--panel); color: var(--ink); max-width: 420px; }
-dialog h2 { margin: 0 0 8px; font-size: 15px; }
-dialog p { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
-dialog label { display: grid; gap: 6px; font-size: 11px; color: var(--muted); }
-dialog input { padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line); background: #0b101a; color: var(--ink); }
-dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 0 0; margin: 0; }
-dialog menu button { border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink); padding: 8px 14px; }
-dialog menu button.danger { border: 0; }
-
-@media (min-width: 900px) {
-  body { grid-template-rows: 1fr; grid-template-columns: 1fr 340px; }
-  #chrome { max-height: none; border-top: 0; border-left: 1px solid var(--line); }
-}
-
-/* 제어 루프가 돌지 않을 때. 3D는 실제 자세를 모르는 상태이므로 그렇게 보여야 한다. */
-body.unknown-pose #canvas { opacity: .35; filter: grayscale(.6); }
-body.unknown-pose #stage::after {
+/* 제어 루프가 돌지 않을 때. 3D는 실제 자세를 모르는 상태이므로 그렇게 보여야 한다 —
+   그럴듯한 모델을 그대로 두면 화면이 "팔이 이 자세다"라고 거짓말을 한다. */
+body.unknown-pose #canvas { opacity: .32; filter: grayscale(.6); }
+body.unknown-pose #view-pane::after {
   content: '관찰을 시작하면 실제 자세가 보입니다';
-  position: absolute;
-  left: 50%; top: 50%;
+  position: absolute; left: 50%; top: 50%;
   transform: translate(-50%, -50%);
   padding: 8px 14px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: rgba(17,23,34,.92);
-  color: var(--muted);
-  font-size: 12px;
+  color: var(--muted); font-size: 12px;
   pointer-events: none;
 }
 
-/* 확인 체크. 글자가 길어 두 줄이 되므로 체크와 글줄이 위에서 맞아야 읽힌다. */
-.authority label.ack {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  color: var(--ink);
-  font-size: 12px;
-  line-height: 1.45;
+/* ─────────────────────────────────────────────── 상태 */
+
+#status-pane { padding: 10px max(10px, var(--safe-r)) 10px max(10px, var(--safe-l)); }
+#joint-readings { display: grid; gap: 7px; }
+.reading-row {
+  display: grid;
+  grid-template-columns: 78px 1fr auto;
+  align-items: center; gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line); border-radius: 11px;
+  background: var(--panel);
 }
-.authority label.ack input { width: 20px; height: 20px; margin: 0; flex: none; accent-color: var(--blue); }
+.reading-row .name { font-size: 12px; color: var(--muted); }
+.reading-row .bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.08); overflow: hidden; }
+.reading-row .bar i { display: block; height: 100%; width: 0; background: var(--green); transition: width .12s linear; }
+.reading-row.hot .bar i { background: var(--amber); }
+.reading-row.tripped { border-color: rgba(255,112,122,.5); }
+.reading-row.tripped .bar i { background: var(--red); }
+.reading-row .figures { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.reading-row .figures.warm { color: var(--amber); }
+.reading-row .figures.bad { color: var(--red); }
+.policy-line { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+
+/* ─────────────────────────────────────────────── 조작판 */
+
+#panel {
+  display: grid;
+  gap: 4px;
+  padding: 6px max(10px, var(--safe-r)) 6px max(10px, var(--safe-l));
+  border-top: 1px solid var(--line);
+  background: #080d16;
+  /* 조작판이 화면의 절반을 넘지 않게 한다. 넘으면 3D가 눌려 팔이 손톱만 해지는데,
+     그 화면에서는 무엇을 끌고 있는지 알 수 없다. */
+  max-height: 46dvh;
+  min-height: 0;
+  /* 마지막 안전망. 여기까지 왔는데도 넘치면 **조작판 안에서만** 굴러간다 — 페이지
+     전체가 굴러가면 정지 버튼이 화면 밖으로 나가고, 그건 정지 버튼이 아니다. */
+  overflow-y: auto;
+}
+.panel-head { display: flex; align-items: center; gap: 6px; }
+.panel-head .mode-switch { flex: 1; }
+#fold {
+  flex: none;
+  width: 40px; min-height: 34px;
+  border: 0; border-radius: 10px;
+  background: rgba(255,255,255,.06); color: var(--muted);
+  font-size: 13px;
+}
+body.folded #joint-controls,
+body.folded #endpoint-controls { display: none; }
+body.folded #fold { transform: rotate(180deg); }
+body.tab-camera #panel,
+body.tab-status #panel { display: none; }
+
+.mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border-radius: 11px; background: rgba(255,255,255,.06); }
+.seg {
+  min-height: 30px; border: 0; border-radius: 8px;
+  background: transparent; color: var(--muted); font-weight: 700; font-size: 13px;
+}
+.seg.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+
+body.mode-joint #endpoint-controls { display: none; }
+body.mode-endpoint #joint-controls { display: none; }
+
+#joint-controls { display: grid; gap: 2px; }
+.joint {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 60px;
+  align-items: center; gap: 8px;
+  min-height: 34px;
+}
+.joint > label { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.joint output { font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.joint.limited output { color: var(--amber); }
+
+/* 슬라이더는 손가락으로 잡는 것이다. 기본 크기로는 엄지가 트랙을 덮어 값이 보이지
+   않고, 조금만 빗나가도 잡히지 않는다. 손잡이를 키우고 누를 수 있는 높이를 따로 준다. */
+input[type=range] {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 34px;
+  background: transparent; margin: 0;
+}
+input[type=range]::-webkit-slider-runnable-track {
+  height: 5px; border-radius: 3px; background: rgba(255,255,255,.14);
+}
+input[type=range]::-moz-range-track { height: 5px; border-radius: 3px; background: rgba(255,255,255,.14); }
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 26px; height: 26px; margin-top: -10.5px;
+  border-radius: 50%; background: var(--blue);
+  border: 2px solid #0b101a;
+  box-shadow: 0 1px 4px rgba(0,0,0,.5);
+}
+input[type=range]::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--blue); border: 2px solid #0b101a;
+}
+.joint.limited input[type=range]::-webkit-slider-thumb { background: var(--amber); }
+.joint.limited input[type=range]::-moz-range-thumb { background: var(--amber); }
+input[type=range]:disabled::-webkit-slider-thumb { background: #46506a; }
+input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
+
+#endpoint-controls { display: grid; gap: 2px; }
+#endpoint-controls .joint { min-height: 32px; }
+.hint { margin: 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.hint b { color: var(--ink); }
+.pad-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 9px; }
+.pad-row label { font-size: 12px; color: var(--muted); }
+.pad-row output { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+#wrist-controls { display: grid; gap: 2px; }
+.reach-note { color: var(--amber); font-size: 11.5px; }
+
+/* ─────────────────────────────────────────────── 아래 탭 */
+
+#tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border-top: 1px solid var(--line);
+  background: #080d16;
+  padding: 4px max(4px, var(--safe-r)) calc(4px + var(--safe-b)) max(4px, var(--safe-l));
+}
+.tab {
+  display: grid; justify-items: center; gap: 2px;
+  min-height: var(--touch);
+  border: 0; background: transparent;
+  color: var(--muted); font-size: 11px; font-weight: 600;
+  border-radius: 10px;
+}
+.tab span { font-size: 16px; line-height: 1; }
+.tab.on { color: var(--ink); background: rgba(255,255,255,.07); }
+.tab.alert { color: var(--red); }
+
+/* ─────────────────────────────────────────────── 권한 시트 */
+
+#sheet-scrim { position: fixed; inset: 0; background: rgba(4,7,12,.6); }
+#sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  /* 넓은 화면에서 시트가 폭 전체를 덮으면 카드가 아니라 벽이 된다. 가운데로 모으고,
+     폰에서는 지금처럼 아래에서 올라오는 시트로 남는다. */
+  margin-inline: auto;
+  max-width: 560px;
+  display: grid; gap: 10px;
+  padding: 12px max(12px, var(--safe-r)) calc(12px + var(--safe-b)) max(12px, var(--safe-l));
+  border-top: 1px solid var(--line);
+  border-radius: 18px 18px 0 0;
+  background: var(--panel);
+  max-height: 86dvh;
+  overflow-y: auto;
+}
+#sheet > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+#sheet > header strong { font-size: 14px; }
+#sheet-close { min-height: 34px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); }
+#lease-idle, #lease-held { display: grid; gap: 9px; }
+.field { display: grid; gap: 5px; font-size: 11px; color: var(--muted); }
+.field input {
+  min-height: var(--touch);
+  padding: 0 11px; border-radius: 11px; border: 1px solid var(--line);
+  background: #0b101a; color: var(--ink); font-size: 15px;
+}
+/* 확인 체크. 글자가 길어 두 줄이 되므로 체크와 글줄이 위에서 맞아야 읽힌다. */
+.ack {
+  display: flex; align-items: flex-start; gap: 10px;
+  color: var(--ink); font-size: 12.5px; line-height: 1.45;
+  min-height: var(--touch); padding: 6px 0;
+}
+.ack input { width: 28px; height: 28px; margin: 0; flex: none; accent-color: var(--blue); }
+button.primary { min-height: var(--touch); border: 0; border-radius: 12px; background: var(--blue); color: #fff; font-weight: 700; }
+button.ghost { min-height: var(--touch); border: 1px solid var(--line); border-radius: 12px; background: transparent; color: var(--muted); }
+button:disabled { opacity: .38; }
+
+#feel { display: grid; gap: 7px; border-top: 1px solid var(--line); padding-top: 10px; }
+.feel-title { font-size: 12px; color: var(--muted); font-weight: 600; }
+.feel-choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.feel-choices button {
+  min-height: var(--touch);
+  border: 1px solid var(--line); border-radius: 11px;
+  background: transparent; color: var(--muted); font-weight: 700; font-size: 13px;
+}
+.feel-choices button.on { background: rgba(95,130,255,.16); border-color: var(--blue); color: var(--ink); }
+
+dialog {
+  border: 1px solid var(--line); border-radius: 16px;
+  background: var(--panel); color: var(--ink);
+  max-width: min(420px, calc(100vw - 24px));
+  padding: 16px;
+}
+dialog::backdrop { background: rgba(4,7,12,.6); }
+dialog h2 { margin: 0 0 8px; font-size: 15px; }
+dialog p { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 0 0; margin: 0; }
+dialog menu button { border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink); min-height: var(--touch); padding: 0 16px; }
+dialog menu button.stop { border: 0; }
+
+/* ─────────────────────────────────────────────── 큰 화면
+ *
+ * 폰에서 만든 것을 그대로 늘이지 않는다. 가로가 넉넉하면 탭으로 나눌 이유가 없으므로,
+ * 카메라·3D·조작판을 나란히 두고 탭 줄은 사라진다. 데스크톱 브라우저에서 여는 경우와
+ * 아이패드 가로 화면이 여기에 해당한다. */
+@media (min-width: 760px) and (min-height: 420px) {
+  body { grid-template-rows: auto auto minmax(0, 1fr); grid-template-columns: minmax(0, 1fr) 340px; }
+  #top { grid-column: 1 / -1; }
+  #banner { grid-column: 1 / -1; }
+  #stage { grid-column: 1; grid-row: 3; }
+  #panel {
+    grid-column: 2; grid-row: 3;
+    max-height: none;
+    border-top: 0; border-left: 1px solid var(--line);
+    align-content: start;
+    overflow-y: auto;
+  }
+  #tabs { display: none; }
+  /* 넓은 화면에서는 시트를 가운데 띄운다. 아래에 붙여 두면 3D를 가리는데, 권한을 받는
+     동안에도 팔이 보여야 한다. */
+  #sheet { bottom: 50%; transform: translateY(50%); border-radius: 18px; max-height: 76dvh; }
+  /* 큰 화면에서는 탭이 없으므로 무대가 늘 카메라와 3D를 함께 그린다. */
+  body.tab-drive #stage, body.tab-camera #stage, body.tab-status #stage, body.tab-lease #stage {
+    grid-template-rows: minmax(120px, 0.38fr) minmax(0, 1fr);
+  }
+  body.tab-camera #view-pane { display: block; }
+  body.tab-status #camera-pane, body.tab-status #view-pane { display: block; }
+  body.tab-status #status-pane { display: none; }
+  body.tab-camera #panel, body.tab-status #panel { display: grid; }
+  /* 상태는 조작판 아래에 이어 붙인다. 나란히 놓을 자리가 있으므로 감출 이유가 없다. */
+  #panel::after { content: ''; }
+  #status-pane { display: none !important; }
+}
+
+/* 가로로 누운 폰.
+ *
+ * 세로 공간이 거의 없다(대개 380~430px). 위아래로 쌓으면 무엇 하나는 반드시 잘리므로
+ * 옆으로 나눈다 — 왼쪽은 카메라와 3D, 오른쪽은 조작판. 데스크톱과 같은 모양이고,
+ * 그래서 가로로 눕히는 순간 배우는 것이 없다. */
+@media (orientation: landscape) and (max-height: 520px) and (max-width: 1000px) {
+  body {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 34%);
+  }
+  #top { grid-column: 1 / -1; }
+  #banner { grid-column: 1 / -1; }
+  #stage { grid-column: 1; grid-row: 3; }
+  #panel {
+    grid-column: 2; grid-row: 3;
+    max-height: none;
+    border-top: 0; border-left: 1px solid var(--line);
+    align-content: start;
+  }
+  #tabs { grid-column: 1 / -1; }
+  #tabs .tab span { display: none; }
+  #tabs .tab { flex-direction: row; }
+  body.tab-drive #stage, body.tab-lease #stage { grid-template-rows: minmax(60px, 0.3fr) minmax(0, 1fr); }
+  body.tab-camera #panel, body.tab-status #panel { display: none; }
+  body.tab-camera #stage, body.tab-status #stage { grid-column: 1 / -1; }
+  .joint { min-height: 32px; }
+  .hint { display: none; }
+}

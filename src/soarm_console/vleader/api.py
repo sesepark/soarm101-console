@@ -17,7 +17,18 @@ from ..diagnostics import inspect_arm
 from .authority import AuthorityManager, LeaseConflict
 from .backend import HardwareError
 from .owner import State, VirtualLeaderOwner
-from .safety import KOREAN, Reject, RejectError, Trip, VLeaderSettings
+from .safety import (
+    KOREAN,
+    PROFILES,
+    OPERATOR_GONE,
+    PROFILE_KOREAN,
+    Reject,
+    RejectError,
+    Trip,
+    VLeaderSettings,
+    load_settings,
+    profile_of,
+)
 from .spec import SpecError, load_joint_specs
 
 logger = logging.getLogger(__name__)
@@ -36,8 +47,13 @@ class ArmRequest(BaseModel):
 
 
 class PolicyRequest(BaseModel):
-    """바꿀 값들. 이름은 `as_dict()`가 내놓는 것과 같다."""
+    """바꿀 값들.
 
+    `profile` 하나만 보내는 것이 보통의 길이다. `values`는 그 위에 겹쳐지고, 둘 다
+    보내면 프로필을 먼저 깐 뒤 개별 값이 덮어쓴다 — 화면의 `고급`이 그렇게 동작한다.
+    """
+
+    profile: str | None = None
     values: dict[str, float] = {}
 
 
@@ -54,23 +70,32 @@ class LeaseRequest(BaseModel):
 #: 앱에서 조절할 수 있는 값과 그 범위.
 #:
 #: 전부를 열지 않는다. 온도 문턱처럼 하드웨어를 지키는 값은 화면에서 만질 것이 아니고,
-#: 리스 만료처럼 프로토콜이 정하는 값은 양쪽이 같아야 한다. 여기 있는 것은 **조작감과
-#: 민감도** — 사람이 팔을 써 보고 "너무 약하다 / 너무 잘 멈춘다"고 느끼는 값들이다.
+#: 리스 만료처럼 프로토콜이 정하는 값은 양쪽이 같아야 한다.
 #:
-#: 범위를 두는 이유는 오타 하나로 팔이 최고 속도로 출발하지 않게 하기 위해서다. 위쪽
-#: 끝(step_deg 15 = 450°/s)은 서보 무부하 속도(252°/s)보다 이미 위라 사실상 상한 없음이다.
+#: 그리고 **여기 있는 값들도 화면의 첫 번째 선택지가 아니다.** `lead_deg`가 12여야
+#: 하는지 15여야 하는지는 이 팔을 만든 사람도 재 보기 전에는 모르고, 쓰는 사람에게
+#: 물을 일은 더더욱 아니다. 화면에는 `PROFILES`의 세 가지를 먼저 두고, 이 표는 그
+#: 아래 `고급`에 접어 둔다. 여기 있는 이유는 값을 하나씩 재 볼 수 있어야 하기 때문이지
+#: 사람이 매번 고르라고 있는 것이 아니다.
+#:
+#: 범위를 두는 이유는 오타 하나로 팔이 최고 속도로 출발하지 않게 하기 위해서다.
 TUNABLES: dict[str, tuple[float, float, type, str]] = {
-    "step_deg": (1.0, 15.0, float, "SOARM_VL_STEP_DEG"),
-    "step_percent": (1.0, 12.0, float, "SOARM_VL_STEP_PERCENT"),
-    "sync_tolerance_deg": (2.0, 25.0, float, "SOARM_VL_SYNC_TOLERANCE_DEG"),
-    "following_error_deg": (1.0, 20.0, float, "SOARM_VL_FOLLOW_ERROR_DEG"),
-    "stall_load": (40, 500, int, "SOARM_VL_STALL_LOAD"),
+    "max_deg_per_s": (10.0, 150.0, float, "SOARM_VL_MAX_DEG_PER_S"),
+    "max_percent_per_s": (10.0, 118.0, float, "SOARM_VL_MAX_PERCENT_PER_S"),
+    "lead_deg": (3.0, 25.0, float, "SOARM_VL_LEAD_DEG"),
+    "lead_percent": (3.0, 25.0, float, "SOARM_VL_LEAD_PERCENT"),
+    "sync_tolerance_deg": (2.0, 30.0, float, "SOARM_VL_SYNC_TOLERANCE_DEG"),
+    "following_error_deg": (2.0, 24.0, float, "SOARM_VL_FOLLOW_ERROR_DEG"),
+    "following_error_ms": (200, 3000, int, "SOARM_VL_FOLLOW_ERROR_MS"),
+    "stall_load": (60, 800, int, "SOARM_VL_STALL_LOAD"),
     "stall_load_ms": (200, 5000, int, "SOARM_VL_STALL_LOAD_MS"),
+    "load_trip": (200, 900, int, "SOARM_VL_LOAD_TRIP"),
     "retreat_deg": (1.0, 15.0, float, "SOARM_VL_RETREAT_DEG"),
+    "command_hold_ms": (500, 8000, int, "SOARM_VL_COMMAND_HOLD_MS"),
 }
 
 
-def _persist_tunables(applied: dict[str, float]) -> str | None:
+def _persist_tunables(applied: dict[str, float], profile: str | None = None) -> str | None:
     """바꾼 값을 `config/soarm.env`에 남긴다. 다음 재시작에도 살아 있어야 한다.
 
     파일에는 조작 토큰도 들어 있으므로 통째로 다시 쓰지 않고, 해당 줄만 갈아 끼우거나
@@ -84,10 +109,23 @@ def _persist_tunables(applied: dict[str, float]) -> str | None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
         for name, value in applied.items():
+            if name not in TUNABLES:
+                # 프로필이 함께 옮기는 값 가운데 화면에서 만질 수 없는 것이 있다.
+                # 적용은 되지만 파일에는 남기지 않는다 — 그러면 다음 재시작에서 프로필의
+                # 기본값이 다시 깔린다. 프로필 자체는 아래에서 이름으로 남는다.
+                continue
             variable = TUNABLES[name][3]
             rendered = f"{variable}={value}"
             for index, line in enumerate(lines):
                 if line.strip().startswith(f"{variable}="):
+                    lines[index] = rendered
+                    break
+            else:
+                lines.append(rendered)
+        if profile is not None:
+            rendered = f"SOARM_VL_PROFILE={profile}"
+            for index, line in enumerate(lines):
+                if line.strip().startswith("SOARM_VL_PROFILE="):
                     lines[index] = rendered
                     break
             else:
@@ -103,7 +141,7 @@ class VirtualLeader:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.policy = VLeaderSettings()
+        self.policy = load_settings()
         self.authority = AuthorityManager(self.policy)
         self._owner: VirtualLeaderOwner | None = None
         self._specs = None
@@ -211,6 +249,19 @@ class VirtualLeader:
     def start(self) -> dict[str, object]:
         if self.running:
             raise HardwareError("Virtual leader is already running")
+        # 루프가 죽은 채로 남아 있는 소유자를 먼저 치운다.
+        #
+        # 죽은 루프는 참조만 남기고 사라지는데, 그 참조가 있는 한 상태 화면은 마지막
+        # 상태(대개 `SAFE`)를 그대로 말하고 `require_owner`는 409로 거절한다. 그러면
+        # 화면에는 "관찰 전용"이라고 적혀 있는데 아무 버튼도 듣지 않는다. 다시 시작하는
+        # 것이 사람이 그 상태에서 빠져나올 유일한 길이므로, 여기서 막히지 않아야 한다.
+        if self._owner is not None:
+            logger.warning("clearing a virtual leader whose loop is gone before restarting")
+            try:
+                self._owner.stop(force=True)
+            except Exception:  # noqa: BLE001 - 치우는 길은 어떤 이유로도 막히지 않는다
+                logger.debug("could not stop the dead owner cleanly", exc_info=True)
+            self._owner = None
         problems = self.preflight()
         if problems:
             raise HardwareError("; ".join(problems))
@@ -332,8 +383,19 @@ class VirtualLeader:
         }
 
     def require_owner(self) -> VirtualLeaderOwner:
-        if self._owner is None or not self._owner.running:
-            raise HTTPException(status_code=409, detail="Virtual leader is not running")
+        if self._owner is None:
+            raise HTTPException(
+                status_code=409, detail="관찰이 꺼져 있습니다. 먼저 관찰을 시작하세요."
+            )
+        if not self._owner.running:
+            # 참조는 남았는데 루프가 없다. 사람이 할 수 있는 일은 다시 시작하는 것뿐이고,
+            # 화면이 그렇게 말해 주어야 한다 — 영어로 "not running"이라고만 하면 방금
+            # "관찰 전용"이라고 적혀 있던 화면과 앞뒤가 맞지 않는다.
+            detail = self._owner.snapshot().get("error") or "제어 루프가 멈췄습니다"
+            raise HTTPException(
+                status_code=409,
+                detail=f"{detail} — `관찰 시작`을 다시 누르면 이어서 쓸 수 있습니다.",
+            )
         return self._owner
 
 
@@ -449,8 +511,14 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             lease = vleader.authority.grant(body.holder or "unknown", body.session_id)
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        # 앞 사람이 반납해서 선 것이라면 새 사람이 이어받는 것으로 풀린다. 그것은 고장이
-        # 아니라 정상적인 교대이고, 지금 문구를 손으로 옮겨 적은 사람이 바로 여기 있다.
+        # **조작하던 사람이 사라져서** 선 것이라면 새 사람이 이어받는 것으로 풀린다.
+        # 반납했든, 리스가 만료됐든, 스트림이 끊겼든 — 팔에 일어난 일이 아니라 조작면에
+        # 일어난 일이고, 읽을 현장이 없다. 지금 확인 체크를 한 사람이 바로 여기 있다.
+        #
+        # 처음에는 반납만 이렇게 두었다. 그랬더니 앞 사람의 창이 그냥 닫힌 경우(그쪽이
+        # 훨씬 흔하다) 새 사람은 권한을 받고도 움직일 수 없었다 — 화면에는 "1524ms 동안
+        # 통과한 명령이 없습니다"라고만 적혀 있었고, 그것은 다음 사람이 확인할 만한
+        # 내용이 아니다.
         #
         # 그 밖의 이유로 선 것은 풀지 않는다. 누가 정지를 눌렀거나 무언가에 닿았거나 모터가
         # 뜨거웠던 것이고, 그 이유는 다음 사람이 **읽고** 확인해야 한다. 권한을 새로 받는
@@ -458,7 +526,7 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
         owner = vleader.owner
         if owner is not None and owner.state == State.HOLD:
             fault = owner.snapshot().get("fault") or {}
-            if fault.get("code") == Trip.LEASE_RELEASED:
+            if fault.get("code") in OPERATOR_GONE:
                 owner.resume()
         return lease.as_dict()
 
@@ -484,6 +552,19 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
     def read_policy() -> dict[str, object]:
         return {
             "policy": vleader.policy.as_dict(),
+            # 지금 값이 어느 프로필인가. 손으로 하나만 바꿔 두었으면 `null`이고, 화면은
+            # 그때 "직접 정한 값"이라고 말해야 한다 — 세 칸 중 하나를 켜 두면 실제와
+            # 다른 말을 하게 된다.
+            "profile": profile_of(vleader.policy),
+            "profiles": [
+                {
+                    "name": name,
+                    "title": PROFILE_KOREAN[name][0],
+                    "detail": PROFILE_KOREAN[name][1],
+                    "values": values,
+                }
+                for name, values in PROFILES.items()
+            ],
             "tunable": {
                 name: {"min": low, "max": high, "integer": cast is int, "env": variable}
                 for name, (low, high, cast, variable) in TUNABLES.items()
@@ -505,6 +586,13 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
                 detail="팔이 움직이는 중에는 바꿀 수 없습니다. 먼저 정지하세요.",
             )
         applied: dict[str, float] = {}
+        if body.profile is not None:
+            if body.profile not in PROFILES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"모르는 조작감입니다: {body.profile} (있는 것: {', '.join(PROFILES)})",
+                )
+            applied.update(PROFILES[body.profile])
         for name, raw in (body.values or {}).items():
             if name not in TUNABLES:
                 raise HTTPException(status_code=400, detail=f"바꿀 수 없는 값입니다: {name}")
@@ -521,8 +609,13 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             applied[name] = value
         if applied:
             vleader.retune(applied)
-        problem = _persist_tunables(applied)
-        return {"policy": vleader.policy.as_dict(), "applied": applied, "save_error": problem}
+        problem = _persist_tunables(applied, profile_of(vleader.policy))
+        return {
+            "policy": vleader.policy.as_dict(),
+            "profile": profile_of(vleader.policy),
+            "applied": applied,
+            "save_error": problem,
+        }
 
     @router.post("/hold")
     def hold() -> dict[str, object]:

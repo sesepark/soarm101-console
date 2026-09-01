@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 import time
 
+import os
+import tempfile
+from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -465,3 +468,37 @@ def test_a_bus_that_fails_to_start_says_why_instead_of_500(console, monkeypatch)
     response = client.post("/api/vleader/start")
     assert response.status_code == 409
     assert "status packet" in response.json()["detail"]
+
+
+def test_the_app_can_retune_the_feel_but_not_past_the_rails(console):
+    """조작감은 화면에서 바꿀 수 있어야 한다. 다만 난간 밖으로는 못 간다.
+
+    `step_deg`는 최대 속도와 서보가 보는 위치 오차(= 토크)를 동시에 정한다. 2.0에서는
+    어깨가 팔을 들지 못했고 8.0에서 움직였다 — 팔마다 다르니 사람이 만져 봐야 하는
+    값이다. 그렇다고 오타 하나로 팔이 최고 속도로 출발해서는 안 된다.
+    """
+    client, _ = console
+    before = client.get("/api/vleader/policy").json()
+    # 진짜 설정 파일을 건드리지 않는다.
+    os.environ["SOARM_ENV_FILE"] = str(Path(tempfile.mkdtemp()) / "soarm.env")
+    assert "step_deg" in before["tunable"]
+
+    ok = motion(client, "POST", "/api/vleader/policy",
+                json={"values": {"step_deg": 6.5, "stall_load": 140}})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["policy"]["step_deg"] == 6.5
+    assert ok.json()["policy"]["stall_load"] == 140
+
+    # 범위 밖은 거절한다.
+    too_much = motion(client, "POST", "/api/vleader/policy", json={"values": {"step_deg": 90}})
+    assert too_much.status_code == 400
+    assert "사이여야" in too_much.json()["detail"]
+
+    # 열지 않은 값은 이름부터 거절한다. 온도 문턱은 화면에서 만질 것이 아니다.
+    not_open = motion(client, "POST", "/api/vleader/policy",
+                      json={"values": {"temperature_trip_c": 90}})
+    assert not_open.status_code == 400
+
+    # 토큰 없이는 못 바꾼다. 조작감을 바꾸는 것도 조작이다.
+    assert client.post("/api/vleader/policy", json={"values": {"step_deg": 3.0}}).status_code == 401
+    os.environ.pop("SOARM_ENV_FILE", None)

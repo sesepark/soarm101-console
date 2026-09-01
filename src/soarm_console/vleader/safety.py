@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass, field
 
 from .spec import JointSpec
@@ -75,6 +76,19 @@ TRIP_KOREAN = {
 }
 
 
+def object_particle(word: str) -> str:
+    """`을`인지 `를`인지.
+
+    `을(를)`로 적어 두면 읽는 사람이 괄호를 골라 읽어야 한다. 이 문장은 팔이 멈췄을 때
+    화면에 뜨는 문장이고, 그때는 한 글자라도 덜 걸리는 편이 낫다. 한글 음절의 받침은
+    코드포인트에서 바로 나온다 — (코드 - 0xAC00) % 28 이 0이면 받침이 없다.
+    """
+    last = word.strip()[-1:] if word.strip() else ""
+    if not last or not ("가" <= last <= "힣"):
+        return "을"
+    return "를" if (ord(last) - 0xAC00) % 28 == 0 else "을"
+
+
 def _env_float(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, default))
@@ -136,9 +150,22 @@ class VLeaderSettings:
     current_trip_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_CURRENT_TRIP_MS", 300)
     )
-    #: 목표와 실제가 이만큼 벌어진 채 이 시간이 지나면 막힌 것으로 본다.
+    #: **사람이 요청한 값**과 실제가 이만큼 벌어진 채, 실제가 거의 움직이지 않으면 막힌
+    #: 것으로 본다. 두 조건이 함께 있어야 하는 이유는 아래 `TripDetector`에 적었다.
+    #: 문턱이 작은 이유: 이 검사는 **서 있다**를 함께 요구한다. 벌어짐만 보던 때에는
+    #: 빠르게 끄는 동안에도 걸릴까 봐 크게 잡아야 했지만, 따라오는 중인 관절은 움직이고
+    #: 있으므로 그 걱정이 사라졌다. 남은 일은 목표에 도달해 미세하게 떠는 것과 진짜로
+    #: 막힌 것을 가르는 것뿐이고, 거기에는 몇 도면 충분하다.
     following_error_deg: float = field(
-        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_DEG", 12.0)
+        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_DEG", 3.0)
+    )
+    #: 집게는 단위가 퍼센트다. 도(degree)로 잰 문턱을 그대로 쓰면 뜻이 달라진다.
+    following_error_percent: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_FOLLOW_ERROR_PERCENT", 2.0)
+    )
+    #: 이 창 동안 실제 위치가 이만큼도 움직이지 않았으면 서 있는 것으로 본다.
+    stall_epsilon: float = field(
+        default_factory=lambda: _env_float("SOARM_VL_STALL_EPSILON", 0.6)
     )
     following_error_ms: int = field(
         default_factory=lambda: _env_int("SOARM_VL_FOLLOW_ERROR_MS", 400)
@@ -155,11 +182,25 @@ class VLeaderSettings:
     temperature_trip_c: int = field(
         default_factory=lambda: _env_int("SOARM_VL_TEMP_TRIP_C", 65)
     )
+    #: 온도도 연속 초과를 요구한다.
+    #:
+    #: 처음에는 온도만 즉시 봤다. "온도는 튀지 않는다"고 적어 두기까지 했는데, 실물에서
+    #: 45°C로 안정된 집게가 **한 번** 89°C로 읽혔고 팔이 그 자리에서 멈췄다. 튀지 않는
+    #: 것은 온도이지 **판독값**이 아니다 — Feetech 버스는 특히 여러 관절이 함께 움직일 때
+    #: 상태 패킷이 깨지는 것으로 알려져 있고, 그때 값은 그럴듯한 숫자로 들어온다.
+    #: 온도 판독은 10Hz이므로 500ms면 다섯 번 연속이다. 진짜 발열은 그 사이에 사라지지
+    #: 않고, 깨진 패킷 하나로 팔이 서는 일은 없어진다.
+    temperature_trip_ms: int = field(
+        default_factory=lambda: _env_int("SOARM_VL_TEMP_TRIP_MS", 500)
+    )
     #: 접촉으로 걸렸을 때 최근 경로를 따라 물러나는 양.
     retreat_deg: float = field(default_factory=lambda: _env_float("SOARM_VL_RETREAT_DEG", 4.0))
 
     def step_limit(self, spec: JointSpec) -> float:
         return self.step_percent if spec.unit == "percent" else self.step_deg
+
+    def following_error(self, spec: JointSpec) -> float:
+        return self.following_error_percent if spec.unit == "percent" else self.following_error_deg
 
     def sync_tolerance(self, spec: JointSpec) -> float:
         return self.sync_tolerance_percent if spec.unit == "percent" else self.sync_tolerance_deg
@@ -180,9 +221,12 @@ class VLeaderSettings:
             "current_trip": self.current_trip,
             "current_trip_ms": self.current_trip_ms,
             "following_error_deg": self.following_error_deg,
+            "following_error_percent": self.following_error_percent,
+            "stall_epsilon": self.stall_epsilon,
             "following_error_ms": self.following_error_ms,
             "temperature_warn_c": self.temperature_warn_c,
             "temperature_trip_c": self.temperature_trip_c,
+            "temperature_trip_ms": self.temperature_trip_ms,
             "retreat_deg": self.retreat_deg,
         }
 
@@ -326,16 +370,26 @@ class TripDetector:
         load: dict[str, float],
         current: dict[str, float],
         temperature: dict[str, float],
+        requested: dict[str, float] | None = None,
+        moved: dict[str, float] | None = None,
     ) -> tuple[str, str, str] | None:
         """걸렸으면 `(code, joint, 사람이 읽을 문장)`, 아니면 `None`."""
         settings = self.settings
         for name in self.specs:
             celsius = temperature.get(name)
-            if celsius is not None and celsius >= settings.temperature_trip_c:
+            if celsius is None:
+                continue
+            if self._sustained(
+                (name, Trip.OVER_TEMPERATURE),
+                celsius >= settings.temperature_trip_c,
+                now,
+                settings.temperature_trip_ms,
+            ):
                 return (
                     Trip.OVER_TEMPERATURE,
                     name,
-                    f"{self.specs[name].label} 모터가 {celsius:.0f}°C입니다 (정지 문턱 {settings.temperature_trip_c}°C)",
+                    f"{self.specs[name].label} 모터가 {settings.temperature_trip_ms}ms 넘게 "
+                    f"{celsius:.0f}°C입니다 (정지 문턱 {settings.temperature_trip_c}°C)",
                 )
         for name in self.specs:
             value = abs(load.get(name, 0.0))
@@ -353,29 +407,56 @@ class TripDetector:
                     name,
                     f"{self.specs[name].label}의 전류가 {settings.current_trip_ms}ms 넘게 {value * 6.5:.0f}mA입니다",
                 )
+        # 막힌 관절을 찾는 자리.
+        #
+        # 처음에는 **틱당 잘린 목표**와 실제의 차이를 봤다. 그 차이는 자라지 않는다 —
+        # 잘린 목표는 매 틱 실제 위치에 다시 붙기 때문이다. 실물에서 집게를 끝까지 닫아
+        # 턱이 맞닿게 했을 때 부하는 48~64였고 자유롭게 움직일 때(최대 88)와 구별되지
+        # 않았다. 즉 부하로도, 잘린 목표로도 "막혔다"를 알 수 없었다.
+        #
+        # 알 수 있는 것은 **사람이 계속 요청하는데 팔이 그 자리에 서 있다**는 사실이다.
+        # 두 조건을 함께 본다. 요청만 보면 빠르게 끌 때(요청이 앞서가고 팔이 따라오는 중)
+        # 걸리고, 정지만 보면 아무도 조작하지 않을 때 걸린다.
+        requested = requested or goal
+        moved = moved or {}
         for name, spec in self.specs.items():
-            if name not in goal or name not in present:
+            if name not in requested or name not in present:
                 self._since.pop((name, Trip.FOLLOWING_ERROR), None)
                 continue
-            gap = abs(goal[name] - present[name])
+            gap = abs(requested[name] - present[name])
+            standing = moved.get(name, float("inf")) < settings.stall_epsilon
             if self._sustained(
                 (name, Trip.FOLLOWING_ERROR),
-                gap >= settings.following_error_deg,
+                gap >= settings.following_error(spec) and standing,
                 now,
                 settings.following_error_ms,
             ):
+                unit = "%" if spec.unit == "percent" else "°"
                 return (
                     Trip.FOLLOWING_ERROR,
                     name,
-                    f"{spec.label}이(가) 목표에서 {gap:.1f} 벌어진 채 {settings.following_error_ms}ms 지났습니다",
+                    f"{spec.label}{object_particle(spec.label)} {gap:.1f}{unit} 더 보내라는 명령이 이어지는데 "
+                    f"{settings.following_error_ms}ms 넘게 제자리입니다 — 무언가에 닿았습니다",
                 )
         return None
 
     def warnings(self, temperature: dict[str, float]) -> list[dict[str, object]]:
-        """멈출 정도는 아니지만 화면이 말해야 하는 것."""
+        """멈출 정도는 아니지만 화면이 말해야 하는 것.
+
+        경고도 한 번 튄 값으로는 뜨지 않는다. 깜빡였다 사라지는 경고는 읽는 사람에게
+        아무것도 알려 주지 않으면서 다음 경고의 무게만 깎는다.
+        """
         lines = []
         for name, celsius in temperature.items():
-            if celsius >= self.settings.temperature_warn_c and name in self.specs:
+            if name not in self.specs:
+                continue
+            warm = self._sustained(
+                (name, "warn-temperature"),
+                celsius >= self.settings.temperature_warn_c,
+                time.monotonic(),
+                self.settings.temperature_trip_ms,
+            )
+            if warm:
                 lines.append(
                     {
                         "joint": name,

@@ -221,28 +221,80 @@ def test_a_sustained_load_trips(specs, settings):
     assert trip is not None and trip[0] == Trip.OVERLOAD and trip[1] == "elbow_flex"
 
 
-def test_a_joint_that_stops_following_its_goal_trips(specs, settings):
+def test_a_joint_that_is_asked_to_move_but_stands_still_trips(specs, settings):
+    """계속 요청하는데 팔이 제자리다 — 무언가에 닿았다는 뜻이다."""
     detector = TripDetector(specs, settings)
     present = {"elbow_flex": 10.0}
-    goal = {"elbow_flex": 10.0 + settings.following_error_deg + 1}
+    requested = {"elbow_flex": 10.0 + settings.following_error_deg + 1}
+    standing = {"elbow_flex": 0.0}
     now = time.monotonic()
-    detector.inspect(now=now, present=present, goal=goal, load={}, current={}, temperature={})
+    detector.inspect(now=now, present=present, goal=present, load={}, current={},
+                     temperature={}, requested=requested, moved=standing)
     trip = detector.inspect(
         now=now + settings.following_error_ms / 1000.0 + 0.01,
-        present=present, goal=goal, load={}, current={}, temperature={},
+        present=present, goal=present, load={}, current={}, temperature={},
+        requested=requested, moved=standing,
     )
     assert trip is not None and trip[0] == Trip.FOLLOWING_ERROR
+    assert "닿았습니다" in trip[2]
+
+
+def test_catching_up_is_not_a_collision(specs, settings):
+    """빠르게 끌면 요청은 늘 앞서간다. 그때마다 서면 조작 자체가 되지 않는다.
+
+    구별하는 것은 **팔이 움직이고 있는가**이다. 따라오는 중이면 움직이고, 닿았으면 서 있다.
+    """
+    detector = TripDetector(specs, settings)
+    present = {"elbow_flex": 10.0}
+    requested = {"elbow_flex": 60.0}
+    catching_up = {"elbow_flex": settings.stall_epsilon * 5}
+    now = time.monotonic()
+    for step in range(6):
+        assert detector.inspect(
+            now=now + step * 0.2, present=present, goal=present, load={}, current={},
+            temperature={}, requested=requested, moved=catching_up,
+        ) is None
+
+
+def test_the_gripper_gets_its_own_following_error_in_percent(specs, settings):
+    """집게만 단위가 퍼센트다. 도(degree)로 잰 문턱을 그대로 쓰면 뜻이 달라진다."""
+    gripper = next(spec for spec in specs if spec.name == "gripper")
+    elbow = next(spec for spec in specs if spec.name == "elbow_flex")
+    assert settings.following_error(gripper) == settings.following_error_percent
+    assert settings.following_error(elbow) == settings.following_error_deg
 
 
 def test_temperature_stops_before_the_servo_cuts_its_own_torque(specs, settings):
     """STS3215는 70°C에서 스스로 토크를 끊는다 — 그러면 팔이 떨어진다."""
     detector = TripDetector(specs, settings)
     assert settings.temperature_trip_c < 70
+    hot = {"wrist_flex": float(settings.temperature_trip_c)}
+    now = time.monotonic()
+    detector.inspect(now=now, present={}, goal={}, load={}, current={}, temperature=hot)
     trip = detector.inspect(
-        now=time.monotonic(), present={}, goal={}, load={}, current={},
-        temperature={"wrist_flex": settings.temperature_trip_c},
+        now=now + settings.temperature_trip_ms / 1000.0 + 0.01,
+        present={}, goal={}, load={}, current={}, temperature=hot,
     )
     assert trip is not None and trip[0] == Trip.OVER_TEMPERATURE
+
+
+def test_one_corrupted_temperature_reading_does_not_stop_the_arm(specs, settings):
+    """실물에서 45°C로 안정된 집게가 한 번 89°C로 읽혀 팔이 섰다.
+
+    튀지 않는 것은 온도이지 판독값이 아니다. Feetech 버스는 여러 관절이 함께 움직일 때
+    상태 패킷이 깨지고, 그때 값은 그럴듯한 숫자로 들어온다.
+    """
+    detector = TripDetector(specs, settings)
+    now = time.monotonic()
+    calm = {"gripper": 46.0}
+    spike = {"gripper": 89.0}
+    assert detector.inspect(now=now, present={}, goal={}, load={}, current={}, temperature=calm) is None
+    assert detector.inspect(now=now + 0.1, present={}, goal={}, load={}, current={}, temperature=spike) is None
+    # 다음 판독이 정상으로 돌아오면 아무 일도 없었던 것이 된다.
+    assert detector.inspect(now=now + 0.2, present={}, goal={}, load={}, current={}, temperature=calm) is None
+    assert detector.inspect(now=now + 1.0, present={}, goal={}, load={}, current={}, temperature=calm) is None
+    # 경고도 한 번 튄 값으로는 뜨지 않는다.
+    assert detector.warnings(spike) == []
 
 
 # --------------------------------------------------------------- 제어 루프

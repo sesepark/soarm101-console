@@ -194,3 +194,14 @@ body.unknown-pose #stage::after {
   font-size: 12px;
   pointer-events: none;
 }
+
+/* 확인 체크. 글자가 길어 두 줄이 되므로 체크와 글줄이 위에서 맞아야 읽힌다. */
+.authority label.ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.authority label.ack input { width: 20px; height: 20px; margin: 0; flex: none; accent-color: var(--blue); }

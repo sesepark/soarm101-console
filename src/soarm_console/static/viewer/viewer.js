@@ -157,10 +157,31 @@ function dragToDelta(jointName, dx, dy) {
   return (dx * perpendicular.x + dy * perpendicular.y) * gain;
 }
 
+/** 리스를 막 잡았을 때는 첫 목표가 팔의 현재 자세 근처여야 한다.
+ *
+ * 서버가 그렇게 요구하는데(`POSE_NOT_SYNCED`), 그것을 모르고 멀리 던지면 명령이 조용히
+ * 거절되고 팔은 꿈쩍도 하지 않는다. 실물에서 그 화면을 봤다. 거절당할 값을 보내는 대신
+ * 갈 수 있는 데까지 보내고, 나머지는 다음 명령이 이어 간다. */
+function clampToSyncWindow(item, value) {
+  if (!lease?.needs_sync) return value;
+  const present = presentOf(item.name);
+  if (present === undefined) return value;
+  const tolerance =
+    (item.unit === 'percent'
+      ? policy.sync_tolerance_percent ?? 10
+      : policy.sync_tolerance_deg ?? 6) * 0.8;
+  return Math.min(present + tolerance, Math.max(present - tolerance, value));
+}
+
+function presentOf(name) {
+  return present[name];
+}
+
 function setTarget(name, value) {
   const item = specByName.get(name);
   if (!item) return;
-  target[name] = Math.min(item.max, Math.max(item.min, value));
+  const wanted = Math.min(item.max, Math.max(item.min, value));
+  target[name] = clampToSyncWindow(item, wanted);
   applyPose(ghost, target);
   paintJoints();
 }
@@ -488,14 +509,22 @@ function paintJoints() {
 
 // ---------------------------------------------------------------- 권한
 
+/** 서버가 요구하는 문구. 화면이 사람에게 요구하는 것과는 다르다.
+ *
+ * 조작 권한은 한 세션에 여러 번 받는다 — 잠깐 반납했다가 다시 잡고, 멈췄다가 다시
+ * 시작한다. 그때마다 열세 글자를 치게 하면 게이트가 아니라 통행세가 되고, 통행세는 사람을
+ * 신중하게 만들지 않는다. 대신 한 번의 분명한 행동을 요구한다 — 현장을 확인했다는 체크.
+ *
+ * 토크 해제는 그대로 옮겨 적게 둔다. 자주 하는 일이 아니고, 잘못 눌리면 팔이 떨어진다. */
+const ARM_CONFIRMATION = 'MOVE SOARM101';
+
 function refreshTakeButton() {
-  const ok = el('confirm').value.trim() === 'MOVE SOARM101' && el('token').value.trim().length > 0;
+  const ok = el('confirm').checked && el('token').value.trim().length > 0;
   el('take').disabled = !ok;
   el('release-go').disabled = el('release-confirm').value.trim() !== 'RELEASE TORQUE SOARM101';
 }
-['confirm', 'token', 'release-confirm'].forEach((id) =>
-  el(id).addEventListener('input', refreshTakeButton)
-);
+['token', 'release-confirm'].forEach((id) => el(id).addEventListener('input', refreshTakeButton));
+el('confirm').addEventListener('change', refreshTakeButton);
 
 const savedToken = localStorage.getItem('soarm-motion-token');
 if (savedToken) el('token').value = savedToken;
@@ -518,7 +547,7 @@ el('take').addEventListener('click', async () => {
   el('take').disabled = true;
   try {
     localStorage.setItem('soarm-motion-token', el('token').value.trim());
-    const phrase = el('confirm').value.trim();
+    const phrase = ARM_CONFIRMATION;
     if (!telemetry?.running) await post('/api/vleader/start');
     if (!telemetry?.torque_enabled) {
       await post('/api/vleader/arm', { confirmation: phrase });
@@ -527,8 +556,8 @@ el('take').addEventListener('click', async () => {
     lease = await post('/api/vleader/lease', {
       confirmation: phrase, holder: HOLDER, session_id: SESSION,
     });
-    // 확인 문구는 한 번 쓰고 지운다. 다음 사람이 그대로 눌러 시작하지 못하게 한다.
-    el('confirm').value = '';
+    // 확인은 한 번 쓰고 내린다. 다음 사람이 그대로 눌러 시작하지 못하게 한다.
+    el('confirm').checked = false;
     target = { ...present };
     paintState();
   } catch (error) {

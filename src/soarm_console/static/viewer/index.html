@@ -69,9 +69,9 @@
         <label>조작 토큰
           <input id="token" type="password" autocomplete="off" placeholder="서버의 SOARM_MOTION_TOKEN">
         </label>
-        <label id="confirm-row">아래 문구를 손으로 옮겨 적으세요
-          <code>MOVE SOARM101</code>
-          <input id="confirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="">
+        <label id="confirm-row" class="ack">
+          <input id="confirm" type="checkbox">
+          <span>현장에 사람·장애물·케이블이 없고, 전원 차단 위치를 알고 있습니다</span>
         </label>
         <button id="take" type="button" disabled>조작 권한 받기</button>
       </div>

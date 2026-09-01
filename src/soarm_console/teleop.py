@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .calibration import validate_calibration
 from .config import Settings
+from .owner_lock import DeviceLockError, DeviceLockSet
 
 
 class TeleopError(RuntimeError):
@@ -21,6 +22,7 @@ class TeleopManager:
         self._process: subprocess.Popen[str] | None = None
         self._logs: deque[str] = deque(maxlen=300)
         self._lock = threading.Lock()
+        self._owner_locks: DeviceLockSet | None = None
 
     def command(self) -> list[str]:
         cfg = self.settings
@@ -30,6 +32,9 @@ class TeleopManager:
             f"--robot.port={cfg.follower_port}",
             f"--robot.id={cfg.follower_id}",
             f"--robot.max_relative_target={cfg.max_relative_target:g}",
+            # 종료나 예외가 곧 torque-off가 되면 팔이 떨어진다. 해제는 사람이 팔을
+            # 받친 상태에서 별도 절차로만 한다.
+            "--robot.disable_torque_on_disconnect=false",
             "--teleop.type=so101_leader",
             f"--teleop.port={cfg.leader_port}",
             f"--teleop.id={cfg.leader_id}",
@@ -63,22 +68,43 @@ class TeleopManager:
             if problems:
                 raise TeleopError("; ".join(problems))
             self._logs.clear()
-            self._process = subprocess.Popen(
-                self.command(),
-                cwd=Path(__file__).parents[2],
-                env=os.environ.copy(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
+            try:
+                owner_locks = DeviceLockSet.acquire(
+                    [self.settings.leader_port, self.settings.follower_port],
+                    "physical-leader-teleop",
+                )
+            except DeviceLockError as exc:
+                raise TeleopError(str(exc)) from exc
+            try:
+                self._process = subprocess.Popen(
+                    self.command(),
+                    cwd=Path(__file__).parents[2],
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                    # console parent가 죽고 LeRobot child만 남는 경우에도 child가 장치를
+                    # 쓰는 동안 커널 lock을 유지한다.
+                    pass_fds=owner_locks.file_descriptors,
+                )
+            except BaseException:
+                owner_locks.release()
+                raise
+            self._owner_locks = owner_locks
             threading.Thread(target=self._collect_logs, daemon=True).start()
+            threading.Thread(
+                target=self._watch_exit, args=(self._process, owner_locks), daemon=True
+            ).start()
 
     def stop(self, timeout: float = 8.0) -> None:
         with self._lock:
             process = self._process
             if process is None or process.poll() is not None:
+                owner_locks, self._owner_locks = self._owner_locks, None
+                if owner_locks is not None:
+                    owner_locks.release()
                 return
             os.killpg(process.pid, signal.SIGINT)
         try:
@@ -87,6 +113,11 @@ class TeleopManager:
             raise TeleopError(
                 "Teleoperation did not stop after SIGINT; use the physical power cutoff if motion continues"
             ) from exc
+        else:
+            with self._lock:
+                owner_locks, self._owner_locks = self._owner_locks, None
+            if owner_locks is not None:
+                owner_locks.release()
 
     @property
     def running(self) -> bool:
@@ -107,3 +138,10 @@ class TeleopManager:
             return
         for line in process.stdout:
             self._logs.append(line.rstrip())
+
+    def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
+        process.wait()
+        with self._lock:
+            if self._process is process and self._owner_locks is owner_locks:
+                self._owner_locks = None
+        owner_locks.release()

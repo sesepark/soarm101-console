@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import cv2
 
+from .owner_lock import DeviceLockError, DeviceLockSet
 from .v4l2_modes import discrete_modes
 
 
@@ -142,7 +143,11 @@ class CameraWorker:
         self._stop.set()
         with self._condition:
             self._condition.notify_all()
-            self._condition.wait_for(lambda: self._clients == 0, timeout=1.0)
+            # 수집으로 owner를 넘길 때는 VideoCapture.close와 lock 반납까지 끝나야 한다.
+            # client 수만 0이 된 순간 돌아가면 record 시작과 capture thread 종료가 경합한다.
+            self._condition.wait_for(
+                lambda: self._clients == 0 and self._thread is None, timeout=3.0
+            )
 
     def acquire(self) -> None:
         with self._condition:
@@ -182,7 +187,15 @@ class CameraWorker:
             self.release()
 
     def _capture(self) -> None:
+        owner_locks: DeviceLockSet | None = None
         try:
+            try:
+                owner_locks = DeviceLockSet.acquire([self.path], "camera-preview")
+            except DeviceLockError as exc:
+                with self._condition:
+                    self._error = str(exc)
+                    self._condition.notify_all()
+                return
             # 프로필이 바뀌면 안쪽 루프만 빠져나와 장치를 다시 연다. 바깥에서 보면 스트림은
             # 이어지고 프레임 크기만 달라진다.
             while not self._stop.is_set():
@@ -196,6 +209,8 @@ class CameraWorker:
                 self._actual = None
                 self._delivered.clear()
                 self._condition.notify_all()
+            if owner_locks is not None:
+                owner_locks.release()
 
     def _capture_once(self, profile: CameraProfile) -> bool:
         """한 프로필로 여는 캡처 한 판. 다시 열어야 하면 True, 끝났으면 False."""

@@ -31,6 +31,7 @@ def test_command_uses_stable_ports_and_safety_limit(tmp_path: Path):
     assert "--teleop.port=/dev/serial/by-id/leader" in command
     assert "--robot.port=/dev/serial/by-id/follower" in command
     assert "--robot.max_relative_target=2" in command
+    assert "--robot.disable_torque_on_disconnect=false" in command
     assert "--fps=30" in command
 
 
@@ -56,6 +57,7 @@ def test_record_config_is_local_and_uses_stable_camera_paths():
     assert str(config.robot.cameras["scene"].index_or_path) == "/dev/v4l/by-path/scene"
     assert str(config.robot.cameras["wrist"].index_or_path) == "/dev/v4l/by-path/wrist"
     assert config.robot.cameras["scene"].fourcc == "MJPG"
+    assert config.robot.disable_torque_on_disconnect is False
 
 
 def test_record_manager_is_gated_before_calibration():

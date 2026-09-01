@@ -7,7 +7,9 @@
 > 것까지 확인했고(루프 4.4ms), **팔이 실제로 움직이는 시험은 아직 하지 않았다.**
 > 접촉 문턱값은 유추값이고 실측이 필요하다.
 >
-> 아직 구현되지 않은 것: owner lock 파일, ROS 2 Bridge, VLA worker, 독립 power cutoff.
+> 장치별 owner lock은 프로젝트가 제어하는 경로에 구현되어 있다(ADR 0003). advisory lock을
+> 무시하는 임의의 upstream 프로세스까지 차단하지는 않는다. 아직 구현되지 않은 것은 ROS 2
+> Bridge, VLA worker, 수집 중 health 감지, 독립 power cutoff다.
 > 기존 `lerobot-teleoperate` 텔레옵 경로에는 lease도 watchdog도 없다(서브프로세스가
 > 리더 팔에서 읽은 값을 그대로 흘려보내는 구조라 끼어들 자리가 없다).
 

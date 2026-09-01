@@ -58,7 +58,7 @@ VLA와 새로운 manipulation 방식의 확장을 방해하므로 선택하지 �
 
 ## Follow-up
 
-- Owner lock 형식 결정
+- Owner lock 형식 결정 및 구현 — 완료, [ADR 0003](0003-device-owner-lock.md)
 - Lease/heartbeat protocol 구현
 - Mock Hardware Owner로 ownership/timeout test
 - 실제 control 주기 측정 후 profile 기본값 결정

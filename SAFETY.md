@@ -10,15 +10,22 @@
 
 **가상 리더 경로(2026-09-01)**: lease, heartbeat, watchdog, HOLD, 절대 관절 한계, 틱당
 변화량, 자세 동기화, 부하·전류·추종오차·온도 트립이 구현되어 있고 fault injection을 포함한
-42개 시험을 통과한다. 문턱값과 근거, 그리고 **아직 실측하지 못한 것**은 맥 앱 저장소의
-`docs/원격_텔레옵_안전.md`에 정직하게 적혀 있다. 실제 motion 검증은 아직 하지 않았다 —
+hardware-free 시험을 통과한다. 문턱값과 근거, 그리고 **아직 실측하지 못한 것**은 이 저장소의
+`RUNBOOK.md` 6절에 정직하게 적혀 있다. 실제 motion 검증은 아직 하지 않았다 —
 접촉 문턱값은 데이터시트와 LeRobot 기본값에서 유추한 값이다.
 
 **기존 물리 리더 텔레옵 경로**: lease도 watchdog도 없다. `lerobot-teleoperate` 서브프로세스
 하나이고, 보호 장치는 LeRobot의 `max_relative_target`과 사람의 손뿐이다.
 
-owner lock 파일은 어느 경로에도 없다. 상호배타는 프로세스 상태 검사와 409로 한다.
-독립 actuator power cutoff와 물리 E-stop은 여전히 없다.
+프로젝트가 제어하는 가상 리더·물리 텔레옵·수집·카메라·진단·접촉 측정 경로에는 장치별
+`flock` owner lock이 구현되어 있다([ADR 0003](ADR/0003-device-owner-lock.md)). 프로세스
+상태 검사와 409만 있던 때와 달리 콘솔 프로세스가 달라도 서로 막는다. 다만 advisory lock을
+무시하고 upstream LeRobot/serial library를 직접 실행한 프로세스까지 OS가 막아 주는 것은
+아니다. 그 경계에는 udev 권한 격리 같은 별도 설계가 필요하다.
+
+수집 중 부하·전류·온도·추종오차 감지는 아직 없다. 보완안은
+[ADR 0004 초안](ADR/0004-recording-safety-ladder-draft.md)에 조사만 했고 구현하지 않았다.
+독립 actuator power cutoff와 물리 E-stop도 여전히 없다.
 
 - 문서에 적혀 있다는 이유만으로 현재 동작한다고 가정하지 않는다.
 - 구현된 기능과 제안 단계 기능을 run 시작 전에 구분한다.

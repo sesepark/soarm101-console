@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .calibration import validate_calibration
 from .config import Settings
+from .owner_lock import DeviceLockError, DeviceLockSet
 from .teleop import TeleopError
 
 
@@ -19,6 +20,7 @@ class RecordManager:
         self._process: subprocess.Popen[str] | None = None
         self._logs: deque[str] = deque(maxlen=400)
         self._lock = threading.Lock()
+        self._owner_locks: DeviceLockSet | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
 
     @property
@@ -76,18 +78,43 @@ class RecordManager:
                     "SOARM_TELEOP_SOURCE": teleop_source,
                 }
             )
+            devices = [
+                self.settings.follower_port,
+                self.settings.scene_camera,
+                self.settings.wrist_camera,
+            ]
+            if teleop_source == "leader":
+                devices.append(self.settings.leader_port)
+            try:
+                owner_locks = DeviceLockSet.acquire(
+                    devices, f"record-{teleop_source}"
+                )
+            except DeviceLockError as exc:
+                raise TeleopError(str(exc)) from exc
+            # record child도 같은 열린 file description을 물려받는다. parent가 죽어도 child가
+            # 장치를 쓰는 동안 flock이 남아야 한다.
+            env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
             command = [str(Path(__file__).parents[2] / "scripts/record.sh")]
-            self._process = subprocess.Popen(
-                command,
-                cwd=Path(__file__).parents[2],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
+            try:
+                self._process = subprocess.Popen(
+                    command,
+                    cwd=Path(__file__).parents[2],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                    pass_fds=owner_locks.file_descriptors,
+                )
+            except BaseException:
+                owner_locks.release()
+                raise
+            self._owner_locks = owner_locks
             threading.Thread(target=self._collect_logs, daemon=True).start()
+            threading.Thread(
+                target=self._watch_exit, args=(self._process, owner_locks), daemon=True
+            ).start()
 
     def control(self, key: str) -> None:
         if key not in {"right", "left", "esc"}:
@@ -103,12 +130,21 @@ class RecordManager:
     def stop(self, timeout: float = 10.0) -> None:
         process = self._process
         if process is None or process.poll() is not None:
+            with self._lock:
+                owner_locks, self._owner_locks = self._owner_locks, None
+            if owner_locks is not None:
+                owner_locks.release()
             return
         os.killpg(process.pid, signal.SIGINT)
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise TeleopError("Recording did not stop cleanly after SIGINT") from exc
+        else:
+            with self._lock:
+                owner_locks, self._owner_locks = self._owner_locks, None
+            if owner_locks is not None:
+                owner_locks.release()
 
     def status(self) -> dict[str, object]:
         process = self._process
@@ -132,3 +168,10 @@ class RecordManager:
             return
         for line in process.stdout:
             self._logs.append(line.rstrip())
+
+    def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
+        process.wait()
+        with self._lock:
+            if self._process is process and self._owner_locks is owner_locks:
+                self._owner_locks = None
+        owner_locks.release()

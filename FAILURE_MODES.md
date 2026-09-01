@@ -28,7 +28,7 @@
 | Calibration 불일치 | ID/hash/schema 검사 | Motion mode 진입 거부 | 올바른 calibration 로드 후 | Observation-only는 가능 |
 | Runtime 재부팅 | Process start | SAFE 상태 | 자동 ACTIVE 금지 | Service auto-start는 가능하나 auto-motion 금지 |
 | 조작 중 접촉(책상·물체) | `Present_Load`/`Present_Current` 연속 초과, 추종오차 | 걸린 관절만 설정값만큼 물러난 뒤 HOLD | 사람이 `확인하고 계속`을 눌러야 | 문턱값은 유추값이다. 실측 후 조정 |
-| 모터 과열 | `Present_Temperature` | 55°C 경고, 65°C에서 HOLD | 식은 뒤 사람이 확인 | 서보 자체 보호(70°C)는 토크를 끊어 팔을 떨어뜨린다 |
+| 모터 과열 | `Present_Temperature` | 58°C 경고, 65°C에서 HOLD | 식은 뒤 사람이 확인 | 서보 자체 보호(70°C)는 토크를 끊어 팔을 떨어뜨린다. holding 실측 전 58°C도 재검토 대기다 |
 | 조작면 연결 끊김 | 명령 300ms 부재 | HOLD. 토크는 유지 | 안 함. 자세 동기화 다시 요구 | 손을 떼는 것과 다르다 — 손을 떼면 스트림은 계속 흐른다 |
 | 조작 권한 만료 | lease TTL 5s | HOLD | 새 lease + 자세 동기화 | 하트비트는 명령과 별개로 보낸다 |
 | 두 기기가 동시에 조작 시도 | lease가 하나뿐 | 두 번째 요청을 409로 거절 | 앞 기기가 반납하면 | 빼앗기는 없다 |

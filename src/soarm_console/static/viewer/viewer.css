@@ -134,8 +134,15 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
   color: var(--muted); background: linear-gradient(transparent, rgba(0,0,0,.75));
 }
 
-.joints { display: grid; gap: 7px; }
-.joint { display: grid; grid-template-columns: 82px 1fr minmax(56px, auto); align-items: center; gap: 8px; }
+.joints { display: grid; gap: 8px; }
+/* 한 줄이 이름·슬라이더·값·부하 막대·계기까지 다섯 조각이라, 줄 사이를 벌리는 것만으로는
+   마지막 조각이 어느 관절 것인지 읽히지 않았다. 줄마다 밑줄을 그어 경계를 분명히 한다. */
+.joint {
+  display: grid; grid-template-columns: 82px 1fr minmax(56px, auto);
+  align-items: center; gap: 8px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.joint:last-child { border-bottom: 0; padding-bottom: 0; }
 .joint > label { font-size: 12px; color: var(--muted); }
 .joint output { font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
 .joint input[type=range] { width: 100%; accent-color: var(--blue); }
@@ -147,6 +154,13 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .joint .load i { display: block; height: 100%; width: 0; background: var(--green); transition: width .12s linear; }
 .joint.hot .load i { background: var(--amber); }
 .joint.tripped .load i { background: var(--red); }
+.joint .reading {
+  /* 자기 관절에 붙어 보이도록 위쪽 간격을 지운다. 줄 사이(14px)보다 좁아야 한다. */
+  grid-column: 1 / -1; margin-top: -4px; text-align: right; font-size: 10px;
+  font-variant-numeric: tabular-nums; color: var(--muted);
+}
+.joint .reading.warm { color: var(--amber); }
+.joint .reading.bad { color: var(--red); }
 
 .authority { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
 .authority p { margin: 0; font-size: 12px; color: var(--muted); }

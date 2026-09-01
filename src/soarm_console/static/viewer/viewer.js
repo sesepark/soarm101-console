@@ -46,7 +46,11 @@ function frameModel(object) {
   const box = new THREE.Box3().setFromObject(object);
   if (box.isEmpty()) return;
   const center = box.getCenter(new THREE.Vector3());
-  const radius = box.getSize(new THREE.Vector3()).length() / 2;
+  const size = box.getSize(new THREE.Vector3());
+  // 팔은 밑동에서 **위로만** 뻗는다. 상자 한가운데를 겨누면 그린 팔이 화면 중단~상단에
+  // 몰리고 아래쪽에는 빈 격자만 남았다. 겨누는 점을 조금 올려 팔을 화면 가운데로 내린다.
+  center.y += size.y * 0.18;
+  const radius = size.length() / 2;
   const distance = (radius / Math.sin((camera.fov * Math.PI) / 360)) * 1.15;
   controls.target.copy(center);
   camera.position.copy(center).add(new THREE.Vector3(0.62, 0.5, 0.62).normalize().multiplyScalar(distance));
@@ -380,7 +384,16 @@ function setStateLine(text, kind = '') {
   line.className = kind;
 }
 
+/** 이 페이지가 배너를 그려도 되는가.
+ *
+ * `host=native`에서는 맥 앱이 같은 배너를 자기 화면에 그린다. 둘 다 그리면 "멈췄습니다"가
+ * 3D 위와 앱 본문에 두 번 뜨고, 누를 수 있는 `확인하고 계속`도 두 개가 된다. 3D는 팔만
+ * 그리고, 멈춘 이유와 그것을 푸는 버튼은 앱 한 곳에서만 나온다. 폰(`host=web`)에서는
+ * 이 페이지가 화면의 전부이므로 그대로 그린다. */
+const OWNS_BANNER = HOST !== 'native';
+
 function showReject(message) {
+  if (!OWNS_BANNER) return;
   const banner = el('banner');
   banner.hidden = false;
   banner.classList.add('warn');
@@ -428,7 +441,9 @@ function paintState() {
   document.body.classList.toggle('unknown-pose', telemetry.state === 'STOPPED');
   const fault = telemetry.fault;
   const banner = el('banner');
-  if (fault) {
+  if (!OWNS_BANNER) {
+    banner.hidden = true;
+  } else if (fault) {
     banner.hidden = false;
     banner.classList.toggle('warn', telemetry.state !== 'FAULT');
     el('banner-title').textContent =
@@ -462,7 +477,8 @@ function buildJointRows() {
       <label for="slider-${item.name}">${index + 1}. ${item.label}</label>
       <input id="slider-${item.name}" type="range" min="${item.min}" max="${item.max}" step="0.1" value="0">
       <output>0</output>
-      <div class="load"><i></i></div>`;
+      <div class="load"><i></i></div>
+      <div class="reading"></div>`;
     const slider = row.querySelector('input');
     slider.addEventListener('pointerdown', () => {
       commanding = canCommand();
@@ -504,6 +520,26 @@ function paintJoints() {
     row.querySelector('.load i').style.width = `${(load * 100).toFixed(0)}%`;
     row.classList.toggle('hot', load > 0.6);
     row.classList.toggle('tripped', telemetry?.fault?.joint === item.name);
+    // 모터가 지금 얼마나 힘들어하는지 숫자로도 적는다. 막대는 "많이 찼다"까지만 말한다.
+    // 문턱을 분모로 적지는 않는다 — 실측에서 부하는 막혀도 130을 넘지 않고 전류는 한 자리에
+    // 머무르는데 문턱은 400과 108이라, 그 분수는 틀린 안심을 준다.
+    const cell = row.querySelector('.reading');
+    if (reading) {
+      cell.textContent =
+        `부하 ${Math.round(Math.abs(reading.load))}` +
+        ` · 전류 ${Math.round(Math.abs(reading.current))}` +
+        ` · ${Math.round(reading.temperature)}°C`;
+      const warm = policy.temperature_warn_c || 55;
+      const trip = policy.temperature_trip_c || 65;
+      cell.className = 'reading' + (reading.temperature >= trip ? ' bad' : (reading.temperature >= warm || load > 0.6 ? ' warm' : ''));
+      cell.title =
+        '부하: 서보 자신의 눈금(0~1000, 단위 없음). 자유롭게 움직일 때 24~100, 막히면 48~130.\n' +
+        '전류: 서보 눈금 한 칸이 약 6.5mA. 이 팔에서는 버틸 때도 0~3칸에 머무릅니다.\n' +
+        `온도: ${Math.round(warm)}°C부터 주황, ${Math.round(trip)}°C에서 서버가 세웁니다.\n` +
+        '팔을 실제로 세우는 것은 이 숫자들이 아니라 "목표를 400ms 넘게 따라가지 못함"입니다.';
+    } else {
+      cell.textContent = '';
+    }
   }
 }
 

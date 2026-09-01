@@ -433,6 +433,48 @@ def test_the_loop_never_turns_torque_off_by_itself(owner):
         owner.stop()
 
 
+def test_backing_off_always_ends(specs, monkeypatch):
+    """물러남에는 끝이 있어야 한다.
+
+    물러남은 목표에 닿을 때까지 이어지는데, 닿지 못하는 자리가 있다. 걸린 방향의 반대편에도
+    무언가가 있으면(책상 위에서 위로 밀다 걸리면 아래는 책상이다) 팔은 물러날 곳이 없다.
+    2026-09-01 실물에서 `shoulder_lift`가 그 상태로 53초 넘게 부하 100으로 밀고 서 있는
+    것을 봤다 — 물러나는 동안에는 관측 정지도 보지 않으므로 아무것도 그것을 끊지 못했다.
+
+    여기서는 물러날 거리를 크게, 시간을 짧게 주어 같은 상황을 만든다. 시간이 다 되면
+    지금 자리에 세워야 한다. 세우는 것은 언제나 할 수 있다.
+    """
+    monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
+    monkeypatch.setenv("SOARM_VL_SIM_OBSTACLE", "elbow_flex:5")
+    monkeypatch.setenv("SOARM_VL_RETREAT_DEG", "60")
+    monkeypatch.setenv("SOARM_VL_RETREAT_MS", "300")
+    settings = VLeaderSettings()
+    authority = AuthorityManager(settings)
+    owner = VirtualLeaderOwner(
+        specs=specs, settings=settings, port="/dev/null", robot_id="test", authority=authority
+    )
+    owner.start()
+    try:
+        wait_for(lambda: owner.snapshot()["observation"] > 2)
+        owner.arm()
+        lease = authority.grant("테스트", "s")
+        sequence = 0
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and owner.state not in (State.HOLD, State.RETREATING):
+            sequence += 1
+            present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
+            try:
+                drive(owner, lease, {"elbow_flex": present["elbow_flex"] + 3.0}, sequence)
+            except RejectError:
+                break
+            time.sleep(0.03)
+        # 60°를 물러나려면 틱당 상한 때문에 1초가 넘게 걸린다. 300ms 뒤에는 그 자리에 선다.
+        assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=3.0)
+        assert "빠져나오지 못해" in owner.snapshot()["fault"]["message"]
+    finally:
+        owner.stop(force=True)
+
+
 def test_a_blocked_joint_backs_off_and_then_holds(specs, settings, monkeypatch):
     """책상에 닿았을 때. 물러난 뒤 서고, 어느 관절이 왜 걸렸는지 남는다."""
     monkeypatch.setenv("SOARM_VL_BACKEND", "simulated")
@@ -463,7 +505,7 @@ def test_a_blocked_joint_backs_off_and_then_holds(specs, settings, monkeypatch):
         assert wait_for(lambda: owner.snapshot()["state"] == State.HOLD, timeout=3.0)
         fault = owner.snapshot()["fault"]
         assert fault["joint"] == "elbow_flex"
-        assert fault["code"] in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR)
+        assert fault["code"] in (Trip.OVERLOAD, Trip.OVERCURRENT, Trip.FOLLOWING_ERROR, Trip.STALLED)
         present = {j["name"]: j["present"] for j in owner.snapshot()["joints"]}
         # 걸린 자리보다 뒤로 물러나 있어야 한다.
         assert present["elbow_flex"] < 5.0

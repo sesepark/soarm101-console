@@ -243,8 +243,25 @@ def test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint():
     html = rule("html")
     assert "height: -webkit-fill-available;" in html
     assert "overflow: hidden;" in html
-    # 문서 바깥에 자리가 남더라도 색이 같으면 띠로 보이지 않는다.
+    # 문서 바깥에 자리가 남더라도 색이 같으면 띠로 보이지 않는다. `body`도 같은 색이어야
+    # 한다 — 실물에서 화면 아래 62pt를 칠한 것이 `body`의 배경이었다.
     assert "background: #080d16;" in html
+    assert "background: #080d16;" in body
+
+    # **홈 화면 앱에서는 보이는 높이를 끝까지 쓴다.**
+    #
+    # 실물 아이폰(402×874)에서 웹 영역은 화면 위 0부터 그려지는데 `innerHeight`와
+    # `-webkit-fill-available`은 812만 말했다. 874 − 812 = 62, 정확히 위쪽 안전 영역이다.
+    # 배치가 812에서 끝나 812~874가 빈 채로 남았고 그것이 아래쪽 띠였다. 주소창이 없는
+    # 홈 화면 앱에서는 `100vh`가 곧 보이는 높이라, `min-height`로 얹으면 채워진다.
+    #
+    # 브라우저에는 걸지 않는다 — 거기서는 `100vh`가 주소창이 숨었을 때의 높이라 아래 탭이
+    # 화면 밖으로 밀린다. 정지 버튼이 화면 밖에 있는 것은 띠보다 나쁘다.
+    assert "@media (display-mode: standalone)" in css
+    standalone = re.search(
+        r"@media \(display-mode: standalone\) \{(.*?)\}\s*\}", css, re.S
+    )
+    assert standalone and "min-height: 100vh" in standalone.group(1)
 
     page = (static / "index.html").read_text(encoding="utf-8")
     assert 'content="#080d16"' in page

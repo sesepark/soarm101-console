@@ -257,6 +257,18 @@ body.unknown-pose #view-pane::after {
 .reading-row .figures.warm { color: var(--amber); }
 .reading-row .figures.bad { color: var(--red); }
 .policy-line { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+/* 손가락으로 눌리는 크기여야 한다. 글줄 안의 링크는 13px밖에 되지 않아, 누르려면
+   조준을 해야 했다 — 이 화면에서 조준이 필요한 것은 3D뿐이면 된다. */
+.console-link {
+  display: grid; gap: 2px;
+  margin-top: 10px; padding: 9px 12px;
+  min-height: var(--touch);
+  align-content: center;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel);
+  color: var(--ink); font-size: 13px; font-weight: 600; text-decoration: none;
+}
+.console-link small { color: var(--muted); font-size: 11px; font-weight: 400; }
 
 /* ─────────────────────────────────────────────── 조작판 */
 

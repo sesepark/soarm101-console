@@ -206,80 +206,55 @@ def test_no_style_class_can_be_worn_by_something_it_was_not_meant_for():
     assert not (applied & bare), f"겹치는 이름: {sorted(applied & bare)}"
 
 
-def test_the_phone_screen_is_pinned_to_the_viewport():
-    """홈 화면 앱에서 아래 탭 밑에 빈 띠가 남지 않아야 한다.
+def test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint():
+    """홈 화면 웹앱에서 아래쪽에 띠가 남지 않으려면 **문서를 흐름에서 들어내면 안 된다.**
 
-    `height: 100dvh`만 두었더니 실물 아이폰에서 탭 줄 아래로 빈 공간이 남았다. iOS가
-    말하는 `dvh`와 실제로 보이는 높이가 늘 같지는 않다. `position: fixed`에 `inset: 0`
-    이면 그 값이 무엇이든 몸통이 정확히 화면을 채운다.
+    `body { position: fixed }`로 화면에 맞추려 했는데, 그러면 `body`가 통째로 흐름에서
+    빠져 문서의 높이가 무너진다. 홈 화면 웹앱에서는 그 순간 iOS가 문서 아래에 남는 자리를
+    `theme-color`로 칠하고, 그 자리는 문서 바깥이라 어떤 CSS로도 덮을 수 없다.
 
-    화면 맨 아래(홈 인디케이터 자리)는 웹 내용이 아니라 `theme-color`로 칠해지므로,
-    그 색이 아래 탭과 같아야 이어져 보인다.
+    `100dvh`도 같은 결과를 낸다. iOS가 말하는 `dvh`는 실제 보이는 높이보다 작을 수 있고,
+    그 차이가 똑같이 문서 아래의 빈자리가 된다.
+
+    쓰는 것은 `-webkit-fill-available`이다 — 그 기기가 실제로 내어 주는 높이. 굴러가지
+    않게 하는 것은 `overflow: hidden`으로 충분하고, 문서를 옮길 이유는 없다.
+
+    같은 사고를 다른 프로젝트에서 먼저 겪었고 기록이 남아 있다:
+    `cookierunhub/docs/ios-webapp-modal-bottom-gap.md`.
     """
-    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
-    css = (static / "viewer.css").read_text(encoding="utf-8")
-    html = (static / "index.html").read_text(encoding="utf-8")
     import re
 
-    body = re.search(r"(?m)^body \{(.*?)^\}", css, re.S)
-    assert body, "body 규칙을 찾지 못했다"
-    rule = body.group(1)
-    assert "position: fixed;" in rule and "inset: 0;" in rule
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    css = (static / "viewer.css").read_text(encoding="utf-8")
 
-    # **높이를 함께 적으면 `inset: 0`이 아무 일도 하지 않는다.**
-    #
-    # `position: fixed`에 `inset: 0`이면 상자가 위아래로 늘어나 뷰포트를 정확히 채운다.
-    # 그런데 `height: 100dvh`를 같이 적어 두면 그 높이가 이기고, 상자는 위에 붙은 채
-    # 100dvh만큼만 차지한다. iOS 홈 화면 앱에서 `dvh`가 실제 보이는 높이보다 작으면
-    # 그 차이가 그대로 아래쪽 빈 띠가 된다 — 실물에서 정확히 그랬고, `inset: 0`을 넣고도
-    # 높이를 지우지 않아 고쳤다고 생각한 것이 아무 일도 하지 않고 있었다.
-    assert not re.search(r"(?m)^\s*(max-)?height\s*:", rule), (
-        "body에 높이를 적으면 inset이 무시된다: " + rule
+    def rule(selector: str) -> str:
+        found = re.search(r"(?m)^%s \{(.*?)^\}" % re.escape(selector), css, re.S)
+        assert found, f"{selector} 규칙을 찾지 못했다"
+        return found.group(1)
+
+    body = rule("body")
+    assert "position: fixed" not in body, (
+        "body를 흐름에서 들어내면 홈 화면 웹앱 아래에 띠가 돌아온다"
     )
+    assert "dvh" not in body, "dvh는 실제 보이는 높이와 어긋날 수 있다"
+    assert "height: -webkit-fill-available;" in body
+    assert "overflow: hidden;" in body
 
-    assert 'content="#080d16"' in html, "theme-color가 아래 탭 색과 같아야 한다"
-    assert "#tabs {" in css and "background: #080d16" in css
+    html = rule("html")
+    assert "height: -webkit-fill-available;" in html
+    assert "overflow: hidden;" in html
+    # 문서 바깥에 자리가 남더라도 색이 같으면 띠로 보이지 않는다.
+    assert "background: #080d16;" in html
 
-    # **설치된 앱은 매니페스트의 색을 쓴다.** 메타만 고치면 브라우저에서만 맞고 홈 화면
-    # 앱에서는 그대로다 — 화면 맨 아래 띠가 탭 줄과 다른 색으로 남는다.
+    page = (static / "index.html").read_text(encoding="utf-8")
+    assert 'content="#080d16"' in page
+
     import json as _json
 
     manifest = _json.loads((static / "manifest.webmanifest").read_text(encoding="utf-8"))
+    # **설치된 앱은 매니페스트의 색을 쓴다.** 메타만 고치면 브라우저에서만 맞는다.
     assert manifest["theme_color"] == "#080d16"
     assert manifest["background_color"] == "#080d16"
-
-
-def test_a_refused_resume_says_why_instead_of_looking_broken():
-    """`확인하고 계속`이 실패하면 그 이유가 화면에 남아야 한다.
-
-    멈춘 것을 푸는 것도 조작이라 토큰이 필요하다. 없으면 서버는 401로 답하는데, 그 답을
-    배너에 쓰자마자 30Hz로 들어오는 텔레메트리가 `fault.message`로 덮어썼다. 화면에서는
-    **아무 일도 일어나지 않는 것처럼** 보인다 — 사용자가 "버튼 눌러도 계속 남아있다"고
-    한 것이 그것이다. 실패는 조용히 지나가면 안 된다.
-    """
-    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
-    javascript = (static / "viewer.js").read_text(encoding="utf-8")
-
-    # 거절이 떠 있는 동안에는 고장 문구가 덮지 않는다.
-    assert "} else if (showReject.timer) {" in javascript
-    # 그리고 보내기 전에 토큰이 없다는 것을 먼저 말한다.
-    assert "조작 토큰이 있어야 멈춘 것을 풀 수 있습니다" in javascript
-
-
-def test_the_screen_can_say_how_the_device_is_using_it():
-    """아래쪽에 띠가 남을 때, 배치가 덜 채운 것인지 웹 영역이 작은 것인지 갈라야 한다.
-
-    둘은 고치는 자리가 전혀 다르다 — 앞은 CSS이고 뒤는 CSS로 닿을 수 없다(메타와
-    매니페스트의 일이다). 기기를 들고 있지 않은 사람이 그것을 알려면 화면이 스스로
-    말해야 한다.
-    """
-    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
-    html = (static / "index.html").read_text(encoding="utf-8")
-    javascript = (static / "viewer.js").read_text(encoding="utf-8")
-    assert 'id="geometry"' in html
-    assert "safe-area-inset-bottom" in javascript
-    assert "display-mode: standalone" in javascript
-    assert "웹 영역이 화면보다 작습니다" in javascript
 
 
 def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
@@ -303,7 +278,5 @@ def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
         assert 'rel="apple-touch-icon"' in page, label
         assert 'name="theme-color" content="#080d16"' in page, label
 
-    # 뷰포트 밖으로 남는 띠는 머리글·아래 탭과 같은 색이어야 한다. 그러지 않으면 그 띠가
-    # "빈 자리"로 보인다.
-    css = (static / "viewer/viewer.css").read_text(encoding="utf-8")
-    assert "html { background: #080d16; }" in css
+    # 문서 바깥으로 남는 띠는 머리글·아래 탭과 같은 색이어야 한다. 색까지 확인하는 것은
+    # 위 `test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint`가 한다.

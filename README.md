@@ -10,7 +10,8 @@
 - **안정적인 장치 식별** — serial은 `/dev/serial/by-id`, 카메라는 `/dev/v4l/by-path`를 사용해 변하는 `ttyACM*`와 `video*` 번호에 의존하지 않습니다.
 - **Motion safety gate** — 텔레옵은 양팔 calibration, motion 활성화, 현장 작업영역 확인, `START SOARM101` 입력을 모두 요구합니다.
 - **하드웨어 단일 소유권** — 프로젝트가 제어하는 observation, teleop, recording, 가상 리더 경로는 장치별 `flock`으로 serial bus와 카메라를 배타 점유합니다. lock을 무시하는 외부 프로세스까지 OS가 차단하는 것은 아닙니다. [ADR 0003](ADR/0003-device-owner-lock.md)
-- **가상 리더 원격 텔레옵** — 물리 리더 팔 없이, 3D로 그린 팔을 맥 앱이나 아이폰에서 끌어 팔로워를 움직입니다. 아이폰에서는 **끝점 조작 하나**이고 아래 조작판이 없습니다 — 관절 슬라이더 여섯 줄이 차지하던 높이는 카메라가 씁니다. 목표는 서버의 안전 사다리(절대 관절 한계, 틱당 변화량, 자세 동기화, 부하·전류·추종오차·온도, 워치독)를 통과해야 모터에 닿고, 조작 권한(lease)은 한 시점에 한 기기만 갖습니다. [ADR 0002](ADR/0002-virtual-leader-owner.md)
+- **가상 리더 원격 텔레옵** — 물리 리더 팔 없이, 3D로 그린 팔을 맥 앱이나 아이폰에서 끌어 팔로워를 움직입니다. 목표는 서버의 안전 사다리(절대 관절 한계, 틱당 변화량, 자세 동기화, 부하·전류·추종오차·온도, 워치독)를 통과해야 모터에 닿고, 조작 권한(lease)은 한 시점에 한 기기만 갖습니다. [ADR 0002](ADR/0002-virtual-leader-owner.md)
+- **폰에서 쓰는 조작 화면** — 서버 주소를 폰에서 열면 조작 화면(`/viewer/?host=web`)으로 옵니다. 홈 화면 앱으로 설치되고, 카메라·3D·상태·권한 네 탭에 정지 버튼이 늘 붙어 있습니다. **폰에서는 조작 방식이 `끝점` 하나이고 아래 조작판이 없습니다** — 관절 슬라이더 여섯 줄은 393×852 화면에서 267px을 가져가 카메라를 92px짜리 띠로 눌렀습니다. 사람이 직접 정하는 넷(앞뒤·손목 굽힘·손목 회전·집게)은 3D 위에 뜨는 타일 넷이 맡고, 넷 다 누른 채 좌우로 끄는 같은 몸짓입니다. 그 결과 카메라는 294px(폭에 정확히 4:3이라 640×480이 잘리지 않습니다), 3D는 392px을 씁니다.
 - **데이터 수집 파이프라인** — episode 성공/재시도 제어가 가능한 로컬 LeRobot dataset을 기록하며, Hub 자동 업로드는 하지 않습니다.
 - **운영 문서화** — runbook, failure mode, safety, architecture, ADR로 구현 결정과 현장 절차를 남깁니다.
 
@@ -41,6 +42,7 @@ SO-ARM101 leader / follower + scene / wrist cameras
 | --- | --- |
 | Robot runtime | Python 3.12, [LeRobot](https://github.com/huggingface/lerobot) 0.6.1, Feetech SDK |
 | Web console | FastAPI, Uvicorn, Vanilla HTML/CSS/JavaScript |
+| 3D 뷰어 | three.js r160(자체 호스팅), 직접 쓴 URDF 로더, 수치 야코비안 역기구학 |
 | Video / data | OpenCV camera input, PyAV / MP4, LeRobot dataset format |
 | Deployment | `uv`, systemd user service, udev device alias |
 | 검증 | pytest 기반 hardware-free test + read-only bus doctor |
@@ -100,6 +102,7 @@ Doctor는 모터 ID, 모델, firmware, 현재 위치, 전압, torque 상태만 �
 
 ```text
 src/soarm_console/        FastAPI app, teleop, recording, diagnostics, camera workers
+src/soarm_console/static/ 데스크톱 콘솔 페이지와 3D 조작 화면(`viewer/`, 맥·폰 공용)
 scripts/                  calibration, doctor, web, recording, service installation
 config/                   로컬 runtime 설정 template
 deploy/                   systemd user service, udev rule
@@ -127,7 +130,7 @@ ARCHITECTURE.md           소유권 모델과 향후 확장 방향
 - [hardware.md](hardware.md) — USB/camera 식별과 검증된 역할 매핑
 - [SAFETY.md](SAFETY.md) — 시스템이 보장하는 것과 보장하지 않는 것
 - [ARCHITECTURE.md](ARCHITECTURE.md) — hardware ownership과 향후 policy/VLA 확장
-- [PROTOCOL.md](PROTOCOL.md) — 계획 중인 observation/action contract
+- [PROTOCOL.md](PROTOCOL.md) — observation/action contract (가상 리더 경로에서 구현되어 돌고 있음)
 - [FAILURE_MODES.md](FAILURE_MODES.md) — 예상 장애와 운영자 대응
 
 ## 참고 및 감사

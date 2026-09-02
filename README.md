@@ -10,7 +10,7 @@
 - **안정적인 장치 식별** — serial은 `/dev/serial/by-id`, 카메라는 `/dev/v4l/by-path`를 사용해 변하는 `ttyACM*`와 `video*` 번호에 의존하지 않습니다.
 - **Motion safety gate** — 텔레옵은 양팔 calibration, motion 활성화, 현장 작업영역 확인, `START SOARM101` 입력을 모두 요구합니다.
 - **하드웨어 단일 소유권** — 프로젝트가 제어하는 observation, teleop, recording, 가상 리더 경로는 장치별 `flock`으로 serial bus와 카메라를 배타 점유합니다. lock을 무시하는 외부 프로세스까지 OS가 차단하는 것은 아닙니다. [ADR 0003](ADR/0003-device-owner-lock.md)
-- **가상 리더 원격 텔레옵** — 물리 리더 팔 없이, 3D로 그린 팔을 맥 앱이나 아이폰에서 끌어 팔로워를 움직입니다. 목표는 서버의 안전 사다리(절대 관절 한계, 틱당 변화량, 자세 동기화, 부하·전류·추종오차·온도, 워치독)를 통과해야 모터에 닿고, 조작 권한(lease)은 한 시점에 한 기기만 갖습니다. [ADR 0002](ADR/0002-virtual-leader-owner.md)
+- **가상 리더 원격 텔레옵** — 물리 리더 팔 없이, 3D로 그린 팔을 맥 앱이나 아이폰에서 끌어 팔로워를 움직입니다. 아이폰에서는 **끝점 조작 하나**이고 아래 조작판이 없습니다 — 관절 슬라이더 여섯 줄이 차지하던 높이는 카메라가 씁니다. 목표는 서버의 안전 사다리(절대 관절 한계, 틱당 변화량, 자세 동기화, 부하·전류·추종오차·온도, 워치독)를 통과해야 모터에 닿고, 조작 권한(lease)은 한 시점에 한 기기만 갖습니다. [ADR 0002](ADR/0002-virtual-leader-owner.md)
 - **데이터 수집 파이프라인** — episode 성공/재시도 제어가 가능한 로컬 LeRobot dataset을 기록하며, Hub 자동 업로드는 하지 않습니다.
 - **운영 문서화** — runbook, failure mode, safety, architecture, ADR로 구현 결정과 현장 절차를 남깁니다.
 

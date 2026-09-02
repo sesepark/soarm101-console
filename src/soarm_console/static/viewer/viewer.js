@@ -45,7 +45,29 @@ const HAND_JOINTS = ['wrist_flex', 'wrist_roll', 'gripper'];
 /** URDF에서 집게 끝을 나타내는 링크. */
 const TCP_LINK = 'gripper_frame_link';
 
+/** 지금 이 화면이 **폰**인가.
+ *
+ * 폰에서는 조작 방식이 `끝점` 하나뿐이고 아래 조작판이 없다. 관절 모드는 관절 여섯 개를
+ * 하나씩 고르는 방식이라 슬라이더 여섯 줄을 요구하는데, 폰에서 그 여섯 줄은 화면의
+ * 3분의 1(실측 852px 중 267px)을 가져갔고 그만큼 위가 눌려 카메라가 92px짜리 띠로
+ * 남았다. 무엇이 찍히는지 알아볼 수 없는 높이다. 폰에서 실제로 쓰는 것은 끝점 조작이고,
+ * 그때 사람이 직접 정할 것은 앞뒤·손목 둘·집게 넷뿐이라 3D 위의 타일로 들어간다.
+ *
+ * 판정이 **여기 한 군데**인 것이 요점이다. 같은 질의를 CSS에도 적으면 화면과 코드가
+ * 서로 다른 때에 폰이라고 믿게 되고, 그러면 조작판만 사라지고 방식은 관절로 남는
+ * 상태가 생긴다 — 아무것도 만질 수 없는 화면이다. CSS는 `body.phone`만 본다.
+ *
+ * 가로로 누운 폰도 폰이다(`max-height`). 반대로 손가락이 아닌 기기(데스크톱 브라우저)는
+ * 창을 아무리 좁혀도 폰이 아니다 — 거기서는 관절 슬라이더가 여전히 쓸모 있고, 마우스로
+ * 잡는 것과 손가락으로 잡는 것은 다른 일이다. 맥 앱(`host=native`)은 자기 화면을 따로
+ * 그리므로 언제나 제외한다. */
+const PHONE_QUERY =
+  '(pointer: coarse) and (max-width: 759px), (pointer: coarse) and (max-height: 520px)';
+const phoneMedia = matchMedia(PHONE_QUERY);
+const isPhone = () => HOST === 'web' && phoneMedia.matches;
+
 document.body.classList.add(`host-${HOST}`);
+document.body.classList.toggle('phone', isPhone());
 
 const el = (id) => document.getElementById(id);
 const canvas = el('canvas');
@@ -195,7 +217,7 @@ let ghost = null; // 목표 모델(반투명)
 let grabbing = null; // 지금 끌고 있는 관절 이름
 let commanding = false;
 let sequence = 0;
-let mode = localStorage.getItem('soarm-mode') === 'endpoint' ? 'endpoint' : 'joint';
+let mode = isPhone() || localStorage.getItem('soarm-mode') === 'endpoint' ? 'endpoint' : 'joint';
 let tab = 'drive';
 let selectedCamera = localStorage.getItem('soarm-camera') === 'wrist' ? 'wrist' : 'scene';
 
@@ -551,12 +573,24 @@ for (const type of ['pointerup', 'pointercancel', 'pointerleave']) {
 // 앞뒤. 화면 평면만으로는 깊이를 정할 수 없다. 누르고 있는 동안만 움직이고 놓으면
 // 가운데로 돌아오는 손잡이 — 손가락과 같은 성질이라 데드맨이 그대로 통한다.
 let depthHeld = 0;
+
+/** 앞뒤 손잡이의 값을 정한다.
+ *
+ * 이 값을 만지는 자리가 셋이다: 데스크톱의 슬라이더, 폰의 타일, 그리고 맥 앱의
+ * `soarmViewer.setDepth`. 각자 `depthHeld`에 직접 쓰면 한쪽이 놓은 것을 다른 쪽이
+ * 잡고 있는 상태가 생긴다 — 손을 다 뗐는데 팔이 계속 가는 것이 그것이다. 쓰는 자리를
+ * 하나로 모으고, 화면에 적히는 것도 여기서 함께 고친다. */
+function setDepthHeld(value) {
+  depthHeld = Math.max(-1, Math.min(1, Number(value) || 0));
+  const slider = el('depth');
+  if (Number(slider.value) !== depthHeld) slider.value = String(depthHeld);
+  el('depth-out').textContent = depthHeld === 0 ? '0' : depthHeld > 0 ? '앞' : '뒤';
+  paintHand();
+}
 {
   const slider = el('depth');
   const reset = () => {
-    depthHeld = 0;
-    slider.value = '0';
-    el('depth-out').textContent = '0';
+    setDepthHeld(0);
     if (commanding && !dragging) releaseGrip();
   };
   slider.addEventListener('input', () => {
@@ -564,8 +598,7 @@ let depthHeld = 0;
       reset();
       return;
     }
-    depthHeld = Number(slider.value);
-    el('depth-out').textContent = depthHeld === 0 ? '0' : depthHeld > 0 ? '앞' : '뒤';
+    setDepthHeld(Number(slider.value));
     commanding = true;
   });
   for (const type of ['pointerup', 'pointercancel', 'keyup', 'blur']) {
@@ -879,6 +912,148 @@ function buildControls() {
     row.innerHTML = `<div class="name">${item.label}</div><div class="bar"><i></i></div><div class="figures"></div>`;
     readings.append(row);
   }
+
+  buildHand();
+}
+
+// ---------------------------------------------------------------- 손 (폰)
+//
+// 3D 위에 뜨는 타일 넷. 폰에서 아래 조작판을 대신하는 것이고, 끝점 모드에서 사람이 직접
+// 정하는 것 전부다 — 앞뒤, 손목 둘, 집게.
+//
+// 넷 다 조작 방법이 같다: **누른 채 좌우로 끈다.** 슬라이더로 두지 않은 이유가 있다.
+// 슬라이더는 손잡이를 조준해야 하고, 그 손잡이가 26px이면 한 줄에 34px이 든다. 넉 줄이면
+// 그것만으로 화면의 5분의 1이고, 폰에서 그 높이는 곧 카메라의 높이다. 타일은 어디를
+// 눌러도 잡히므로 46px 한 줄에 넷이 들어간다.
+//
+// 손을 떼면 `releaseGrip()`이 목표를 팔의 지금 자리로 붙인다. 슬라이더와 똑같은 데드맨이고,
+// 조작 경로도 같은 `setTarget()` 하나다 — 새 조작 방식을 만든 것이 아니라 같은 것의
+// 손잡이를 바꾼 것뿐이라, 서버로 나가는 명령은 조금도 달라지지 않는다.
+
+/** 값의 전 범위를 훑는 데 드는 손가락 거리(px). 타일 자체(약 86px)보다 훨씬 길게 잡는다 —
+ *  타일 안에서만 움직이게 하면 1px이 2도가 넘어 손이 떨리는 만큼 팔이 흔들린다. 포인터를
+ *  붙잡아 두므로 타일 밖으로 나가도 계속 끌린다. */
+const HAND_DRAG_SPAN = 300;
+
+function handTile(name, label) {
+  const tile = document.createElement('button');
+  tile.type = 'button';
+  tile.className = 'tile';
+  tile.dataset.hand = name;
+  tile.innerHTML =
+    '<span class="tile-name"></span><strong class="tile-value">–</strong>' +
+    '<span class="tile-track"><i></i><u></u></span>';
+  tile.querySelector('.tile-name').textContent = label;
+  return tile;
+}
+
+/** 타일 하나에 손가락을 붙인다. 잡을 수 없을 때는 아예 잡히지 않는다 — 눌러도 아무 일이
+ *  없는 것과 눌리지 않는 것은 사람에게 전혀 다른 뜻이다. */
+function driveTile(tile, onStart, onMove, onEnd) {
+  let active = null;
+  tile.addEventListener('pointerdown', (event) => {
+    if (!canCommand()) return;
+    active = event.pointerId;
+    tile.setPointerCapture(active);
+    tile.classList.add('grabbing');
+    commanding = true;
+    onStart(event);
+    event.preventDefault();
+  });
+  tile.addEventListener('pointermove', (event) => {
+    if (active === null || event.pointerId !== active) return;
+    onMove(event);
+  });
+  const end = (event) => {
+    if (active === null || (event && event.pointerId !== active)) return;
+    active = null;
+    tile.classList.remove('grabbing');
+    if (onEnd) onEnd();
+    releaseGrip();
+  };
+  // `lostpointercapture`까지 듣는다. 손가락이 화면 밖으로 나가거나 시스템 제스처가
+  // 가로채면 `pointerup`이 오지 않는 경우가 있고, 그때 놓지 않으면 목표가 잡힌 채 남는다.
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    tile.addEventListener(type, end);
+  }
+}
+
+function buildHand() {
+  const host = el('hand');
+  host.innerHTML = '';
+  if (!spec.length) return;
+
+  // 앞뒤는 **속도**다. 다른 셋과 달리 값이 아니라 방향이고, 놓으면 0으로 돌아온다.
+  const depth = handTile('depth', '앞뒤');
+  let depthFrom = 0;
+  driveTile(
+    depth,
+    (event) => {
+      depthFrom = event.clientX;
+      setDepthHeld(0);
+    },
+    // 70px을 끌면 최고 속도. 슬라이더의 끝에서 끝까지와 같은 뜻이다.
+    (event) => setDepthHeld((event.clientX - depthFrom) / 70),
+    () => setDepthHeld(0)
+  );
+  host.append(depth);
+
+  for (const name of HAND_JOINTS) {
+    const item = specByName.get(name);
+    if (!item) continue;
+    const tile = handTile(name, item.label);
+    const perPixel = (item.max - item.min) / HAND_DRAG_SPAN;
+    let from = 0;
+    let startX = 0;
+    driveTile(
+      tile,
+      (event) => {
+        startX = event.clientX;
+        // 잡은 순간의 목표에서 출발한다. 매 프레임 지금 값에 더하면 텔레메트리가
+        // 들어올 때마다 기준이 흔들려 손가락을 멈춰도 값이 조금씩 흐른다.
+        from = target[name] ?? present[name] ?? 0;
+      },
+      (event) => setTarget(name, from + (event.clientX - startX) * perPixel)
+    );
+    host.append(tile);
+  }
+  paintHand();
+}
+
+/** 타일 넷의 숫자와 막대. 막대는 두 겹이다 — 채운 것은 **팔이 지금 있는 자리**이고,
+ *  가는 선은 **우리가 보내고 있는 목표**다. 숫자는 목표를 적는다(손가락이 정하는 것이
+ *  그쪽이므로). 둘이 벌어져 있으면 그 차이가 곧 "따라가는 중" 또는 "막혔다"는 뜻이고,
+ *  하나만 그리면 화면이 실제와 다른 말을 하게 된다. */
+function paintHand() {
+  const host = el('hand');
+  host.classList.toggle('off', !canCommand());
+  for (const tile of host.querySelectorAll('.tile')) {
+    const name = tile.dataset.hand;
+    const value = tile.querySelector('.tile-value');
+    const fill = tile.querySelector('.tile-track i');
+    const mark = tile.querySelector('.tile-track u');
+    if (name === 'depth') {
+      value.textContent = depthHeld === 0 ? '멈춤' : depthHeld > 0 ? '앞으로' : '뒤로';
+      const half = Math.min(1, Math.abs(depthHeld)) * 50;
+      fill.style.left = `${depthHeld < 0 ? 50 - half : 50}%`;
+      fill.style.width = `${half}%`;
+      mark.style.left = '50%';
+      continue;
+    }
+    const item = specByName.get(name);
+    if (!item) continue;
+    const wanted = target[name] ?? present[name] ?? 0;
+    const measured = present[name] ?? wanted;
+    const span = item.max - item.min || 1;
+    const place = (raw) => `${(Math.min(1, Math.max(0, (raw - item.min) / span)) * 100).toFixed(1)}%`;
+    value.textContent =
+      `${wanted.toFixed(item.unit === 'percent' ? 0 : 1)}${item.unit === 'percent' ? '%' : '°'}`;
+    fill.style.left = '0';
+    fill.style.width = place(measured);
+    mark.style.left = place(wanted);
+    const reading = telemetry?.joints?.find((joint) => joint.name === name);
+    tile.classList.toggle('limited', Boolean(reading?.rate_limited));
+  }
 }
 
 function paintControls() {
@@ -901,6 +1076,7 @@ function paintControls() {
       row.classList.toggle('limited', Boolean(reading?.rate_limited));
     }
   }
+  paintHand();
 }
 
 function paintReadings() {
@@ -1005,8 +1181,12 @@ function setTab(next) {
 }
 
 function setMode(next) {
-  mode = next === 'endpoint' ? 'endpoint' : 'joint';
-  localStorage.setItem('soarm-mode', mode);
+  // 폰에서는 무엇을 넣어도 끝점이다. 관절 모드는 슬라이더 여섯 줄을 요구하는데 폰에는
+  // 그 줄이 없으므로, 방식만 관절로 넘어가면 아무것도 만질 수 없는 화면이 된다.
+  mode = isPhone() || next === 'endpoint' ? 'endpoint' : 'joint';
+  // 강제로 정해진 값은 기억하지 않는다. 기억해 두면 그 기기가 나중에 폰이 아니게 됐을 때
+  // (창을 키운 데스크톱, 마우스를 붙인 태블릿) 고른 적 없는 방식이 남는다.
+  if (!isPhone()) localStorage.setItem('soarm-mode', mode);
   document.body.classList.toggle('mode-endpoint', mode === 'endpoint');
   document.body.classList.toggle('mode-joint', mode === 'joint');
   for (const button of document.querySelectorAll('.seg')) {
@@ -1018,6 +1198,15 @@ function setMode(next) {
   if (mode === 'endpoint') applyFixedView();
   releaseGrip();
 }
+
+// 폰인지 아닌지가 도중에 바뀌는 자리가 있다. 화면을 눕히거나, 창을 키우거나, 태블릿에
+// 키보드를 붙이는 때다. 그때 배치만 바뀌고 조작 방식이 그대로 남으면, 조작판 없는 화면에
+// 관절 모드가 남거나 그 반대가 된다.
+phoneMedia.addEventListener('change', () => {
+  document.body.classList.toggle('phone', isPhone());
+  setMode(mode);
+  requestAnimationFrame(resize);
+});
 
 for (const button of document.querySelectorAll('.tab')) {
   button.addEventListener('click', () => setTab(button.dataset.tab));
@@ -1340,7 +1529,7 @@ window.soarmViewer = {
   },
   /** 앱의 앞뒤 손잡이. */
   setDepth(value) {
-    depthHeld = Number(value) || 0;
+    setDepthHeld(value);
     if (depthHeld) commanding = true;
   },
   /** 지금 페이지가 무엇을 믿고 있는가.

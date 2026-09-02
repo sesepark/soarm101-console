@@ -245,8 +245,23 @@ def test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint():
     assert "overflow: hidden;" in html
     # 문서 바깥에 자리가 남더라도 색이 같으면 띠로 보이지 않는다. `body`도 같은 색이어야
     # 한다 — 실물에서 화면 아래 62pt를 칠한 것이 `body`의 배경이었다.
-    assert "background: #080d16;" in html
-    assert "background: #080d16;" in body
+    #
+    # 값을 여기에 적어 두지 않는다. 예전에는 `#080d16`을 그대로 박아 두었는데, 색을 한 번
+    # 바꾸자 **여섯 군데**(html·body·머리글·아래 탭·메타·매니페스트)를 함께 고쳐야 했고
+    # 시험은 "어디가 어긋났는지"가 아니라 "옛 값이 아니다"라고만 말했다. 이 시험이 지키려는
+    # 것은 특정 색이 아니라 **여섯이 같다**는 것이므로, 기준을 `--navy` 하나로 두고 나머지를
+    # 거기에 맞춘다.
+    theme = re.search(r"--navy:\s*(#[0-9a-fA-F]{6});", css)
+    assert theme, "--navy를 찾지 못했다"
+    navy = theme.group(1)
+    for selector, block in (("html", html), ("body", body)):
+        assert "background: var(--navy);" in block or f"background: {navy};" in block, (
+            f"{selector}의 배경이 머리글·아래 탭과 다르면 그 차이가 그대로 띠가 된다"
+        )
+    for selector in ("#top", "#tabs"):
+        assert "background: var(--navy);" in rule(selector), (
+            f"{selector}가 다른 색이면 문서 바깥의 띠가 그 연장으로 읽히지 않는다"
+        )
 
     # **홈 화면 앱에서는 보이는 높이를 끝까지 쓴다.**
     #
@@ -264,14 +279,67 @@ def test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint():
     assert standalone and "min-height: 100vh" in standalone.group(1)
 
     page = (static / "index.html").read_text(encoding="utf-8")
-    assert 'content="#080d16"' in page
+    assert f'content="{navy}"' in page
 
     import json as _json
 
     manifest = _json.loads((static / "manifest.webmanifest").read_text(encoding="utf-8"))
     # **설치된 앱은 매니페스트의 색을 쓴다.** 메타만 고치면 브라우저에서만 맞는다.
-    assert manifest["theme_color"] == "#080d16"
-    assert manifest["background_color"] == "#080d16"
+    assert manifest["theme_color"] == navy
+    assert manifest["background_color"] == navy
+
+
+def test_the_phone_gets_one_way_to_drive_and_no_panel_under_it():
+    """**폰에서는 끝점 하나뿐이고, 아래 조작판이 없다.**
+
+    관절 모드는 관절 여섯 개를 하나씩 고르는 방식이라 슬라이더 여섯 줄이 따라온다. 실측
+    852px 화면에서 그 여섯 줄이 267px을 가져갔고, 그만큼 위가 눌려 카메라가 92px짜리 띠로
+    남았다 — 무엇이 찍히는지 알아볼 수 없는 높이다. 폰에서 실제로 쓰는 것은 끝점 조작이고,
+    사람이 직접 정할 것은 앞뒤·손목 둘·집게 넷뿐이라 3D 위의 타일(`#hand`)로 옮겼다.
+
+    이 시험이 지키는 것은 **판정이 한 군데**라는 것이다. 같은 미디어 질의를 CSS에도 적으면
+    화면과 코드가 서로 다른 때에 폰이라고 믿게 되고, 그러면 조작판만 사라지고 방식은 관절로
+    남는 상태가 생긴다 — 아무것도 만질 수 없는 화면이다.
+    """
+    import re
+
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    css = (static / "viewer.css").read_text(encoding="utf-8")
+    js = (static / "viewer.js").read_text(encoding="utf-8")
+    html = (static / "index.html").read_text(encoding="utf-8")
+
+    # 판정은 자바스크립트에만 있고, CSS는 그 결과(`body.phone`)만 본다.
+    assert "const PHONE_QUERY =" in js
+    assert "pointer: coarse" not in css, (
+        "폰 판정을 CSS에도 적으면 화면과 코드가 서로 다른 때에 폰이라고 믿는다"
+    )
+    assert "document.body.classList.toggle('phone', isPhone());" in js
+
+    # 무엇을 넣어도 폰에서는 끝점이다.
+    setmode = re.search(r"function setMode\(next\) \{(.*?)\n\}", js, re.S)
+    assert setmode and "isPhone() || next === 'endpoint'" in setmode.group(1), (
+        "폰에서 관절 모드로 넘어가면 조작판 없는 화면에 슬라이더만 요구하게 된다"
+    )
+
+    # 조작판은 폰에서 격자 줄까지 비운다.
+    assert "body.phone #panel { display: none !important; }" in css
+    # 그 높이는 카메라로 간다.
+    assert re.search(
+        r"body\.phone\.tab-drive #stage,\s*\n?body\.phone\.tab-lease #stage \{[^}]*0\.75fr",
+        css,
+    ), "폰에서 카메라가 무대의 큰 쪽을 가져가야 한다"
+
+    # 손 조작판은 3D 안에 있다. 밖에 두면 그 높이가 다시 무대에서 빠진다.
+    view = re.search(r'<section id="view-pane">(.*?)</section>', html, re.S)
+    assert view and 'id="hand"' in view.group(1)
+    for name in ("depth", "wrist_flex", "wrist_roll", "gripper"):
+        assert f"'{name}'" in js or f'"{name}"' in js
+
+    # 폰 구획은 반응형 규칙들보다 뒤에 있어야 한다. 명시도가 같아서, 앞에 두면
+    # `body.mode-endpoint.tab-drive #stage`가 이기고 카메라가 다시 얇아진다.
+    assert css.index("body.phone #panel") > css.index("body.mode-endpoint.tab-drive #stage")
+    # 맥 전용 구획은 그 아래에 남는다. 같은 이유다.
+    assert css.index("body.host-native {") > css.index("body.phone #panel")
 
 
 def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
@@ -284,16 +352,22 @@ def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
 
     두 페이지가 같은 메타를 가져야 어느 쪽에서 추가하든 같은 앱이 된다.
     """
+    import re
+
     static = Path(__file__).parents[1] / "src/soarm_console/static"
     console = (static / "index.html").read_text(encoding="utf-8")
     viewer = (static / "viewer/index.html").read_text(encoding="utf-8")
+    css = (static / "viewer/viewer.css").read_text(encoding="utf-8")
+    theme = re.search(r"--navy:\s*(#[0-9a-fA-F]{6});", css)
+    assert theme, "--navy를 찾지 못했다"
+    navy = theme.group(1)
 
     for page, label in ((console, "콘솔"), (viewer, "조작 화면")):
         assert "viewport-fit=cover" in page, f"{label}: 안전 영역까지 그려야 한다"
         assert 'name="apple-mobile-web-app-capable" content="yes"' in page, label
         assert 'rel="manifest"' in page, label
         assert 'rel="apple-touch-icon"' in page, label
-        assert 'name="theme-color" content="#080d16"' in page, label
+        assert f'name="theme-color" content="{navy}"' in page, label
 
     # 문서 바깥으로 남는 띠는 머리글·아래 탭과 같은 색이어야 한다. 색까지 확인하는 것은
     # 위 `test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint`가 한다.

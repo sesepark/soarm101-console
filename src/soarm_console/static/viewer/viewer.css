@@ -11,26 +11,56 @@
  * 보이는 높이와 어긋날 수 있고, 그 차이가 그대로 빈 띠가 된다.
  */
 
+/* 색은 SHAPE 디자인 토큰(`sesepark/shape-web-design`의 `tokens/tokens.json`)에서 가져온다.
+ *
+ * 그 토큰은 **흰 종이 위의 파랑**을 위해 만들어진 것이라 그대로는 쓸 수 없다. 이 화면은
+ * 카메라 영상과 3D를 담고 있어서 어두워야 한다 — 밝은 바탕에 얹으면 영상이 실제보다
+ * 밝아 보이고, 어두운 실험실에서는 화면 자체가 눈부시다. 그래서 **색은 그대로 쓰고 역할만
+ * 뒤집는다**: 큰 면을 채우라고 만든 남색(`brand.navy`)이 여기서는 바탕이 되고, 어두운
+ * 바탕 위 보조 글자로 정의된 하늘색(`brand.sky`)이 여기서는 모든 설명 글자가 된다.
+ * 강조는 SHAPE와 똑같이 파랑(`brand.blue`) 하나뿐이다.
+ *
+ * 상태색 셋(초록·주황·빨강)만 토큰 밖의 값이다. SHAPE의 상태색은 밝은 바탕에 얹는 짝이라
+ * 남색 위에서는 읽히지 않는데, 여기서 그 셋은 장식이 아니라 **팔이 지금 무슨 상태인지**를
+ * 말한다. 읽히지 않는 경고는 경고가 아니므로 이 셋은 밝기를 지킨다. 대신 정지 단추의
+ * 빨강은 SHAPE의 `status.danger.fg`를 그대로 쓴다 — 그쪽은 면을 칠하는 색이라 맞는다. */
 :root {
   color-scheme: dark;
-  --ink: #f6f8fc;
-  --muted: #8994a7;
-  --line: rgba(255,255,255,.11);
-  --blue: #5f82ff;
+  --ink: #ffffff;              /* surface.page */
+  --muted: #90afff;            /* brand.sky — "어두운 바탕 위 보조 글자" */
+  --line: rgba(144,175,255,.20);
+  --blue: #2855f3;             /* brand.blue */
+  --blue-press: #1d4eb5;       /* brand.blue-press */
+  --navy: #0c245e;             /* brand.navy — 머리글·탭·조작판 */
+  --navy-deep: #142354;        /* brand.navy-deep — 카드 면 */
+  --navy-mid: #163c91;         /* brand.navy-mid */
+  --danger: #b62446;           /* status.danger.fg — 정지 단추의 면 */
   --green: #43d695;
   --amber: #ffb648;
   --red: #ff707a;
-  --panel: #111722;
-  --bg: #070b12;
+  --panel: #142354;
+  --bg: #0a1327;               /* overlay.backdrop의 색. 무대의 바닥 */
+  /* 모서리. SHAPE의 사다리 그대로다 — 상자 12, 카드 18, 대화상자 22, 누를 것은 알약. */
+  --r-box: 12px;
+  --r-card: 18px;
+  --r-dialog: 22px;
+  --r-pill: 999px;
   /* 손가락 하나가 확실히 닿는 크기. 애플 휴먼 인터페이스가 말하는 44pt를 아래로
-     내려가지 않게 하는 기준선이고, 이 파일 안의 모든 누를 수 있는 것이 이 값을 쓴다. */
+     내려가지 않게 하는 기준선이고, 이 파일 안의 모든 누를 수 있는 것이 이 값을 쓴다.
+     SHAPE의 배치 규칙도 같은 값을 말한다. */
   --touch: 44px;
   --gap: 8px;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-l: env(safe-area-inset-left, 0px);
   --safe-r: env(safe-area-inset-right, 0px);
   --safe-t: env(safe-area-inset-top, 0px);
-  font-family: Inter, Pretendard, "Pretendard SD KR", -apple-system, BlinkMacSystemFont, sans-serif;
+  /* 글꼴은 Pretendard 한 벌이다. 없는 기기에서는 SHAPE가 정해 둔 대체 순서로 내려간다 —
+     여기서 새 글꼴을 내려받지는 않는다. 이 화면은 tailnet 안에서만 열리고, 조작 화면이
+     바깥 CDN을 기다리다 늦게 뜨는 것은 그 자체로 사고다. */
+  font-family: Pretendard, "Pretendard Variable", "Apple SD Gothic Neo", -apple-system,
+    BlinkMacSystemFont, "Noto Sans KR", sans-serif;
+  /* 한글은 단어 중간에서 끊지 않는다. SHAPE의 규칙이고, 좁은 폰에서 특히 눈에 띈다. */
+  word-break: keep-all;
 }
 
 * { box-sizing: border-box; }
@@ -74,7 +104,7 @@ html {
   overscroll-behavior: none;
   /* 문서 바깥에 혹시 자리가 남더라도 머리글·아래 탭과 같은 색이면 띠로 보이지 않는다.
      매니페스트의 `theme_color`·`background_color`도 같은 값으로 맞춰 두었다. */
-  background: #080d16;
+  background: var(--navy);
 }
 html, body { width: 100%; }
 body {
@@ -85,8 +115,8 @@ body {
    * 화면 안에서는 보이지 않는 색이다 — 무대의 칸도, 조작판도, 머리글도 저마다 배경을
    * 칠하므로 `body`의 배경이 드러나는 자리는 배치 안에 없다. 이 색이 보이는 곳은 배치
    * **바깥**뿐이고, 거기서는 탭 줄의 연장으로 읽혀야 한다. 실물 아이폰에서 화면 아래
-   * 62pt가 이 색(`#070b12`)으로 칠해져 띠처럼 보였다. */
-  background: #080d16;
+   * 62pt가 이 색으로 칠해져 띠처럼 보였다. */
+  background: var(--navy);
   /* 화면 자체는 절대 굴러가지 않는다. 넘치는 것이 있으면 그것은 배치가 틀린 것이지
      사용자가 굴려서 해결할 일이 아니다. */
   overflow: hidden;
@@ -126,17 +156,19 @@ a { color: var(--blue); }
   gap: var(--gap);
   padding: max(6px, var(--safe-t)) max(10px, var(--safe-r)) 6px max(10px, var(--safe-l));
   border-bottom: 1px solid var(--line);
-  background: #080d16;
+  background: var(--navy);
 }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1; }
 .mark {
   width: 30px; height: 30px; flex: none;
   display: grid; place-items: center;
-  border-radius: 9px; background: var(--blue); font-weight: 900; font-size: 15px;
+  border-radius: var(--r-box); background: var(--blue);
+  font-weight: 900; font-size: 15px; letter-spacing: -.04em;
+  box-shadow: 0 5px 12px rgba(40,85,243,.3);   /* shadow.brand */
 }
 .lines { display: grid; gap: 1px; min-width: 0; }
-.lines strong { font-size: 13px; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lines small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lines strong { font-size: 13.5px; font-weight: 800; letter-spacing: -.03em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lines small { color: var(--muted); font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 상태 색은 **접두사가 붙은 이름**을 쓴다.
  *
  * 예전에는 그냥 `live`/`warn`/`stop`이었다. 그런데 정지 단추의 스타일도 `.stop`이라는
@@ -153,8 +185,11 @@ a { color: var(--blue); }
 button.stop {
   flex: none;
   min-width: 72px; min-height: var(--touch);
-  border: 0; border-radius: 999px;
-  background: var(--red); color: #fff; font-weight: 800;
+  border: 0; border-radius: var(--r-pill);
+  background: var(--danger); color: #fff; font-weight: 800; letter-spacing: -.02em;
+  /* SHAPE의 `.button.danger`가 쓰는 바로 그 그림자다. 남색 위에서 이 한 겹이 있어야
+     빨간 알약이 면에 붙지 않고 떠 있는 것으로 읽힌다. */
+  box-shadow: 0 5px 12px rgba(182,36,70,.3);
 }
 button.stop:disabled { opacity: .4; }
 
@@ -198,7 +233,7 @@ body.tab-lease #status-pane { display: none; }
  * 예전에는 실패했을 때만 숨겼는데, 그 사이(주소를 막 걸어 둔 순간, 실패 핸들러가 아직
  * 돌지 않은 순간)에 사파리가 깨진 그림 아이콘을 그렸다 — 실물 아이폰에서 카메라 자리에
  * 파란 물음표가 떠 있었다. 들어온 것이 확인됐을 때만 보이는 편이 뒤집기 쉽다. */
-#camera-image { width: 100%; height: 100%; object-fit: cover; display: block; background: #0d121c; visibility: hidden; }
+#camera-image { width: 100%; height: 100%; object-fit: cover; display: block; background: var(--bg); visibility: hidden; }
 #camera-image.live { visibility: visible; }
 .pane-note {
   position: absolute; inset: 0;
@@ -210,27 +245,30 @@ body.tab-lease #status-pane { display: none; }
   display: flex; gap: 6px;
 }
 .chip {
-  min-height: 30px; padding: 0 12px;
-  border-radius: 999px; border: 1px solid var(--line);
-  background: rgba(8,13,22,.78);
-  backdrop-filter: blur(10px);
-  color: var(--muted); font-size: 12px; font-weight: 600;
+  min-height: 32px; padding: 0 13px;
+  border-radius: var(--r-pill); border: 1px solid var(--line);
+  background: rgba(10,19,39,.72);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  color: var(--muted); font-size: 12px; font-weight: 800; letter-spacing: -.02em;
+  transition: background 200ms cubic-bezier(.2,.8,.2,1), color 200ms cubic-bezier(.2,.8,.2,1);
 }
-.chip.on { color: #fff; background: rgba(95,130,255,.9); border-color: transparent; }
+/* 고른 것을 파랑으로 칠하되 빛은 주지 않는다. SHAPE의 규칙대로 한 화면에서 가장 강한
+   파랑은 하나여야 하고, 여기서 그 하나는 사람이 눌러야 하는 단추다 — 칩은 상태 표시다. */
+.chip.on { color: #fff; background: var(--blue); border-color: transparent; }
 
 #canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 
 .overlay {
   position: absolute; inset: 0;
   display: grid; place-content: center; justify-items: center; gap: 8px;
-  background: rgba(7,11,18,.86);
+  background: rgba(10,19,39,.86);
   text-align: center; padding: 20px;
 }
 .overlay small { color: var(--muted); font-size: 12px; }
 body:not(.loading) #boot { display: none; }
 .spinner {
   width: 26px; height: 26px;
-  border: 2px solid rgba(255,255,255,.18);
+  border: 2px solid rgba(144,175,255,.24);
   border-top-color: var(--blue);
   border-radius: 50%;
   animation: spin .8s linear infinite;
@@ -241,17 +279,18 @@ body:not(.loading) #boot { display: none; }
   margin: 0;
   padding: 9px max(10px, var(--safe-r)) 9px max(10px, var(--safe-l));
   display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
-  border-bottom: 1px solid rgba(255,112,122,.45);
-  background: rgba(51,17,22,.94);
+  border-bottom: 1px solid rgba(182,36,70,.55);
+  background: rgba(70,20,38,.94);
   font-size: 12.5px;
 }
-.banner.warn { border-bottom-color: rgba(255,182,72,.45); background: rgba(50,38,16,.94); }
-.banner strong { color: var(--red); }
+.banner.warn { border-bottom-color: rgba(255,182,72,.45); background: rgba(52,39,17,.94); }
+.banner strong { color: var(--red); font-weight: 800; letter-spacing: -.02em; }
 .banner.warn strong { color: var(--amber); }
 .banner span { color: var(--ink); opacity: .92; flex: 1 1 160px; }
 .banner button {
-  border: 0; border-radius: 999px; padding: 0 14px; min-height: 34px;
-  background: var(--blue); color: #fff; font-weight: 700; font-size: 12px;
+  border: 0; border-radius: var(--r-pill); padding: 0 15px; min-height: 34px;
+  background: var(--blue); color: #fff; font-weight: 800; font-size: 12px; letter-spacing: -.02em;
+  box-shadow: 0 5px 12px rgba(40,85,243,.3);
 }
 
 /* 시점 단추. `끝점` 모드에서만 쓸모가 있으므로 그때만 보인다 — 관절 모드에서는
@@ -260,27 +299,28 @@ body:not(.loading) #boot { display: none; }
   position: absolute; right: 8px; top: 8px;
   display: none; gap: 4px;
   padding: 3px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   border: 1px solid var(--line);
-  background: rgba(8,13,22,.8);
-  backdrop-filter: blur(10px);
+  background: rgba(10,19,39,.72);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
 body.mode-endpoint.tab-drive #view-controls,
 body.mode-endpoint.tab-lease #view-controls { display: flex; }
 #view-controls button {
   min-width: 38px; min-height: 34px;
-  border: 0; border-radius: 999px; background: transparent; color: var(--ink);
+  border: 0; border-radius: var(--r-pill); background: transparent; color: var(--ink);
   font-size: 15px;
 }
-#view-name { font-size: 12px; font-weight: 700; color: var(--muted); min-width: 34px; }
+#view-name { font-size: 12px; font-weight: 800; letter-spacing: -.02em; color: var(--muted); min-width: 34px; }
 
 .grabbed {
   position: absolute; left: 8px; bottom: 8px;
-  padding: 6px 11px;
-  border-radius: 999px;
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
   border: 1px solid var(--line);
-  background: rgba(17,23,34,.92);
-  font-size: 12px; color: var(--muted);
+  background: rgba(20,35,84,.92);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  font-size: 12px; font-weight: 600; color: var(--muted);
   pointer-events: none;
 }
 .grabbed b { color: var(--ink); }
@@ -297,10 +337,10 @@ body.unknown-pose #view-pane::after {
   position: absolute; left: 50%; top: 50%;
   transform: translate(-50%, -50%);
   padding: 8px 14px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   border: 1px solid var(--line);
-  background: rgba(17,23,34,.92);
-  color: var(--muted); font-size: 12px;
+  background: rgba(20,35,84,.92);
+  color: var(--muted); font-size: 12px; font-weight: 600;
   pointer-events: none;
 }
 
@@ -312,13 +352,13 @@ body.unknown-pose #view-pane::after {
   display: grid;
   grid-template-columns: 78px 1fr auto;
   align-items: center; gap: 8px;
-  padding: 7px 9px;
-  border: 1px solid var(--line); border-radius: 11px;
+  padding: 8px 11px;
+  border: 1px solid var(--line); border-radius: var(--r-box);
   background: var(--panel);
 }
-.reading-row .name { font-size: 12px; color: var(--muted); }
-.reading-row .bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.08); overflow: hidden; }
-.reading-row .bar i { display: block; height: 100%; width: 0; background: var(--green); transition: width .12s linear; }
+.reading-row .name { font-size: 12px; font-weight: 700; color: var(--muted); }
+.reading-row .bar { height: 4px; border-radius: var(--r-pill); background: rgba(144,175,255,.14); overflow: hidden; }
+.reading-row .bar i { display: block; height: 100%; border-radius: var(--r-pill); width: 0; background: var(--green); transition: width .12s linear; }
 .reading-row.hot .bar i { background: var(--amber); }
 .reading-row.tripped { border-color: rgba(255,112,122,.5); }
 .reading-row.tripped .bar i { background: var(--red); }
@@ -333,9 +373,9 @@ body.unknown-pose #view-pane::after {
   margin-top: 10px; padding: 9px 12px;
   min-height: var(--touch);
   align-content: center;
-  border: 1px solid var(--line); border-radius: 12px;
+  border: 1px solid var(--line); border-radius: var(--r-card);
   background: var(--panel);
-  color: var(--ink); font-size: 13px; font-weight: 600; text-decoration: none;
+  color: var(--ink); font-size: 13px; font-weight: 800; letter-spacing: -.02em; text-decoration: none;
 }
 .console-link small { color: var(--muted); font-size: 11px; font-weight: 400; }
 
@@ -346,7 +386,7 @@ body.unknown-pose #view-pane::after {
   gap: 4px;
   padding: 6px max(10px, var(--safe-r)) 6px max(10px, var(--safe-l));
   border-top: 1px solid var(--line);
-  background: #080d16;
+  background: var(--navy);
   /* 조작판이 화면의 절반을 넘지 않게 한다. 넘으면 3D가 눌려 팔이 손톱만 해지는데,
      그 화면에서는 무엇을 끌고 있는지 알 수 없다. */
   max-height: 46dvh;
@@ -360,8 +400,8 @@ body.unknown-pose #view-pane::after {
 #fold {
   flex: none;
   width: 40px; min-height: 34px;
-  border: 0; border-radius: 10px;
-  background: rgba(255,255,255,.06); color: var(--muted);
+  border: 0; border-radius: var(--r-pill);
+  background: rgba(144,175,255,.10); color: var(--muted);
   font-size: 13px;
 }
 body.folded #joint-controls,
@@ -370,12 +410,13 @@ body.folded #endpoint-controls { display: none; }
 body.tab-camera #panel,
 body.tab-status #panel { display: none; }
 
-.mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border-radius: 11px; background: rgba(255,255,255,.06); }
+.mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border-radius: var(--r-pill); background: rgba(144,175,255,.10); }
 .seg {
-  min-height: 30px; border: 0; border-radius: 8px;
-  background: transparent; color: var(--muted); font-weight: 700; font-size: 13px;
+  min-height: 30px; border: 0; border-radius: var(--r-pill);
+  background: transparent; color: var(--muted); font-weight: 800; font-size: 13px; letter-spacing: -.02em;
+  transition: background 200ms cubic-bezier(.2,.8,.2,1), color 200ms cubic-bezier(.2,.8,.2,1);
 }
-.seg.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+.seg.on { background: var(--blue); color: #fff; }
 
 body.mode-joint #endpoint-controls { display: none; }
 body.mode-endpoint #joint-controls { display: none; }
@@ -399,24 +440,24 @@ input[type=range] {
   background: transparent; margin: 0;
 }
 input[type=range]::-webkit-slider-runnable-track {
-  height: 5px; border-radius: 3px; background: rgba(255,255,255,.14);
+  height: 5px; border-radius: var(--r-pill); background: rgba(144,175,255,.20);
 }
-input[type=range]::-moz-range-track { height: 5px; border-radius: 3px; background: rgba(255,255,255,.14); }
+input[type=range]::-moz-range-track { height: 5px; border-radius: var(--r-pill); background: rgba(144,175,255,.20); }
 input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
   width: 26px; height: 26px; margin-top: -10.5px;
   border-radius: 50%; background: var(--blue);
-  border: 2px solid #0b101a;
-  box-shadow: 0 1px 4px rgba(0,0,0,.5);
+  border: 2px solid var(--navy);
+  box-shadow: 0 5px 12px rgba(40,85,243,.3);
 }
 input[type=range]::-moz-range-thumb {
   width: 26px; height: 26px; border-radius: 50%;
-  background: var(--blue); border: 2px solid #0b101a;
+  background: var(--blue); border: 2px solid var(--navy);
 }
 .joint.limited input[type=range]::-webkit-slider-thumb { background: var(--amber); }
 .joint.limited input[type=range]::-moz-range-thumb { background: var(--amber); }
-input[type=range]:disabled::-webkit-slider-thumb { background: #46506a; }
-input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
+input[type=range]:disabled::-webkit-slider-thumb { background: #243e78; box-shadow: none; }
+input[type=range]:disabled::-moz-range-thumb { background: #243e78; }
 
 #endpoint-controls { display: grid; gap: 2px; }
 #endpoint-controls .joint { min-height: 32px; }
@@ -434,15 +475,19 @@ input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   border-top: 1px solid var(--line);
-  background: #080d16;
+  background: var(--navy);
   padding: 4px max(4px, var(--safe-r)) calc(6px + var(--safe-b)) max(4px, var(--safe-l));
 }
 .tab {
-  display: grid; justify-items: center; gap: 2px;
+  /* `align-content`가 있어야 한다. 격자의 기본값은 늘어나기(stretch)라, 아이콘을 숨기는
+     가로 화면에서는 글자만 남아 55px 칸의 **맨 위**에 붙었다 — 알약은 아래에 비어 있고
+     이름은 그 위에 떠 있는 모양이 실제로 나왔다. 세로에서도 이 값이 맞는 것이다. */
+  display: grid; justify-items: center; align-content: center; gap: 2px;
   min-height: var(--touch);
   border: 0; background: transparent;
-  color: var(--muted); font-size: 11px; font-weight: 600;
-  border-radius: 10px;
+  color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: -.02em;
+  border-radius: var(--r-pill);
+  transition: background 200ms cubic-bezier(.2,.8,.2,1), color 200ms cubic-bezier(.2,.8,.2,1);
 }
 /* 글리프가 아니라 그림이다.
  *
@@ -454,12 +499,12 @@ input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
 #view-controls button svg { width: 17px; height: 17px; }
 #fold svg { width: 15px; height: 15px; }
 body.folded #fold svg { transform: rotate(180deg); }
-.tab.on { color: var(--ink); background: rgba(255,255,255,.07); }
+.tab.on { color: var(--ink); background: rgba(144,175,255,.12); }
 .tab.alert { color: var(--red); }
 
 /* ─────────────────────────────────────────────── 권한 시트 */
 
-#sheet-scrim { position: fixed; inset: 0; background: rgba(4,7,12,.6); }
+#sheet-scrim { position: fixed; inset: 0; background: rgba(10,19,39,.5); }   /* overlay.backdrop */
 #sheet {
   position: fixed;
   left: 0; right: 0; bottom: 0;
@@ -470,20 +515,22 @@ body.folded #fold svg { transform: rotate(180deg); }
   display: grid; gap: 10px;
   padding: 12px max(12px, var(--safe-r)) calc(12px + var(--safe-b)) max(12px, var(--safe-l));
   border-top: 1px solid var(--line);
-  border-radius: 18px 18px 0 0;
+  border-radius: var(--r-dialog) var(--r-dialog) 0 0;
   background: var(--panel);
+  box-shadow: 0 -18px 44px rgba(10,19,39,.45);
   max-height: 86dvh;
   overflow-y: auto;
 }
 #sheet > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-#sheet > header strong { font-size: 14px; }
-#sheet-close { min-height: 34px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); }
+#sheet > header strong { font-size: 15px; font-weight: 900; letter-spacing: -.04em; }
+#sheet-close { min-height: 34px; padding: 0 13px; border-radius: var(--r-pill); border: 1px solid var(--line); background: transparent; color: var(--muted); font-weight: 700; }
 #lease-idle, #lease-held { display: grid; gap: 9px; }
 .field { display: grid; gap: 5px; font-size: 11px; color: var(--muted); }
+.field { font-weight: 700; }
 .field input {
   min-height: var(--touch);
-  padding: 0 11px; border-radius: 11px; border: 1px solid var(--line);
-  background: #0b101a; color: var(--ink); font-size: 15px;
+  padding: 0 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); font-size: 15px; font-weight: 600;
 }
 /* 확인 체크. 글자가 길어 두 줄이 되므로 체크와 글줄이 위에서 맞아야 읽힌다. */
 .ack {
@@ -492,8 +539,14 @@ body.folded #fold svg { transform: rotate(180deg); }
   min-height: var(--touch); padding: 6px 0;
 }
 .ack input { width: 28px; height: 28px; margin: 0; flex: none; accent-color: var(--blue); }
-button.primary { min-height: var(--touch); border: 0; border-radius: 12px; background: var(--blue); color: #fff; font-weight: 700; }
-button.ghost { min-height: var(--touch); border: 1px solid var(--line); border-radius: 12px; background: transparent; color: var(--muted); }
+/* 알약이 SHAPE의 단추다. "각진 버튼은 SHAPE가 아닙니다." */
+button.primary {
+  min-height: var(--touch); border: 0; border-radius: var(--r-pill);
+  background: var(--blue); color: #fff; font-weight: 800; letter-spacing: -.02em;
+  box-shadow: 0 5px 12px rgba(40,85,243,.3);
+}
+button.primary:disabled { box-shadow: none; }
+button.ghost { min-height: var(--touch); border: 1px solid var(--line); border-radius: var(--r-pill); background: transparent; color: var(--muted); font-weight: 800; }
 button:disabled { opacity: .38; }
 
 #feel { display: grid; gap: 7px; border-top: 1px solid var(--line); padding-top: 10px; }
@@ -501,22 +554,24 @@ button:disabled { opacity: .38; }
 .feel-choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .feel-choices button {
   min-height: var(--touch);
-  border: 1px solid var(--line); border-radius: 11px;
-  background: transparent; color: var(--muted); font-weight: 700; font-size: 13px;
+  border: 1px solid var(--line); border-radius: var(--r-pill);
+  background: transparent; color: var(--muted); font-weight: 800; font-size: 13px; letter-spacing: -.02em;
+  transition: background 200ms cubic-bezier(.2,.8,.2,1), border-color 200ms cubic-bezier(.2,.8,.2,1);
 }
-.feel-choices button.on { background: rgba(95,130,255,.16); border-color: var(--blue); color: var(--ink); }
+.feel-choices button.on { background: rgba(40,85,243,.22); border-color: var(--blue); color: var(--ink); }
 
 dialog {
-  border: 1px solid var(--line); border-radius: 16px;
+  border: 1px solid var(--line); border-radius: var(--r-dialog);
   background: var(--panel); color: var(--ink);
   max-width: min(420px, calc(100vw - 24px));
-  padding: 16px;
+  padding: 18px;
+  box-shadow: 0 35px 100px rgba(12,24,52,.3);   /* shadow.dialog */
 }
-dialog::backdrop { background: rgba(4,7,12,.6); }
-dialog h2 { margin: 0 0 8px; font-size: 15px; }
-dialog p { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+dialog::backdrop { background: rgba(10,19,39,.5); }
+dialog h2 { margin: 0 0 8px; font-size: 16px; font-weight: 900; letter-spacing: -.04em; line-height: 1.25; }
+dialog p { margin: 0 0 10px; font-size: 12px; color: var(--muted); line-height: 1.6; }
 dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 0 0; margin: 0; }
-dialog menu button { border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink); min-height: var(--touch); padding: 0 16px; }
+dialog menu button { border-radius: var(--r-pill); border: 1px solid var(--line); background: transparent; color: var(--ink); min-height: var(--touch); padding: 0 17px; font-weight: 800; }
 dialog menu button.stop { border: 0; }
 
 /* ─────────────────────────────────────────────── 큰 화면
@@ -580,6 +635,125 @@ dialog menu button.stop { border: 0; }
   body.tab-camera #stage, body.tab-status #stage { grid-column: 1 / -1; }
   .joint { min-height: 32px; }
   .hint { display: none; }
+}
+
+/* ─────────────────────────────────────────────── 폰
+ *
+ * **폰에서는 끝점 하나뿐이고, 아래 조작판이 없다.**
+ *
+ * 관절 모드는 관절 여섯 개를 하나씩 골라 각도를 정하는 방식이라 슬라이더 여섯 줄이
+ * 따라온다. 폰에서 그 여섯 줄은 화면의 3분의 1(실측 852px 중 267px)을 가져갔고, 그만큼
+ * 위가 눌려 카메라가 92px짜리 띠가 됐다 — 무엇이 찍히는지 알아볼 수 없는 높이다.
+ * 그런데 폰에서 실제로 쓰는 것은 끝점 조작이다. 손가락 하나로 집게 끝을 끌면 되고,
+ * 그때 사람이 직접 정할 것은 앞뒤·손목 둘·집게 넷뿐이다. 그 넷은 3D 위에 뜨는 타일로
+ * 옮겼다(`#hand`). 그래서 조작판 줄 자체가 없어지고, 그 높이가 카메라로 간다.
+ *
+ * `.phone`은 자바스크립트가 붙인다. 미디어 질의 하나를 두 곳에 적으면 화면과 코드가
+ * 서로 다른 때에 폰이라고 믿게 되고, 그러면 조작판만 사라지고 방식은 관절로 남는 상태가
+ * 생긴다 — 아무것도 만질 수 없는 화면이다. 판정은 `viewer.js`의 `PHONE_QUERY` 한 군데다.
+ *
+ * 이 구획은 위의 반응형 규칙들보다 **뒤에** 있어야 한다. `body.phone.tab-drive #stage`와
+ * `body.mode-endpoint.tab-drive #stage`는 명시도가 같아서, 순서가 뒤집히면 카메라가 다시
+ * 얇아진다. 같은 이유로 맥 전용 구획은 이 아래에 남는다. */
+
+body.phone #panel { display: none !important; }
+
+/* 카메라가 무대의 큰 쪽을 가져간다. 0.75fr : 1fr은 실측 852px 화면에서 카메라 294px,
+   3D 393px이 된다 — 294는 393폭에서 정확히 4:3이라, 640×480 영상이 잘리지 않고 꽉 찬다.
+   `minmax`의 아래쪽은 배너가 떠서 무대가 줄어들 때의 바닥이다. */
+body.phone.tab-drive #stage,
+body.phone.tab-lease #stage { grid-template-rows: minmax(140px, 0.75fr) minmax(0, 1fr); }
+
+/* 조작 방식을 고르는 자리도 없다. 하나뿐이면 고르게 하지 않는다. */
+body.phone .mode-switch { display: none; }
+
+/* 손. 3D 위에 떠 있는 타일 넷. */
+#hand {
+  display: none;
+  position: absolute;
+  left: 8px; right: 8px; bottom: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px;
+  border-radius: var(--r-card);
+  border: 1px solid var(--line);
+  background: rgba(10,19,39,.72);
+  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 12px 38px rgba(10,19,39,.45);   /* shadow.float */
+}
+body.phone.tab-drive #hand,
+body.phone.tab-lease #hand { display: grid; }
+/* 조작할 수 없을 때는 만질 수 없다는 것이 보여야 한다. 눌러도 아무 일이 없는 타일과
+   눌리지 않는 타일은 사람에게 전혀 다른 뜻이다.
+   흐려지는 것은 **타일뿐**이다. 판 전체를 흐리면 3D가 그대로 비쳐 글자와 팔이 겹치고,
+   그러면 "만질 수 없다"가 아니라 "화면이 깨졌다"로 읽힌다. */
+#hand.off .tile { opacity: .45; }
+
+.tile {
+  display: grid; align-content: center; gap: 3px;
+  min-height: 46px; padding: 5px 8px;
+  border: 0; border-radius: var(--r-box);
+  background: rgba(144,175,255,.10);
+  text-align: left;
+  /* 타일 위의 손가락은 화면을 굴리거나 확대하는 것이 아니라 값을 바꾸는 것이다. */
+  touch-action: none;
+  transition: background 200ms cubic-bezier(.2,.8,.2,1);
+}
+.tile-name {
+  font-size: 10px; font-weight: 800; letter-spacing: -.02em; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile-value {
+  font-size: 14px; font-weight: 900; letter-spacing: -.04em; color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile-track {
+  position: relative; display: block; height: 3px; border-radius: var(--r-pill);
+  background: rgba(144,175,255,.18); overflow: hidden;
+}
+/* 채운 것은 **팔이 지금 있는 자리**, 가는 선은 **보내고 있는 목표**다. 둘이 벌어져
+   있으면 팔이 아직 따라가는 중이거나 무엇엔가 막힌 것이고, 하나만 그리면 화면이 실제와
+   다른 말을 하게 된다. */
+.tile-track i { position: absolute; top: 0; bottom: 0; border-radius: var(--r-pill); background: var(--blue); }
+.tile-track u { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: var(--ink); }
+.tile.grabbing { background: rgba(40,85,243,.3); }
+.tile.limited .tile-track i { background: var(--amber); }
+
+/* 알림 알약은 손 위로 올라간다. 손이 가리면 무엇을 끌고 있는지 읽을 수 없다. */
+body.phone.tab-drive .grabbed,
+body.phone.tab-lease .grabbed { bottom: 78px; }
+
+/* 가로로 누운 폰. 조작판이 없으므로 오른쪽 단이 통째로 빈다 — 무대가 그 자리를 가져가고,
+   카메라와 3D는 위아래가 아니라 옆으로 나뉜다. 세로 393px에 둘을 쌓으면 둘 다 못 쓴다. */
+@media (orientation: landscape) and (max-height: 520px) and (max-width: 1000px) {
+  body.phone { grid-template-columns: minmax(0, 1fr); }
+  body.phone #stage { grid-column: 1 / -1; }
+  body.phone.tab-drive #stage,
+  body.phone.tab-lease #stage {
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  body.phone.tab-camera #stage,
+  body.phone.tab-status #stage {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+}
+
+/* ─────────────────────────────────────────────── 움직임을 끄고 싶은 사람
+ *
+ * SHAPE의 규칙이다 — "움직임은 반드시 끌 수 있어야 합니다." 여기서 움직이는 것은 색이
+ * 바뀌는 것뿐이라 크지 않지만, 규칙을 지키는 데 드는 것도 없다.
+ *
+ * 다만 부팅 회전판은 남긴다. 그것은 장식이 아니라 **아직 기다리는 중**이라는 말이고,
+ * 멈춰 있는 회전판은 고장 난 화면처럼 보인다. */
+@media (prefers-reduced-motion: reduce) {
+  *:not(.spinner), *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
 }
 
 /* ─────────────────────────────────────────────── 맥 앱 안에서

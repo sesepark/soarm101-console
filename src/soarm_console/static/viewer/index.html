@@ -7,7 +7,10 @@
        아는 키라 사파리는 콘솔에 오류를 적고 무시하고, 이 화면에는 조작 중에 뜨는 입력칸이
        없어서 얻는 것도 없다. -->
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#070b12">
+  <!-- 아래 탭과 같은 색. 홈 화면 앱에서 화면 맨 아래(홈 인디케이터 자리)는 웹 내용이
+       아니라 이 색으로 칠해지는데, 배경색(#070b12)으로 두었더니 탭 줄 아래에 다른 색
+       띠가 남아 "빈 공간"으로 보였다. -->
+  <meta name="theme-color" content="#080d16">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="SO-ARM">
@@ -81,9 +84,9 @@
 
       <!-- 시점. `끝점` 모드에서는 화면이 고정되므로 여기서만 돌린다. -->
       <div id="view-controls">
-        <button id="turn-left" type="button" aria-label="시점 왼쪽으로 90도">⟲</button>
+        <button id="turn-left" type="button" aria-label="시점 왼쪽으로 90도"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11a7.5 7.5 0 1 1 2.2 5.3"/><path d="M4.5 6.5v4.7h4.7"/></svg></button>
         <button id="view-name" type="button">앞</button>
-        <button id="turn-right" type="button" aria-label="시점 오른쪽으로 90도">⟳</button>
+        <button id="turn-right" type="button" aria-label="시점 오른쪽으로 90도"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 11a7.5 7.5 0 1 0-2.2 5.3"/><path d="M19.5 6.5v4.7h-4.7"/></svg></button>
       </div>
 
       <div id="grabbed" class="grabbed" hidden></div>
@@ -111,7 +114,7 @@
       </div>
       <!-- 조작판을 접으면 3D가 화면을 다 쓴다. 끌어서 조작하는 사람에게는 슬라이더가
            늘 보일 이유가 없고, 폰에서는 그 자리가 곧 3D의 크기다. -->
-      <button id="fold" type="button" aria-label="조작판 접기">▾</button>
+      <button id="fold" type="button" aria-label="조작판 접기"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9.5l6 6 6-6"/></svg></button>
     </div>
 
     <!-- 관절 모드: 관절마다 하나씩. -->
@@ -161,10 +164,10 @@
 
   <!-- ─────────────────────────────── 아래 탭. 엄지가 닿는 자리. -->
   <nav id="tabs" role="tablist">
-    <button class="tab on" type="button" data-tab="drive"><span>✥</span>조작</button>
-    <button class="tab" type="button" data-tab="camera"><span>▣</span>카메라</button>
-    <button class="tab" type="button" data-tab="status"><span>◷</span>상태</button>
-    <button class="tab" type="button" data-tab="lease"><span>⚿</span>권한</button>
+    <button class="tab on" type="button" data-tab="drive"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5v19M2.5 12h19"/><path d="M9.6 5.1L12 2.7l2.4 2.4M9.6 18.9L12 21.3l2.4-2.4M5.1 9.6L2.7 12l2.4 2.4M18.9 9.6L21.3 12l-2.4 2.4"/></svg></span>조작</button>
+    <button class="tab" type="button" data-tab="camera"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="19" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.6"/><path d="M8.5 6l1.4-2.2h4.2L15.5 6"/></svg></span>카메라</button>
+    <button class="tab" type="button" data-tab="status"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18a8.5 8.5 0 1 1 16 0"/><path d="M12 18l4.2-4.6"/><circle cx="12" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg></span>상태</button>
+    <button class="tab" type="button" data-tab="lease"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="9.5" r="4"/><path d="M11.4 12.4L20 21M17.2 18.2l1.8-1.8M14.4 15.4l1.8-1.8"/></svg></span>권한</button>
   </nav>
 
   <dialog id="torque-dialog">

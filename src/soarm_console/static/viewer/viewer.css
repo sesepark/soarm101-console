@@ -55,8 +55,15 @@ body {
   -webkit-text-size-adjust: 100%;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  /* 뷰포트에 **못 박는다.**
+   *
+   * `height: 100dvh`만 두었더니 실물 아이폰의 홈 화면 앱에서 아래쪽에 빈 띠가 남았다.
+   * iOS가 말하는 `dvh`와 실제로 보이는 높이가 늘 같지는 않다. `position: fixed`에
+   * `inset: 0`이면 그 값이 무엇이든 몸통이 정확히 화면을 채운다 — 계산이 필요 없다.
+   * 아래 탭이 언제나 화면 맨 아래에 붙는 것도 이것으로 보장된다. */
+  position: fixed;
+  inset: 0;
   height: 100dvh;
-  /* `dvh`를 모르는 판본을 위한 대비. 먼저 적어 두면 아는 쪽이 덮어쓴다. */
   max-height: 100dvh;
 }
 /* 줄을 **이름으로 못 박는다.**
@@ -96,18 +103,26 @@ a { color: var(--blue); }
 .lines { display: grid; gap: 1px; min-width: 0; }
 .lines strong { font-size: 13px; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lines small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lines strong.live { color: var(--green); }
-.lines strong.warn { color: var(--amber); }
-.lines strong.stop { color: var(--red); }
+/* 상태 색은 **접두사가 붙은 이름**을 쓴다.
+ *
+ * 예전에는 그냥 `live`/`warn`/`stop`이었다. 그런데 정지 단추의 스타일도 `.stop`이라는
+ * 맨 클래스로 적혀 있었고, 팔이 자세 유지에 들어가면 상태 글줄이 `class="stop"`이 되면서
+ * **그 단추 모양을 그대로 뒤집어썼다** — 빨간 알약 안에 13px 흰 글씨가 들어가 실물
+ * 아이폰에서 읽을 수 없는 덩어리로 보였다. 자바스크립트는 맞게 동작하고 있었고 이름
+ * 하나가 겹쳤을 뿐이다. */
+.lines strong.state-live { color: var(--green); }
+.lines strong.state-warn { color: var(--amber); }
+.lines strong.state-stop { color: var(--red); }
 
 /* 정지는 언제나 같은 자리에 있고 언제나 누를 수 있다. 탭을 바꿔도, 권한이 없어도. */
-.stop {
+/* 요소를 함께 적는다. 맨 클래스로 두면 같은 이름을 쓰는 다른 것이 이 모양을 뒤집어쓴다. */
+button.stop {
   flex: none;
   min-width: 72px; min-height: var(--touch);
   border: 0; border-radius: 999px;
   background: var(--red); color: #fff; font-weight: 800;
 }
-.stop:disabled { opacity: .4; }
+button.stop:disabled { opacity: .4; }
 
 /* ─────────────────────────────────────────────── 무대 */
 
@@ -144,8 +159,13 @@ body.tab-status #status-pane { overflow-y: auto; -webkit-overflow-scrolling: tou
 body.tab-lease #stage { grid-template-rows: minmax(72px, 0.28fr) minmax(0, 1fr); }
 body.tab-lease #status-pane { display: none; }
 
-#camera-image { width: 100%; height: 100%; object-fit: cover; display: block; background: #0d121c; }
-#camera-image.down { visibility: hidden; }
+/* 그림이 들어오기 **전까지는 보이지 않는다.**
+ *
+ * 예전에는 실패했을 때만 숨겼는데, 그 사이(주소를 막 걸어 둔 순간, 실패 핸들러가 아직
+ * 돌지 않은 순간)에 사파리가 깨진 그림 아이콘을 그렸다 — 실물 아이폰에서 카메라 자리에
+ * 파란 물음표가 떠 있었다. 들어온 것이 확인됐을 때만 보이는 편이 뒤집기 쉽다. */
+#camera-image { width: 100%; height: 100%; object-fit: cover; display: block; background: #0d121c; visibility: hidden; }
+#camera-image.live { visibility: visible; }
 .pane-note {
   position: absolute; inset: 0;
   display: grid; place-content: center;
@@ -312,7 +332,7 @@ body.unknown-pose #view-pane::after {
 }
 body.folded #joint-controls,
 body.folded #endpoint-controls { display: none; }
-body.folded #fold { transform: rotate(180deg); }
+
 body.tab-camera #panel,
 body.tab-status #panel { display: none; }
 
@@ -381,7 +401,7 @@ input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
   grid-template-columns: repeat(4, 1fr);
   border-top: 1px solid var(--line);
   background: #080d16;
-  padding: 4px max(4px, var(--safe-r)) calc(4px + var(--safe-b)) max(4px, var(--safe-l));
+  padding: 4px max(4px, var(--safe-r)) calc(6px + var(--safe-b)) max(4px, var(--safe-l));
 }
 .tab {
   display: grid; justify-items: center; gap: 2px;
@@ -390,7 +410,16 @@ input[type=range]:disabled::-moz-range-thumb { background: #46506a; }
   color: var(--muted); font-size: 11px; font-weight: 600;
   border-radius: 10px;
 }
-.tab span { font-size: 16px; line-height: 1; }
+/* 글리프가 아니라 그림이다.
+ *
+ * 예전에는 `✥ ▣ ◷ ⚿` 같은 문자를 썼는데, 실물 아이폰에서 `⚿`가 네모 상자로 떨어졌다.
+ * 어느 글꼴에 어느 글리프가 있는지는 기기마다 다르고, 없으면 아이콘 자리에 두부가
+ * 남는다. SVG는 어디서든 같은 것을 그린다. */
+.tab span { display: grid; place-items: center; width: 20px; height: 20px; }
+.tab span svg { width: 20px; height: 20px; }
+#view-controls button svg { width: 17px; height: 17px; }
+#fold svg { width: 15px; height: 15px; }
+body.folded #fold svg { transform: rotate(180deg); }
 .tab.on { color: var(--ink); background: rgba(255,255,255,.07); }
 .tab.alert { color: var(--red); }
 

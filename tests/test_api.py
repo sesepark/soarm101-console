@@ -171,3 +171,54 @@ def test_ui_is_fixed_console_with_capsule_views_and_reference_design_tokens():
     assert 'id="device-status"' not in html
     assert "grid-template-rows:auto minmax(0,1fr)" in css
     assert "log.scrollTop = log.scrollHeight" in js
+
+
+def test_no_style_class_can_be_worn_by_something_it_was_not_meant_for():
+    """상태 이름과 단추 모양이 같은 클래스를 쓰면, 상태가 단추가 된다.
+
+    실물 아이폰에서 팔이 자세 유지에 들어가는 순간 상태 글줄이 **빨간 알약 덩어리**로
+    보였다. 정지 단추의 스타일이 `.stop`이라는 맨 클래스로 적혀 있었고, 상태 글줄도
+    자세 유지일 때 `class="stop"`이 됐기 때문이다. 자바스크립트는 맞게 동작하고 있었고
+    이름 하나가 겹쳤을 뿐이라, 화면을 실제로 보기 전에는 드러나지 않았다.
+
+    두 가지를 잠근다. 단추 스타일은 요소와 함께 적고(`button.stop`), 상태 이름에는
+    접두사를 붙인다(`state-stop`). 둘 중 하나만 있어도 이 사고는 나지 않지만, 둘 다
+    있으면 다음 사람이 어느 쪽 규칙을 몰라도 안전하다.
+    """
+    import re
+
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    css = (static / "viewer.css").read_text(encoding="utf-8")
+    javascript = (static / "viewer.js").read_text(encoding="utf-8")
+
+    # 단추 모양은 요소와 함께 적혀 있어야 한다.
+    assert "button.stop {" in css
+    assert not re.search(r"(?m)^\.stop\s*[,{]", css), "맨 `.stop`은 다른 것이 뒤집어쓸 수 있다"
+
+    # 상태 이름에는 접두사가 붙는다.
+    assert "line.className = kind ? `state-${kind}` : ''" in javascript
+    for kind in ("live", "warn", "stop"):
+        assert f".lines strong.state-{kind}" in css
+
+    # 자바스크립트가 붙이는 이름 가운데 CSS의 맨 클래스와 겹치는 것이 없어야 한다.
+    applied = set(re.findall(r"classList\.(?:add|toggle|remove)\('([a-z-]+)'", javascript))
+    bare = set(re.findall(r"(?m)^\.([a-z-]+)\s*[,{]", css))
+    assert not (applied & bare), f"겹치는 이름: {sorted(applied & bare)}"
+
+
+def test_the_phone_screen_is_pinned_to_the_viewport():
+    """홈 화면 앱에서 아래 탭 밑에 빈 띠가 남지 않아야 한다.
+
+    `height: 100dvh`만 두었더니 실물 아이폰에서 탭 줄 아래로 빈 공간이 남았다. iOS가
+    말하는 `dvh`와 실제로 보이는 높이가 늘 같지는 않다. `position: fixed`에 `inset: 0`
+    이면 그 값이 무엇이든 몸통이 정확히 화면을 채운다.
+
+    화면 맨 아래(홈 인디케이터 자리)는 웹 내용이 아니라 `theme-color`로 칠해지므로,
+    그 색이 아래 탭과 같아야 이어져 보인다.
+    """
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    css = (static / "viewer.css").read_text(encoding="utf-8")
+    html = (static / "index.html").read_text(encoding="utf-8")
+    assert "position: fixed;\n  inset: 0;" in css
+    assert 'content="#080d16"' in html, "theme-color가 아래 탭 색과 같아야 한다"
+    assert "#tabs {" in css and "background: #080d16" in css

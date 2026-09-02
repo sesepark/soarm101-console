@@ -69,9 +69,37 @@ def test_the_server_address_leads_to_the_screen_that_can_drive_the_arm():
     좁은 화면은 조작 화면으로 보내고, 데스크톱에는 링크를 둔다. 사람이 친 주소를 말없이
     바꾸는 것은 데스크톱에서는 놀라운 일이라 그쪽은 링크로 남긴다.
     """
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app
+
+    client = TestClient(app, follow_redirects=False)
+    phone = {"user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1"}
+    pad = {"user-agent": "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1"}
+    mac = {"user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/18.0 Safari/605.1.15"}
+
+    # **판정은 서버가 한다.** 화면 안의 자바스크립트로도 같은 일을 하지만, 옛 사본이
+    # 캐시에 남아 있으면 그쪽은 실행되지 않는다. 실제로 고친 뒤에도 폰에서 조작 화면이
+    # 뜨지 않는 일이 있었고, 그때 서버는 새 파일을 내주고 있었다.
+    for agent in (phone, pad):
+        answer = client.get("/", headers=agent)
+        assert answer.status_code == 307, answer.status_code
+        assert answer.headers["location"] == "/viewer/?host=web"
+    # 돌아올 길은 남는다.
+    assert client.get("/?console=1", headers=phone).status_code == 200
+    # 데스크톱의 주소는 말없이 바뀌지 않는다.
+    assert client.get("/", headers=mac).status_code == 200
+
+    # 화면을 이루는 것은 캐시에서 살아 돌아오지 않는다. 옛 화면이 새 서버의 거절 코드를
+    # 모르면 팔이 왜 안 움직이는지 아무 말도 하지 못한다.
+    for path in ("/", "/viewer/", "/static/viewer/viewer.js", "/static/viewer/viewer.css"):
+        answer = client.get(path, headers=mac)
+        assert answer.status_code == 200, path
+        assert "no-store" in answer.headers.get("cache-control", ""), path
+
     static = Path(__file__).parents[1] / "src/soarm_console/static"
     console = (static / "index.html").read_text(encoding="utf-8")
-    # 폰은 보내고, `?console=1`로 남을 수 있다.
+    # 자바스크립트 쪽 그물도 그대로 둔다. 서버가 못 알아본 기기를 여기서 잡는다.
     assert "location.replace('/viewer/?host=web')" in console
     assert "console" in console and "pointer: coarse" in console
     # 데스크톱에는 눈에 보이는 길.

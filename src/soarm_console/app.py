@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import version
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -48,6 +49,40 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="SO-ARM101 Console", version="0.1.0", lifespan=lifespan)
+
+
+#: 폰·태블릿에서 온 요청인가.
+#:
+#: 정교한 기기 판별이 아니라 "이 화면을 여기서 쓸 수 있는가"만 묻는 것이다. 콘솔은 3열
+#: 데스크톱 레이아웃이고 3D 조작이 아예 없으므로, 손가락으로 온 사람에게는 어느 쪽이든
+#: 조작 화면이 맞다.
+_TOUCH_AGENT = re.compile(r"iPhone|iPad|iPod|Android|Mobile|Silk|Kindle", re.IGNORECASE)
+
+
+@app.middleware("http")
+async def no_stale_screens(request: Request, call_next):
+    """조작 화면은 캐시에서 살아 돌아오지 않는다.
+
+    옛 화면이 새 서버의 거절 코드나 새 상태 필드를 모르면, 팔이 왜 안 움직이는지 아무
+    말도 하지 못한다. 실제로 폰에서 `/`를 열었는데 리다이렉트가 걸리지 않는 일이 있었고,
+    서버는 새 파일을 내주고 있었으므로 남은 설명은 사파리가 들고 있던 옛 사본이었다.
+
+    화면을 이루는 것만 막는다 — HTML·스크립트·스타일·매니페스트. 카메라 스트림과 STL
+    메시는 바뀌지 않고 무거우므로 그대로 둔다. 스크립트가 빠지면 반쪽짜리가 된다: 옛
+    `viewer.js`가 새 서버에 붙으면 화면은 멀쩡해 보이는데 동작만 옛것이다.
+    """
+    response = await call_next(request)
+    kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    stale_is_dangerous = (
+        kind in {"text/html", "text/css", "application/manifest+json"}
+        or "javascript" in kind
+    )
+    if stale_is_dangerous:
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # 3D 뷰어는 한 번만 만들고 서버가 서빙한다. 맥 앱이 `WKWebView`로 품는 화면과 폰의
 # 조작 화면이 같은 파일을 쓴다 — 구현이 둘이면 두 기기의 동작이 반드시 어긋난다.
@@ -105,8 +140,29 @@ def device_status(path: str) -> dict[str, object]:
     }
 
 
-@app.get("/")
-def index() -> FileResponse:
+# `response_model=None`: 돌려주는 것이 파일일 수도 리다이렉트일 수도 있는데, FastAPI는
+# 그 합집합으로 응답 모델을 만들려다 실패한다(`Invalid args for response field`). 여기서
+# 만들 스키마가 없다는 것을 분명히 적어 둔다.
+@app.get("/", response_model=None)
+def index(request: Request) -> FileResponse | RedirectResponse:
+    """콘솔 첫 화면. **손가락으로 온 사람은 조작 화면으로 보낸다.**
+
+    이 페이지는 3열 데스크톱 콘솔이고 3D 조작이 아예 없다. 그런데 서버 주소를 폰에서
+    그냥 열면 여기로 온다 — 사용자가 실제로 여기 도착해서 "3D 조작이 구현이 안 되어
+    있는데?"라고 물었다. 이 화면이 조작 화면의 존재를 한 글자도 말하지 않았으니 맞는
+    말이었다.
+
+    판정을 **서버에서** 한다. 화면 안의 자바스크립트로도 같은 일을 하지만 그쪽은 옛
+    사본이 캐시에 남아 있으면 실행되지 않는다. 실제로 고친 뒤에도 폰에서 조작 화면이
+    뜨지 않는 일이 있었고, 서버는 새 파일을 내주고 있었다. 헤더는 캐시를 타지 않는다.
+
+    `?console=1`이면 폰에서도 이 화면을 그대로 본다. 되돌아올 길이 없으면 전체 콘솔은
+    주소를 아는 사람만 볼 수 있게 된다.
+    """
+    if "console" not in request.query_params and _TOUCH_AGENT.search(
+        request.headers.get("user-agent", "")
+    ):
+        return RedirectResponse("/viewer/?host=web", status_code=307)
     return FileResponse(static_dir / "index.html")
 
 

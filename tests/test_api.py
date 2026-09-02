@@ -222,3 +222,30 @@ def test_the_phone_screen_is_pinned_to_the_viewport():
     assert "position: fixed;\n  inset: 0;" in css
     assert 'content="#080d16"' in html, "theme-color가 아래 탭 색과 같아야 한다"
     assert "#tabs {" in css and "background: #080d16" in css
+
+
+def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
+    """iOS는 **홈 화면에 추가하는 순간 열려 있던 페이지**의 메타를 저장한다.
+
+    조작 화면에는 `viewport-fit=cover`와 `apple-mobile-web-app-capable`이 있었지만 콘솔
+    페이지에는 없었다. 사람이 치는 주소는 서버 루트이므로 거기서 추가하는 것이 자연스러운데,
+    그렇게 저장된 앱은 안전 영역(위의 상태 표시줄, 아래의 홈 인디케이터)을 **뷰포트 밖으로**
+    두고 열린다. 그래서 아래 탭 밑에 쓸 수 없는 띠가 남았다 — 실물 아이폰에서 본 것이다.
+
+    두 페이지가 같은 메타를 가져야 어느 쪽에서 추가하든 같은 앱이 된다.
+    """
+    static = Path(__file__).parents[1] / "src/soarm_console/static"
+    console = (static / "index.html").read_text(encoding="utf-8")
+    viewer = (static / "viewer/index.html").read_text(encoding="utf-8")
+
+    for page, label in ((console, "콘솔"), (viewer, "조작 화면")):
+        assert "viewport-fit=cover" in page, f"{label}: 안전 영역까지 그려야 한다"
+        assert 'name="apple-mobile-web-app-capable" content="yes"' in page, label
+        assert 'rel="manifest"' in page, label
+        assert 'rel="apple-touch-icon"' in page, label
+        assert 'name="theme-color" content="#080d16"' in page, label
+
+    # 뷰포트 밖으로 남는 띠는 머리글·아래 탭과 같은 색이어야 한다. 그러지 않으면 그 띠가
+    # "빈 자리"로 보인다.
+    css = (static / "viewer/viewer.css").read_text(encoding="utf-8")
+    assert "html { background: #080d16; }" in css

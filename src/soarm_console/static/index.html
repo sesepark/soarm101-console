@@ -2,7 +2,20 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- **조작 화면과 같은 웹앱 메타를 여기에도 둔다.**
+       홈 화면에 추가할 때 iOS는 **그 순간 열려 있던 페이지**의 메타를 저장한다. 사람이
+       치는 주소는 서버 루트이므로 여기서 추가하는 것이 자연스러운데, 이 페이지에는
+       `viewport-fit=cover`도 `apple-mobile-web-app-capable`도 없었다. 그렇게 저장된
+       앱은 안전 영역(위의 상태 표시줄, 아래의 홈 인디케이터)을 **뷰포트 밖으로** 두고
+       열리고, 그래서 아래 탭 밑에 쓸 수 없는 띠가 남았다. 실물 아이폰에서 그 화면을 봤다. -->
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#080d16">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="SO-ARM">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/viewer/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/viewer/icon-180.png">
   <title>SO-ARM101 Console</title>
   <link rel="stylesheet" href="/static/app.css">
   <script>

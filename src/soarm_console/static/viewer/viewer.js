@@ -953,11 +953,29 @@ function paintGeometry() {
     matchMedia('(display-mode: standalone)').matches;
   const view = `${window.innerWidth}×${window.innerHeight}`;
   const screenSize = `${Math.round(screen.width)}×${Math.round(screen.height)}`;
-  const letterboxed = screen.height - window.innerHeight - top - bottom > 8;
-  el('geometry').textContent =
+  // 배치가 화면을 채우고 있는가. 아래 탭의 바닥이 웹 영역의 바닥과 같아야 한다.
+  const tabs = el('tabs').getBoundingClientRect();
+  const unfilled = Math.max(0, Math.round(window.innerHeight - tabs.bottom));
+  // 웹 영역이 화면보다 작은가. 그 차이는 **문서 바깥**이라 CSS로 닿을 수 없다.
+  const outside = Math.max(0, Math.round(screen.height - window.innerHeight));
+
+  const lines = [
     `화면 ${screenSize} · 웹 영역 ${view} · 안전 영역 위 ${top} 아래 ${bottom}` +
-    ` · ${standalone ? '홈 화면 앱' : '브라우저'}` +
-    (letterboxed ? ' · ⚠︎ 웹 영역이 화면보다 작습니다' : '');
+      ` · ${standalone ? '홈 화면 앱' : '브라우저'}`,
+  ];
+  if (unfilled > 2) {
+    lines.push(`⚠︎ 배치가 아래로 ${unfilled}pt 덜 찼습니다 — 이건 이 화면의 CSS 문제입니다.`);
+  }
+  if (standalone && outside > 2) {
+    // 여기까지 오면 화면 안쪽은 다 채운 것이고, 남는 띠는 iOS가 칠하는 자리다.
+    // CSS로는 덮을 수 없고, `viewport-fit=cover`가 실제로 걸려야 사라진다 — 그 값은
+    // **홈 화면에 추가한 순간**의 페이지에서 저장되므로 아이콘을 다시 만들어야 한다.
+    lines.push(
+      `웹 영역이 화면보다 ${outside}pt 작습니다. 그 띠는 문서 바깥이라 CSS로 덮을 수 ` +
+        '없습니다 — 홈 화면 아이콘을 지우고 다시 추가하면 사라집니다.'
+    );
+  }
+  el('geometry').textContent = lines.join(' ');
 }
 
 // ---------------------------------------------------------------- 탭과 모드

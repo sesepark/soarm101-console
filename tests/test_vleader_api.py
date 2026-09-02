@@ -495,6 +495,14 @@ def test_the_app_can_choose_a_feel_without_guessing_numbers(console):
     ok = motion(client, "POST", "/api/vleader/policy", json={"profile": "gentle"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["profile"] == "gentle"
+    # **쓰기의 답이 읽기의 답과 같은 모양이어야 한다.**
+    #
+    # POST가 `policy`만 돌려주던 시절, 화면은 그 답을 그대로 받아 들면서 난간이 비었고
+    # "난간이 있으면 다 읽은 것"이라는 판단이 뒤집혀 영영 `읽는 중`에 머물렀다.
+    # 사용자가 `보통`에서 `빠름`으로 바꿨을 때 실제로 그렇게 됐다.
+    assert set(before) <= set(ok.json()), "쓰기의 답에 읽기의 답이 다 들어 있어야 한다"
+    assert ok.json()["tunable"] == before["tunable"]
+    assert [item["name"] for item in ok.json()["profiles"]] == ["gentle", "normal", "quick"]
     assert ok.json()["policy"]["max_deg_per_s"] == 45.0
     assert ok.json()["policy"]["lead_deg"] == 8.0
 

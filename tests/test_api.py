@@ -59,6 +59,28 @@ def test_the_phone_url_leads_to_the_one_screen_that_can_do_everything():
     assert response.headers["location"] == "/viewer/?host=web"
 
 
+def test_the_server_address_leads_to_the_screen_that_can_drive_the_arm():
+    """서버 주소를 그냥 열었을 때 조작할 수 있는 화면에 닿아야 한다.
+
+    `/`는 3열 데스크톱 콘솔이고 **3D 조작이 아예 없다.** 그런데 폰에서 서버 주소를 열면
+    거기로 온다 — 사용자가 실제로 그 화면에 도착해서 "3D 조작이 구현이 안 되어 있는데?"
+    라고 물었다. 조작 화면이 있다는 것을 그 화면이 말해 주지 않았으니 맞는 말이었다.
+
+    좁은 화면은 조작 화면으로 보내고, 데스크톱에는 링크를 둔다. 사람이 친 주소를 말없이
+    바꾸는 것은 데스크톱에서는 놀라운 일이라 그쪽은 링크로 남긴다.
+    """
+    static = Path(__file__).parents[1] / "src/soarm_console/static"
+    console = (static / "index.html").read_text(encoding="utf-8")
+    # 폰은 보내고, `?console=1`로 남을 수 있다.
+    assert "location.replace('/viewer/?host=web')" in console
+    assert "console" in console and "pointer: coarse" in console
+    # 데스크톱에는 눈에 보이는 길.
+    assert 'href="/viewer/?host=web"' in console
+    # 그리고 돌아오는 길.
+    viewer = (static / "viewer/index.html").read_text(encoding="utf-8")
+    assert 'href="/?console=1"' in viewer
+
+
 def test_the_phone_screen_fits_one_view_and_can_be_installed():
     """폰에서 조작할 때 필요한 것이 한 화면에 있어야 한다.
 

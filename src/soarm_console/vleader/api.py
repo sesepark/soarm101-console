@@ -548,8 +548,17 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
             owner.hold(Trip.LEASE_RELEASED)
         return {"released": released}
 
-    @router.get("/policy")
-    def read_policy() -> dict[str, object]:
+    def policy_document() -> dict[str, object]:
+        """읽기와 쓰기가 **같은 문서**를 돌려준다.
+
+        POST가 `policy`만 돌려주던 시절에 앱이 걸렸다. 화면이 답을 그대로 받아 들면서
+        난간(`tunable`)이 비었고, "난간이 있으면 다 읽은 것"으로 판단하던 화면은 조작감을
+        바꾼 뒤 영영 `서버에서 지금 값을 읽는 중입니다`에 머물렀다. 사용자가 `보통`에서
+        `빠름`으로 바꿨을 때 실제로 그렇게 됐다.
+
+        쓰기의 답이 읽기의 답과 다르면, 쓰는 쪽은 언제나 한 번 더 읽어야 한다는 규칙이
+        생긴다. 그런 규칙은 어딘가에서 반드시 잊힌다.
+        """
         return {
             "policy": vleader.policy.as_dict(),
             # 지금 값이 어느 프로필인가. 손으로 하나만 바꿔 두었으면 `null`이고, 화면은
@@ -570,6 +579,10 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
                 for name, (low, high, cast, variable) in TUNABLES.items()
             },
         }
+
+    @router.get("/policy")
+    def read_policy() -> dict[str, object]:
+        return policy_document()
 
     @router.post("/policy")
     def write_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
@@ -610,12 +623,7 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
         if applied:
             vleader.retune(applied)
         problem = _persist_tunables(applied, profile_of(vleader.policy))
-        return {
-            "policy": vleader.policy.as_dict(),
-            "profile": profile_of(vleader.policy),
-            "applied": applied,
-            "save_error": problem,
-        }
+        return {**policy_document(), "applied": applied, "save_error": problem}
 
     @router.post("/hold")
     def hold() -> dict[str, object]:

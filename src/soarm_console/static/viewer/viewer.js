@@ -778,6 +778,13 @@ function paintState() {
   const banner = el('banner');
   if (!OWNS_BANNER) {
     banner.hidden = true;
+  } else if (showReject.timer) {
+    // 방금 거절당한 이유가 떠 있는 동안에는 덮지 않는다.
+    //
+    // 예전에는 여기서 무조건 `fault.message`로 덮어썼다. 그런데 텔레메트리는 30Hz로
+    // 들어오므로, 거절 문구는 쓰이자마자 지워졌다 — 화면에서는 **아무 일도 일어나지
+    // 않는 것처럼** 보인다. `확인하고 계속`을 눌렀는데 배너가 그대로인 것이 그것이다.
+    // 실패는 조용히 지나가면 안 된다.
   } else if (fault) {
     banner.hidden = false;
     banner.classList.toggle('warn', telemetry.state !== 'FAULT');
@@ -917,11 +924,40 @@ function paintReadings() {
     cell.className =
       'figures' + (reading.temperature >= hot ? ' bad' : reading.temperature >= warm || load > 0.6 ? ' warm' : '');
   }
+  paintGeometry();
   el('policy-line').textContent = policy.max_deg_per_s
     ? `최대 속도 ${Math.round(policy.max_deg_per_s)}°/s · 막혔을 때 미는 거리 ${policy.lead_deg}° · ` +
       `${policy.following_error_deg}° 벌어진 채 ${policy.following_error_ms}ms 서 있으면 멈춥니다. ` +
       `속도는 서보 자신이 지키고, 판정은 전부 서버가 합니다.`
     : '';
+}
+
+/** 이 기기가 화면을 어떻게 쓰고 있는가.
+ *
+ * 홈 화면 앱에서 아래쪽에 띠가 남는 일이 있었고, 그것이 **배치가 덜 채운 것**인지
+ * **웹 영역 자체가 화면보다 작은 것**인지 구별할 방법이 없었다. 둘은 고치는 자리가
+ * 전혀 다르다 — 앞은 CSS이고 뒤는 CSS로 닿을 수 없다. 기기를 들고 있지 않은 사람이
+ * 그것을 알려면 화면이 스스로 말해야 한다. */
+function paintGeometry() {
+  const probe = document.createElement('div');
+  probe.style.cssText =
+    'position:fixed;top:0;left:0;height:env(safe-area-inset-top);width:env(safe-area-inset-left);visibility:hidden';
+  document.body.append(probe);
+  const top = Math.round(parseFloat(getComputedStyle(probe).height)) || 0;
+  probe.style.height = 'env(safe-area-inset-bottom)';
+  const bottom = Math.round(parseFloat(getComputedStyle(probe).height)) || 0;
+  probe.remove();
+
+  const standalone =
+    window.navigator.standalone === true ||
+    matchMedia('(display-mode: standalone)').matches;
+  const view = `${window.innerWidth}×${window.innerHeight}`;
+  const screenSize = `${Math.round(screen.width)}×${Math.round(screen.height)}`;
+  const letterboxed = screen.height - window.innerHeight - top - bottom > 8;
+  el('geometry').textContent =
+    `화면 ${screenSize} · 웹 영역 ${view} · 안전 영역 위 ${top} 아래 ${bottom}` +
+    ` · ${standalone ? '홈 화면 앱' : '브라우저'}` +
+    (letterboxed ? ' · ⚠︎ 웹 영역이 화면보다 작습니다' : '');
 }
 
 // ---------------------------------------------------------------- 탭과 모드
@@ -1075,12 +1111,22 @@ el('take').addEventListener('click', async () => {
 el('give-back').addEventListener('click', () => giveBack());
 el('hold').addEventListener('click', holdNow);
 el('banner-resume').addEventListener('click', async () => {
+  // 멈춘 것을 푸는 것도 **조작**이라 토큰이 필요하다. 없으면 서버는 401로 답하고,
+  // 그 답은 배너에 잠깐 떴다가 텔레메트리에 덮여 사라졌다 — 누른 사람에게는 버튼이
+  // 고장 난 것으로 보인다. 보내기 전에 여기서 먼저 말하고, 넣을 자리를 열어 준다.
+  if (!el('token').value.trim()) {
+    showReject({ message: '조작 토큰이 있어야 멈춘 것을 풀 수 있습니다. 권한 탭에서 넣어 주세요.' });
+    setTab('lease');
+    return;
+  }
+  el('banner-resume').disabled = true;
   try {
     await post('/api/vleader/resume');
     target = { ...present };
   } catch (error) {
     showReject({ message: String(error.message || error) });
   }
+  el('banner-resume').disabled = false;
 });
 el('release-torque').addEventListener('click', () => el('torque-dialog').showModal());
 el('torque-dialog').addEventListener('close', async () => {

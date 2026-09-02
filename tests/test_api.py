@@ -219,7 +219,24 @@ def test_the_phone_screen_is_pinned_to_the_viewport():
     static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
     css = (static / "viewer.css").read_text(encoding="utf-8")
     html = (static / "index.html").read_text(encoding="utf-8")
-    assert "position: fixed;\n  inset: 0;" in css
+    import re
+
+    body = re.search(r"(?m)^body \{(.*?)^\}", css, re.S)
+    assert body, "body 규칙을 찾지 못했다"
+    rule = body.group(1)
+    assert "position: fixed;" in rule and "inset: 0;" in rule
+
+    # **높이를 함께 적으면 `inset: 0`이 아무 일도 하지 않는다.**
+    #
+    # `position: fixed`에 `inset: 0`이면 상자가 위아래로 늘어나 뷰포트를 정확히 채운다.
+    # 그런데 `height: 100dvh`를 같이 적어 두면 그 높이가 이기고, 상자는 위에 붙은 채
+    # 100dvh만큼만 차지한다. iOS 홈 화면 앱에서 `dvh`가 실제 보이는 높이보다 작으면
+    # 그 차이가 그대로 아래쪽 빈 띠가 된다 — 실물에서 정확히 그랬고, `inset: 0`을 넣고도
+    # 높이를 지우지 않아 고쳤다고 생각한 것이 아무 일도 하지 않고 있었다.
+    assert not re.search(r"(?m)^\s*(max-)?height\s*:", rule), (
+        "body에 높이를 적으면 inset이 무시된다: " + rule
+    )
+
     assert 'content="#080d16"' in html, "theme-color가 아래 탭 색과 같아야 한다"
     assert "#tabs {" in css and "background: #080d16" in css
 

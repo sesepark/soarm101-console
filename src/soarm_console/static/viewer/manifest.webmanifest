@@ -8,12 +8,32 @@
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#070b12",
-  "theme_color": "#070b12",
+  "background_color": "#080d16",
+  "theme_color": "#080d16",
   "icons": [
-    { "src": "/viewer/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
-    { "src": "/viewer/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "/viewer/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "/viewer/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "/viewer/icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/viewer/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/viewer/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/viewer/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ]
 }

@@ -240,6 +240,47 @@ def test_the_phone_screen_is_pinned_to_the_viewport():
     assert 'content="#080d16"' in html, "theme-color가 아래 탭 색과 같아야 한다"
     assert "#tabs {" in css and "background: #080d16" in css
 
+    # **설치된 앱은 매니페스트의 색을 쓴다.** 메타만 고치면 브라우저에서만 맞고 홈 화면
+    # 앱에서는 그대로다 — 화면 맨 아래 띠가 탭 줄과 다른 색으로 남는다.
+    import json as _json
+
+    manifest = _json.loads((static / "manifest.webmanifest").read_text(encoding="utf-8"))
+    assert manifest["theme_color"] == "#080d16"
+    assert manifest["background_color"] == "#080d16"
+
+
+def test_a_refused_resume_says_why_instead_of_looking_broken():
+    """`확인하고 계속`이 실패하면 그 이유가 화면에 남아야 한다.
+
+    멈춘 것을 푸는 것도 조작이라 토큰이 필요하다. 없으면 서버는 401로 답하는데, 그 답을
+    배너에 쓰자마자 30Hz로 들어오는 텔레메트리가 `fault.message`로 덮어썼다. 화면에서는
+    **아무 일도 일어나지 않는 것처럼** 보인다 — 사용자가 "버튼 눌러도 계속 남아있다"고
+    한 것이 그것이다. 실패는 조용히 지나가면 안 된다.
+    """
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    javascript = (static / "viewer.js").read_text(encoding="utf-8")
+
+    # 거절이 떠 있는 동안에는 고장 문구가 덮지 않는다.
+    assert "} else if (showReject.timer) {" in javascript
+    # 그리고 보내기 전에 토큰이 없다는 것을 먼저 말한다.
+    assert "조작 토큰이 있어야 멈춘 것을 풀 수 있습니다" in javascript
+
+
+def test_the_screen_can_say_how_the_device_is_using_it():
+    """아래쪽에 띠가 남을 때, 배치가 덜 채운 것인지 웹 영역이 작은 것인지 갈라야 한다.
+
+    둘은 고치는 자리가 전혀 다르다 — 앞은 CSS이고 뒤는 CSS로 닿을 수 없다(메타와
+    매니페스트의 일이다). 기기를 들고 있지 않은 사람이 그것을 알려면 화면이 스스로
+    말해야 한다.
+    """
+    static = Path(__file__).parents[1] / "src/soarm_console/static/viewer"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    javascript = (static / "viewer.js").read_text(encoding="utf-8")
+    assert 'id="geometry"' in html
+    assert "safe-area-inset-bottom" in javascript
+    assert "display-mode: standalone" in javascript
+    assert "웹 영역이 화면보다 작습니다" in javascript
+
 
 def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
     """iOS는 **홈 화면에 추가하는 순간 열려 있던 페이지**의 메타를 저장한다.

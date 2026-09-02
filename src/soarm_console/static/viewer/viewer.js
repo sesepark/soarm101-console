@@ -712,7 +712,9 @@ function holdNow() {
 function setStateLine(text, kind = '') {
   const line = el('state-line');
   line.textContent = text;
-  line.className = kind;
+  // 접두사를 붙인다. 맨 이름(`stop`)을 쓰던 때에는 정지 단추의 `.stop` 스타일을 그대로
+  // 뒤집어써서, 자세 유지에 들어가는 순간 상태 글줄이 빨간 알약 덩어리가 됐다.
+  line.className = kind ? `state-${kind}` : '';
 }
 
 /** 이 페이지가 배너를 그려도 되는가. `host=native`에서는 맥 앱이 같은 배너를 자기 화면에
@@ -1166,6 +1168,9 @@ function paintProfiles() {
 function openCamera() {
   if (HOST === 'native') return;
   const image = el('camera-image');
+  // 새 주소를 걸기 전에 감춘다. 그러지 않으면 다음 그림이 올 때까지 앞 카메라의 마지막
+  // 장면이 남아, 화면이 다른 카메라를 보고 있다고 말하게 된다.
+  image.classList.remove('live');
   image.src = `/api/cameras/${selectedCamera}.mjpg?v=${Date.now()}`;
   for (const chip of document.querySelectorAll('.chip')) {
     chip.classList.toggle('on', chip.dataset.camera === selectedCamera);
@@ -1176,13 +1181,13 @@ function startCameras() {
   if (HOST === 'native') return;
   const image = el('camera-image');
   image.addEventListener('load', () => {
-    image.classList.remove('down');
+    image.classList.add('live');
     el('camera-down').hidden = true;
   });
   image.addEventListener('error', () => {
     // 깨진 이미지 아이콘을 남겨 두지 않는다. 카메라가 없는 것과 화면이 고장 난 것은
     // 다른 일인데, 그 아이콘은 둘을 같아 보이게 한다.
-    image.classList.add('down');
+    image.classList.remove('live');
     el('camera-down').hidden = false;
     setTimeout(openCamera, 3000);
   });

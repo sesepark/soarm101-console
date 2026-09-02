@@ -59,6 +59,21 @@ body {
   /* `dvh`를 모르는 판본을 위한 대비. 먼저 적어 두면 아는 쪽이 덮어쓴다. */
   max-height: 100dvh;
 }
+/* 줄을 **이름으로 못 박는다.**
+ *
+ * 격자 줄을 순서에만 맡기면, 가운데 있는 것 하나가 숨는 순간 아래가 전부 한 칸씩 올라온다.
+ * 멈춤 배너가 정확히 그랬다 — 고장이 없으면 배너가 격자 항목이 아니게 되고, 그러면 무대가
+ * 배너의 `auto` 줄로 올라가고 조작판이 `1fr`을 가져갔다. 조작판이 화면의 절반을 차지하고
+ * 3D가 295px로 눌렸는데, **고장이 떠 있을 때는 멀쩡했다.** 그래서 한동안 통과하다가
+ * 팔이 정상일 때만 틀어졌다.
+ *
+ * 각자 자기 줄에 못 박아 두면 무엇이 숨든 나머지는 제자리에 있는다. */
+#top    { grid-row: 1; }
+#banner { grid-row: 2; }
+#stage  { grid-row: 3; }
+#panel  { grid-row: 4; }
+#tabs   { grid-row: 5; }
+
 button, a, input, select { font: inherit; -webkit-tap-highlight-color: transparent; }
 a { color: var(--blue); }
 
@@ -448,8 +463,8 @@ dialog menu button.stop { border: 0; }
  * 아이패드 가로 화면이 여기에 해당한다. */
 @media (min-width: 760px) and (min-height: 420px) {
   body { grid-template-rows: auto auto minmax(0, 1fr); grid-template-columns: minmax(0, 1fr) 340px; }
-  #top { grid-column: 1 / -1; }
-  #banner { grid-column: 1 / -1; }
+  #top { grid-column: 1 / -1; grid-row: 1; }
+  #banner { grid-column: 1 / -1; grid-row: 2; }
   #stage { grid-column: 1; grid-row: 3; }
   #panel {
     grid-column: 2; grid-row: 3;
@@ -485,8 +500,8 @@ dialog menu button.stop { border: 0; }
     grid-template-rows: auto auto minmax(0, 1fr) auto;
     grid-template-columns: minmax(0, 1fr) minmax(240px, 34%);
   }
-  #top { grid-column: 1 / -1; }
-  #banner { grid-column: 1 / -1; }
+  #top { grid-column: 1 / -1; grid-row: 1; }
+  #banner { grid-column: 1 / -1; grid-row: 2; }
   #stage { grid-column: 1; grid-row: 3; }
   #panel {
     grid-column: 2; grid-row: 3;
@@ -494,7 +509,7 @@ dialog menu button.stop { border: 0; }
     border-top: 0; border-left: 1px solid var(--line);
     align-content: start;
   }
-  #tabs { grid-column: 1 / -1; }
+  #tabs { grid-column: 1 / -1; grid-row: 4; }
   #tabs .tab span { display: none; }
   #tabs .tab { flex-direction: row; }
   body.tab-drive #stage, body.tab-lease #stage { grid-template-rows: minmax(60px, 0.3fr) minmax(0, 1fr); }

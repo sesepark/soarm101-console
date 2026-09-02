@@ -8,9 +8,10 @@
        없어서 얻는 것도 없다. -->
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
   <!-- 아래 탭과 같은 색. 홈 화면 앱에서 화면 맨 아래(홈 인디케이터 자리)는 웹 내용이
-       아니라 이 색으로 칠해지는데, 배경색(#070b12)으로 두었더니 탭 줄 아래에 다른 색
-       띠가 남아 "빈 공간"으로 보였다. -->
-  <meta name="theme-color" content="#080d16">
+       아니라 이 색으로 칠해지는데, 배경색으로 두었더니 탭 줄 아래에 다른 색 띠가 남아
+       "빈 공간"으로 보였다. 지금 값은 SHAPE의 남색(`brand.navy`)이고, `viewer.css`의
+       `--navy`·`manifest.webmanifest`의 `theme_color`와 **셋이 같아야 한다.** -->
+  <meta name="theme-color" content="#0c245e">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="SO-ARM">
@@ -93,6 +94,15 @@
       <!-- 끝점 모드에서 무엇을 하면 되는지. 조작판이 아니라 3D의 구석에 둔다 — 조작판에
            두면 그만큼 3D가 줄고, 정작 그 설명이 가리키는 것이 3D다. -->
       <div id="endpoint-hint" class="grabbed hint-pill">3D를 끌면 <b>집게 끝</b>이 갑니다</div>
+
+      <!-- 손. **폰에서 아래 조작판을 대신하는 것이다.**
+           끝점 모드에서 사람이 직접 정하는 것은 넷뿐이다 — 앞뒤, 손목 둘, 집게. 그것을
+           슬라이더 넉 줄로 화면 아래에 쌓으면 그 높이만큼 카메라와 3D가 눌린다. 폰에서는
+           그 넉 줄이 화면의 3분의 1을 가져갔고, 그래서 카메라가 띠처럼 얇아졌다.
+           여기서는 3D 위에 떠 있는 타일 넷으로 줄인다. 조작 방법은 넷 다 같다 —
+           **누른 채 좌우로 끈다.** 슬라이더처럼 손잡이를 조준할 필요가 없어 오히려 쉽고,
+           손을 떼면 데드맨이 그대로 걸린다. 안은 자바스크립트가 관절 계약에서 짓는다. -->
+      <div id="hand" class="hand" role="group" aria-label="손 조작"></div>
     </section>
 
     <!-- 상태. `상태` 탭에서만 무대를 쓴다. -->

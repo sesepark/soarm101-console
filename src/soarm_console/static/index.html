@@ -5,6 +5,23 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SO-ARM101 Console</title>
   <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // 폰으로 이 주소를 열면 조작 화면으로 보낸다.
+    //
+    // 이 페이지는 3열 데스크톱 콘솔이라 폰에서 쓸 수 없고, **3D 조작이 아예 없다.**
+    // 그런데 서버 주소를 폰에서 그냥 열면 여기로 온다 — 실제로 사용자가 여기에 와서
+    // "3D 조작이 구현이 안 되어 있는데?"라고 물었다. 조작 화면이 있다는 것을 이 화면이
+    // 말해 주지 않았으니 맞는 말이다.
+    //
+    // 리다이렉트는 좁은 화면에서만 한다. 데스크톱에서는 아래 머리글의 링크로 간다 —
+    // 사람이 친 주소를 말없이 바꾸는 것은 그쪽에서는 놀라운 일이다.
+    // `?console=1`이면 폰에서도 이 화면을 그대로 본다.
+    (function () {
+      var wantsConsole = new URLSearchParams(location.search).has('console');
+      var narrow = Math.min(screen.width, screen.height) < 820 && matchMedia('(pointer: coarse)').matches;
+      if (!wantsConsole && narrow) location.replace('/viewer/?host=web');
+    })();
+  </script>
 </head>
 <body>
   <div class="app-shell">
@@ -17,6 +34,7 @@
       </nav>
       <div class="header-actions">
         <div id="overall" class="status-pill neutral"><i></i> 연결 확인 중</div>
+        <a class="compact-button viewer-link" href="/viewer/?host=web">3D로 조작</a>
         <button id="doctor" class="compact-button primary">환경 진단</button>
         <button id="stop-all" class="compact-button stop">모드 중지</button>
       </div>

@@ -30,16 +30,13 @@
   --muted: #90afff;            /* brand.sky — "어두운 바탕 위 보조 글자" */
   --line: rgba(144,175,255,.20);
   --blue: #2855f3;             /* brand.blue */
-  --blue-press: #1d4eb5;       /* brand.blue-press */
   --navy: #0c245e;             /* brand.navy — 머리글·탭·조작판 */
-  --navy-deep: #142354;        /* brand.navy-deep — 카드 면 */
-  --navy-mid: #163c91;         /* brand.navy-mid */
+  --panel: #142354;            /* brand.navy-deep — 카드와 시트의 면 */
+  --bg: #0a1327;               /* overlay.backdrop의 색. 무대의 바닥 */
   --danger: #b62446;           /* status.danger.fg — 정지 단추의 면 */
   --green: #43d695;
   --amber: #ffb648;
   --red: #ff707a;
-  --panel: #142354;
-  --bg: #0a1327;               /* overlay.backdrop의 색. 무대의 바닥 */
   /* 모서리. SHAPE의 사다리 그대로다 — 상자 12, 카드 18, 대화상자 22, 누를 것은 알약. */
   --r-box: 12px;
   --r-card: 18px;

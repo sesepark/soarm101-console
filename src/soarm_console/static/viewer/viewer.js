@@ -943,9 +943,18 @@ function paintGeometry() {
   probe.style.cssText =
     'position:fixed;top:0;left:0;height:env(safe-area-inset-top);width:env(safe-area-inset-left);visibility:hidden';
   document.body.append(probe);
-  const top = Math.round(parseFloat(getComputedStyle(probe).height)) || 0;
-  probe.style.height = 'env(safe-area-inset-bottom)';
-  const bottom = Math.round(parseFloat(getComputedStyle(probe).height)) || 0;
+  const measure = (value) => {
+    probe.style.height = value;
+    return Math.round(parseFloat(getComputedStyle(probe).height)) || 0;
+  };
+  const top = measure('env(safe-area-inset-top)');
+  const bottom = measure('env(safe-area-inset-bottom)');
+  // 높이 단위마다 다른 값을 말한다. 실물 아이폰에서 `-webkit-fill-available`이 보이는
+  // 높이보다 62pt 짧게 나왔고, 그 차이가 그대로 아래쪽 띠였다. 어느 단위가 맞는지는
+  // 기기가 말해 주어야 안다.
+  const units = ['100vh', '100dvh', '100svh', '100lvh', '-webkit-fill-available']
+    .map((unit) => `${unit.replace('100', '').replace('-webkit-fill-available', 'fill')} ${measure(unit)}`)
+    .join(' · ');
   probe.remove();
 
   const standalone =
@@ -962,6 +971,7 @@ function paintGeometry() {
   const lines = [
     `화면 ${screenSize} · 웹 영역 ${view} · 안전 영역 위 ${top} 아래 ${bottom}` +
       ` · ${standalone ? '홈 화면 앱' : '브라우저'}`,
+    `높이 단위: ${units}`,
   ];
   if (unfilled > 2) {
     lines.push(`⚠︎ 배치가 아래로 ${unfilled}pt 덜 찼습니다 — 이건 이 화면의 CSS 문제입니다.`);

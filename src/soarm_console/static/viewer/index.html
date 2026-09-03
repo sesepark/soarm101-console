@@ -67,11 +67,20 @@
     <section id="camera-pane">
       <img id="camera-image" alt="" draggable="false">
       <div id="camera-down" class="pane-note" hidden>카메라 영상이 오지 않습니다</div>
-      <div class="camera-chips" role="tablist" aria-label="카메라 선택">
-        <button class="chip on" type="button" data-camera="scene">작업공간</button>
-        <button class="chip" type="button" data-camera="wrist">손목</button>
-      </div>
     </section>
+
+    <!-- 영상 데이터는 어느 탭에서도 바로 끌 수 있어야 한다. 상태 탭에서 카메라 칸이
+         사라져도 이 줄은 `stage` 바로 아래에 남고, 맥 앱(host=native)에서는 CSS가 줄
+         전체를 그리지 않는다. -->
+    <div class="camera-chips" role="group" aria-label="카메라와 영상 받기">
+      <button class="chip on" type="button" data-camera="scene">작업공간</button>
+      <button class="chip" type="button" data-camera="wrist">손목</button>
+      <button class="chip" type="button" data-camera-data="off">끔</button>
+      <button class="chip" type="button" data-camera-data="saver">절약</button>
+      <button class="chip" type="button" data-camera-data="medium">보통</button>
+      <button class="chip" type="button" data-camera-data="full">전체</button>
+      <small id="camera-data-usage">영상 받기 · 절약 · 약 55MB/시간</small>
+    </div>
 
     <!-- 3D. `조작`에서만 보인다. -->
     <section id="view-pane">

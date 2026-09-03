@@ -46,6 +46,38 @@ def test_unknown_camera_is_rejected():
     assert error.value.status_code == 404
 
 
+def test_camera_settings_accept_phone_saver_profile_and_report_it(monkeypatch):
+    """폰의 절약 모드는 장치가 내는 320x240에서 서버가 2fps로 솎는다."""
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app, cameras
+
+    worker = cameras["scene"]
+    # 하드웨어 없는 시험에서도 실물 카메라에서 확인한 두 모드를 같은 계약으로 둔다.
+    monkeypatch.setattr(
+        worker,
+        "_modes",
+        [
+            {"width": 320, "height": 240, "fps": [30]},
+            {"width": 640, "height": 480, "fps": [30]},
+        ],
+    )
+    monkeypatch.setattr(worker, "_profile", worker.profile)
+
+    client = TestClient(app)
+    answer = client.post(
+        "/api/cameras/scene/settings",
+        json={"width": 320, "height": 240, "fps": 2},
+    )
+
+    assert answer.status_code == 200
+    assert client.get("/api/status").json()["cameras"]["scene"]["requested"] == {
+        "width": 320,
+        "height": 240,
+        "fps": 2,
+    }
+
+
 def test_the_phone_url_leads_to_the_one_screen_that_can_do_everything():
     """폰 화면이 둘이면 영상을 보다가 조작하려고 주소를 옮겨 가야 한다.
 

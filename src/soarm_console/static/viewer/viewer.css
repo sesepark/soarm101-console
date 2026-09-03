@@ -238,8 +238,15 @@ body.tab-lease #status-pane { display: none; }
   color: var(--muted); font-size: 12px; text-align: center; padding: 12px;
 }
 .camera-chips {
-  position: absolute; left: 8px; bottom: 8px;
-  display: flex; gap: 6px;
+  position: absolute; z-index: 3; left: 8px; right: 8px; top: 8px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  pointer-events: none;
+}
+.camera-chips > * { pointer-events: auto; }
+.camera-chips small {
+  flex-basis: 100%; width: max-content;
+  color: var(--muted); font-size: 11px; font-weight: 700;
+  padding: 4px 9px; border-radius: var(--r-pill); background: var(--navy);
 }
 .chip {
   min-height: 32px; padding: 0 13px;
@@ -344,6 +351,8 @@ body.unknown-pose #view-pane::after {
 /* ─────────────────────────────────────────────── 상태 */
 
 #status-pane { padding: 10px max(10px, var(--safe-r)) 10px max(10px, var(--safe-l)); }
+/* 상태 탭에서도 영상 받기 스위치는 남는다. 첫 판독값을 그 줄 아래에서 시작한다. */
+body.tab-status #status-pane { padding-top: 72px; }
 #joint-readings { display: grid; gap: 7px; }
 .reading-row {
   display: grid;
@@ -772,6 +781,7 @@ body.host-native #banner,
 body.host-native #panel,
 body.host-native #tabs,
 body.host-native #camera-pane,
+body.host-native .camera-chips,
 body.host-native #status-pane,
 body.host-native #sheet,
 body.host-native #sheet-scrim { display: none !important; }

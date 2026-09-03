@@ -220,6 +220,19 @@ let sequence = 0;
 let mode = isPhone() || localStorage.getItem('soarm-mode') === 'endpoint' ? 'endpoint' : 'joint';
 let tab = 'drive';
 let selectedCamera = localStorage.getItem('soarm-camera') === 'wrist' ? 'wrist' : 'scene';
+const CAMERA_DATA_PROFILES = {
+  off: { label: '끔', usage: '0MB/시간 · 데이터를 쓰지 않습니다' },
+  saver: { label: '절약', usage: '약 55MB/시간', width: 320, height: 240, fps: 2 },
+  medium: { label: '보통', usage: '약 800MB/시간', width: 640, height: 480, fps: 8 },
+  full: { label: '전체', usage: '약 3GB/시간', width: 640, height: 480, fps: 30 },
+};
+const savedCameraData = localStorage.getItem('soarm-camera-data');
+// 폰은 고르기 전에 이미 데이터를 받는다. 저장값이 없거나 옛 값이면 가장 싼 영상부터 연다.
+let cameraData = savedCameraData in CAMERA_DATA_PROFILES ? savedCameraData : 'saver';
+let cameraRetryTimer = null;
+let cameraDataRevision = 0;
+let cameraDataReady = false;
+let cameraDataOperation = Promise.resolve();
 
 const NATIVE = HOST === 'native' ? window.webkit?.messageHandlers?.soarm : null;
 
@@ -1429,21 +1442,92 @@ function paintProfiles() {
 // ---------------------------------------------------------------- 카메라
 
 function openCamera() {
-  if (HOST === 'native') return;
+  if (HOST === 'native' || cameraData === 'off' || !cameraDataReady) return;
   const image = el('camera-image');
   // 새 주소를 걸기 전에 감춘다. 그러지 않으면 다음 그림이 올 때까지 앞 카메라의 마지막
   // 장면이 남아, 화면이 다른 카메라를 보고 있다고 말하게 된다.
   image.classList.remove('live');
   image.src = `/api/cameras/${selectedCamera}.mjpg?v=${Date.now()}`;
-  for (const chip of document.querySelectorAll('.chip')) {
+  for (const chip of document.querySelectorAll('[data-camera]')) {
     chip.classList.toggle('on', chip.dataset.camera === selectedCamera);
   }
+}
+
+function closeCameraStream() {
+  clearTimeout(cameraRetryTimer);
+  cameraRetryTimer = null;
+  const image = el('camera-image');
+  image.classList.remove('live');
+  // `src = ''`는 일부 브라우저에서 현재 페이지를 이미지로 다시 요청한다.
+  image.removeAttribute('src');
+}
+
+function paintCameraData() {
+  const profile = CAMERA_DATA_PROFILES[cameraData];
+  for (const chip of document.querySelectorAll('[data-camera-data]')) {
+    chip.classList.toggle('on', chip.dataset.cameraData === cameraData);
+    chip.setAttribute('aria-pressed', chip.dataset.cameraData === cameraData ? 'true' : 'false');
+  }
+  el('camera-data-usage').textContent = `영상 받기 · ${profile.label} · ${profile.usage}`;
+}
+
+function applyCameraData(next) {
+  if (HOST === 'native' || !(next in CAMERA_DATA_PROFILES)) return;
+  cameraData = next;
+  localStorage.setItem('soarm-camera-data', cameraData);
+  paintCameraData();
+  cameraDataReady = false;
+  closeCameraStream();
+  const revision = ++cameraDataRevision;
+  const note = el('camera-down');
+
+  if (cameraData === 'off') {
+    note.textContent = '영상 받기를 껐습니다 · 데이터를 쓰지 않습니다';
+    note.hidden = false;
+  } else {
+    note.textContent = '영상 설정을 적용하는 중입니다';
+    note.hidden = false;
+  }
+
+  // 연타해도 오래 걸린 앞 요청이 나중 설정을 덮지 않게 서버 변경을 한 줄로 세운다.
+  cameraDataOperation = cameraDataOperation.then(() => finishCameraData(next, revision));
+}
+
+async function finishCameraData(next, revision) {
+  if (revision !== cameraDataRevision) return;
+  if (next === 'off') {
+    // 연결을 먼저 닫은 뒤 worker도 놓는다. 한 대가 늦어도 다른 카메라의 stop은 기다리지
+    // 않게 동시에 보낸다.
+    await Promise.allSettled([
+      post('/api/cameras/scene/stop'),
+      post('/api/cameras/wrist/stop'),
+    ]);
+    return;
+  }
+
+  const note = el('camera-down');
+  const { width, height, fps } = CAMERA_DATA_PROFILES[next];
+  const answers = await Promise.allSettled([
+    post('/api/cameras/scene/settings', { width, height, fps }),
+    post('/api/cameras/wrist/settings', { width, height, fps }),
+  ]);
+  if (revision !== cameraDataRevision || cameraData === 'off') return;
+  const failed = answers.find((answer) => answer.status === 'rejected');
+  if (failed) {
+    // settings의 400/409 detail은 `post`가 Error.message에 그대로 넣는다.
+    note.textContent = String(failed.reason?.message || failed.reason);
+    note.hidden = false;
+    return;
+  }
+  cameraDataReady = true;
+  openCamera();
 }
 
 function startCameras() {
   if (HOST === 'native') return;
   const image = el('camera-image');
   image.addEventListener('load', () => {
+    if (cameraData === 'off' || !image.hasAttribute('src')) return;
     image.classList.add('live');
     el('camera-down').hidden = true;
   });
@@ -1451,17 +1535,25 @@ function startCameras() {
     // 깨진 이미지 아이콘을 남겨 두지 않는다. 카메라가 없는 것과 화면이 고장 난 것은
     // 다른 일인데, 그 아이콘은 둘을 같아 보이게 한다.
     image.classList.remove('live');
+    if (cameraData === 'off' || !cameraDataReady) return;
     el('camera-down').hidden = false;
-    setTimeout(openCamera, 3000);
+    clearTimeout(cameraRetryTimer);
+    cameraRetryTimer = setTimeout(() => {
+      if (cameraData !== 'off' && cameraDataReady) openCamera();
+    }, 3000);
   });
-  for (const chip of document.querySelectorAll('.chip')) {
+  for (const chip of document.querySelectorAll('[data-camera]')) {
     chip.addEventListener('click', () => {
       selectedCamera = chip.dataset.camera;
       localStorage.setItem('soarm-camera', selectedCamera);
       openCamera();
     });
   }
-  openCamera();
+  for (const chip of document.querySelectorAll('[data-camera-data]')) {
+    chip.addEventListener('click', () => applyCameraData(chip.dataset.cameraData));
+  }
+  paintCameraData();
+  applyCameraData(cameraData);
 }
 
 /** 방금 그린 화면에서 배경이 아닌 픽셀의 비율.

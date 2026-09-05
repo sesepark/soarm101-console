@@ -71,6 +71,9 @@ TRAJECTORY_EXTRAS = {
     "observation.velocity": "velocity",
     "observation.camera_fresh": "camera_fresh",
     "observation.wall_time": "wall_time",
+    # 이 행의 서보 값이 이 프레임에서 새로 읽힌 것인가(1.0), 읽기가 실패해 직전 값이
+    # 되풀이된 것인가(0.0). 값을 고치지 않으므로, 그 사실을 물어볼 곳은 이 열뿐이다.
+    "observation.sensor_read_ok": "sensor_read_ok",
 }
 
 

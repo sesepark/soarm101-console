@@ -34,6 +34,55 @@ _DATASET_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}")
 CONTROLS = ("right", "left", "esc", "abort")
 
 
+#: `soarm_quality.json`에서 이어 찍기 때 **더해야** 하는 세는 값들. 비율은 여기 없다 —
+#: 비율은 더하는 것이 아니라 합쳐진 세는 값에서 다시 계산한다.
+_COUNTED_QUALITY_KEYS = ("total_frames", "sensor_read_failures")
+_COUNTED_QUALITY_MAPS = ("camera_stale_frames", "sensor_implausible")
+
+
+def _merge_session_quality(
+    session: dict[str, object], previous: dict[str, object]
+) -> dict[str, object]:
+    """이번 실행이 센 값에 지난 실행의 값을 더한다.
+
+    `soarm_quality.json` 하나가 데이터셋 전체를 말해야 한다. 이어 찍기에서 마지막 실행의
+    수만 남기면 앞 회차들의 프레임이 세어지지 않은 채 사라진다.
+
+    `camera_stale_pct`는 더하지 않고 합쳐진 프레임 수에서 **다시 계산한다** — 비율의 합은
+    비율이 아니고, 회차마다 프레임 수가 다르면 평균도 답이 아니다.
+
+    읽기 시간의 p50·p99는 이번 실행의 값 그대로다. 지난 실행의 표본은 남아 있지 않고,
+    두 백분위수를 더하거나 평균 내는 것은 어느 쪽도 실제로 일어난 시간이 아니다.
+    """
+    merged: dict[str, object] = dict(session)
+    for key in _COUNTED_QUALITY_KEYS:
+        merged[key] = _as_int(session.get(key)) + _as_int(previous.get(key))
+    for key in _COUNTED_QUALITY_MAPS:
+        current = session.get(key)
+        current = current if isinstance(current, dict) else {}
+        earlier = previous.get(key)
+        earlier = earlier if isinstance(earlier, dict) else {}
+        merged[key] = {
+            name: _as_int(current.get(name)) + _as_int(earlier.get(name))
+            for name in {*current, *earlier}
+        }
+    total = _as_int(merged.get("total_frames"))
+    stale = merged.get("camera_stale_frames")
+    stale = stale if isinstance(stale, dict) else {}
+    merged["camera_stale_pct"] = {
+        name: (100.0 * _as_int(count) / total) if total else 0.0
+        for name, count in stale.items()
+    }
+    return merged
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
 def preview_path(runtime_dir: Path, role: str) -> Path:
     """수집 중 스냅숏이 놓이는 자리.
 
@@ -306,20 +355,28 @@ class RecordManager:
 
         이어 찍기면 지난 실행의 경고 수에 이번 것을 더한다. 파일 하나가 데이터셋 전체를
         말해야 하므로, 마지막 실행만 남기면 앞 회차들이 조용해진다.
+
+        `camera_stale_pct`는 **세션 전체**의 값이다. 이름은 그대로 두고 뜻만 바꿨다 —
+        앱이 이 키를 읽고, 그 자리에서 물어보는 것도 "이 데이터가 어떻게 찍혔나"이기
+        때문이다. 예전 값은 `_LoopRateMonitor`의 3초 창이라 회차가 끝나는 순간만 말했고,
+        실제로 `test4_20260905_1459`는 0.0으로 적혔지만 파케이를 세면 2.54·2.90%였다.
         """
         path = target / "soarm_quality.json"
         warnings = self._slow_loop_warnings
+        previous: dict[str, object] = {}
         if self._resumed:
             try:
                 previous = json.loads(path.read_text(encoding="utf-8"))
                 warnings += int(previous.get("slow_loop_warnings", 0))
             except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
-                pass
+                previous = {}
+        session = runtime.get("session_quality")
+        session = session if isinstance(session, dict) else {}
         quality = {
             "loop_hz": runtime.get("loop_hz"),
-            "camera_stale_pct": runtime.get("camera_stale_pct"),
             "slow_loop_warnings": warnings,
             "recorded_at": time.time(),
+            **_merge_session_quality(session, previous if self._resumed else {}),
         }
         try:
             path.write_text(json.dumps(quality), encoding="utf-8")

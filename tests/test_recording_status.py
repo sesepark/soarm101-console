@@ -330,6 +330,117 @@ def test_the_next_save_tells_the_screen_how_long_the_last_one_took(tmp_path, mon
     assert estimates[1] >= 0.05
 
 
+# MARK: 세션 전체로 세는 값
+
+
+@pytest.fixture
+def counters(monkeypatch):
+    """세는 값은 모듈 전역이다. 시험마다 0에서 시작한다."""
+    monkeypatch.setattr(recording, "_total_frames", 0)
+    monkeypatch.setattr(recording, "_sensor_read_failures", 0)
+    monkeypatch.setattr(recording, "_camera_stale_frames", {"scene": 0, "wrist": 0})
+    monkeypatch.setattr(recording, "_sensor_implausible", {"temperature": 0, "voltage": 0})
+    monkeypatch.setattr(recording, "_sensor_durations", [])
+
+
+def _frame(scene=1.0, wrist=1.0, read_ok=1.0, temperature=36.0, voltage=12.1):
+    return {
+        sensors.CAMERA_FRESH_COLUMN: np.array([scene, wrist], dtype=np.float32),
+        sensors.SENSOR_READ_OK_COLUMN: np.array([read_ok], dtype=np.float32),
+        "observation.temperature": np.full(6, temperature, dtype=np.float32),
+        "observation.voltage": np.full(6, voltage, dtype=np.float32),
+    }
+
+
+def test_the_stale_rate_is_the_whole_session_not_the_last_three_seconds(counters):
+    """`test4_20260905_1459`는 `camera_stale_pct` 0.0으로 적혔는데 파케이를 세면
+    scene 2.54%·wrist 2.90%였다. 3초 창은 회차가 끝나는 순간만 말한다.
+
+    여기서 세는 자리가 파케이에 들어가는 바로 그 행이므로, 이 수는 나중에 파케이를 다시
+    세어 얻는 수와 반드시 같다.
+    """
+    for index in range(1104):
+        recording._count_recorded_frame(
+            _frame(scene=0.0 if index < 28 else 1.0, wrist=0.0 if index < 32 else 1.0)
+        )
+
+    quality = recording._sensor_quality_fields()
+    assert quality["total_frames"] == 1104
+    assert quality["camera_stale_frames"] == {"scene": 28, "wrist": 32}
+    assert quality["camera_stale_pct"]["scene"] == pytest.approx(2.54, abs=0.01)
+    assert quality["camera_stale_pct"]["wrist"] == pytest.approx(2.90, abs=0.01)
+
+
+def test_repeated_rows_are_counted_but_their_values_are_not_touched(counters):
+    frame = _frame(read_ok=0.0, temperature=150.0)
+    before = frame["observation.temperature"].copy()
+
+    recording._count_recorded_frame(frame)
+    recording._count_recorded_frame(_frame(read_ok=1.0))
+
+    quality = recording._sensor_quality_fields()
+    assert quality["sensor_read_failures"] == 1
+    assert quality["total_frames"] == 2
+    # 세기만 한다. 프레임 안의 값은 그대로 파케이로 간다.
+    assert np.array_equal(frame["observation.temperature"], before)
+    assert frame["observation.temperature"][0] == 150.0
+
+
+def test_implausible_readings_are_counted_per_field_and_never_clamped(counters):
+    recording._count_recorded_frame(_frame(temperature=150.0))
+    recording._count_recorded_frame(_frame(voltage=0.3))
+    recording._count_recorded_frame(_frame())
+
+    quality = recording._sensor_quality_fields()
+    # 관절 여섯이 모두 그 값이므로 여섯씩이다 — 세는 단위는 프레임이 아니라 판독이다.
+    assert quality["sensor_implausible"] == {"temperature": 6, "voltage": 6}
+    # 무슨 기준으로 세었는지가 함께 나간다. 원본이 그대로이므로 다시 셀 수 있다.
+    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 100.0
+    assert quality["sensor_implausible_thresholds"]["voltage"]["min"] == 5.0
+
+
+def test_block_read_times_are_reported_as_percentiles_of_the_whole_session(counters):
+    """읽기의 2%가 느리면 p99가 그것을 말해야 한다. 평균은 말하지 않는다."""
+    recording._sensor_durations.extend([0.002] * 980 + [0.010] * 20)
+
+    quality = recording._sensor_quality_fields()
+    assert quality["sensor_block_read_ms_p50"] == pytest.approx(2.0)
+    assert quality["sensor_block_read_ms_p99"] == pytest.approx(10.0)
+
+
+def test_the_percentile_is_a_time_that_actually_happened(counters):
+    """보간하지 않는다. 보간한 값은 한 번도 일어나지 않은 읽기 시간이다."""
+    recording._sensor_durations.extend([0.001 * n for n in range(1, 101)])
+
+    quality = recording._sensor_quality_fields()
+    assert quality["sensor_block_read_ms_p50"] == pytest.approx(51.0)
+    assert quality["sensor_block_read_ms_p99"] == pytest.approx(99.0)
+
+
+def test_a_session_that_recorded_nothing_reports_no_read_times(counters):
+    quality = recording._sensor_quality_fields()
+    assert quality["total_frames"] == 0
+    assert quality["camera_stale_pct"] == {"scene": 0.0, "wrist": 0.0}
+    assert quality["sensor_block_read_ms_p50"] is None
+
+
+def test_the_action_frame_is_not_counted_as_a_second_frame(counters, monkeypatch):
+    """`build_dataset_frame`은 프레임마다 관측·action 두 번 불린다. 세는 것은 관측뿐이다."""
+    monkeypatch.setattr(
+        recording, "_ORIGINAL_BUILD_DATASET_FRAME", lambda features, values, prefix: {}
+    )
+    features = {
+        sensors.CAMERA_FRESH_COLUMN: {"names": list(sensors.CAMERA_KEYS)},
+        "action": {"names": ["a"]},
+    }
+    values = {sensors.CAMERA_FRESH_COLUMN: [1.0, 1.0]}
+
+    recording._build_dataset_frame_with_sensors(features, values, "observation")
+    recording._build_dataset_frame_with_sensors(features, values, "action")
+
+    assert recording._sensor_quality_fields()["total_frames"] == 1
+
+
 # MARK: 조작 — 버리고 끝내기
 
 

@@ -152,11 +152,36 @@ SmolVLA는 이미 배운 것을 옮겨 오므로 스텝이 훨씬 적다. 대신
 세션이 하나라도 있으면 409 `Training is already running: <run>`이다. 후자는 GPU가 하나이기
 때문이고, 무엇이 돌고 있는지를 문구에 적어 사람이 멈출지 기다릴지 고를 수 있게 한다.
 
+### 우리가 적는 것은 `output_dir` **밖**에 둔다
+
+실행 하나는 두 자리에 걸쳐 있다.
+
+| 자리 | 만드는 쪽 | 담긴 것 |
+| --- | --- | --- |
+| `<output_root>/<run>/` | LeRobot | `checkpoints/<step>/pretrained_model` |
+| `<output_root>/.runs/<run>/` | 콘솔 | `train.log`, `soarm_train.json` |
+
+**`output_dir` 안에 우리 파일을 두면 학습이 시작되지 않는다.** LeRobot은 `output_dir`이
+이미 있으면 `FileExistsError`로 거절하는데(`configs/train.py:259`), 로그를 그 안에 두려면
+`tee`가 쓸 폴더를 미리 만들어야 하고 그 `mkdir`이 곧 거절 조건이다. 실제로 그렇게 만들어
+둔 적이 있고, 학습은 1초 만에 죽었다 — 죽은 자리가 tmux 안이라 화면에는 "시작했다"만
+남았다. `mkdir -p`가 만드는 것은 `.runs/<run>` 하나뿐이고, `output_dir`은 LeRobot이
+스스로 만든다.
+
+`.runs`는 점으로 시작하므로 `<output_root>`를 훑는 목록에서 실행 이름으로 읽히지 않는다.
+
+**LeRobot은 `output_dir`을 늦게 만든다.** 실측(2026-09-05): 학습이 90스텝을 돈 시점에도
+`outputs/<run>/`은 아직 없고 `.runs/<run>/`만 있었다. 그래서 목록은 두 자리의 **합집합**이다
+— `<run>/checkpoints`가 있는 실행과 `.runs/<run>/soarm_train.json`이 있는 실행. 어느
+한쪽만 훑으면 방금 시작한 학습이 안 보이거나(진행을 못 그린다), 손으로 돌린 옛 학습이
+안 보인다(회수할 것을 못 찾는다). 두 자리 다 그 표시를 요구하므로 남은 빈 폴더가 실행
+하나로 세어지지도 않는다.
+
 ### 진행은 로그에서 읽는다
 
-시작 직후 `outputs/<run>/soarm_train.json`에 `{dataset, policy, steps, batch_size, started_at}`
-을 남기고, 명령 자체는 `2>&1 | tee outputs/<run>/train.log`로 끝난다. `GET /api/spark/runs`의
-각 실행에 실리는 `training`은 그 둘과 `tmux has-session`을 합친 것이다:
+시작 직후 `.runs/<run>/soarm_train.json`에 `{dataset, policy, steps, batch_size, started_at}`
+을 남기고, 명령 자체는 `2>&1 | tee <output_root>/.runs/<run>/train.log`로 끝난다.
+`GET /api/spark/runs`의 각 실행에 실리는 `training`은 그 둘과 `tmux has-session`을 합친 것이다:
 
 ```json
 {"running": true, "step": 20000, "steps": 100000, "loss": 0.187,
@@ -164,16 +189,22 @@ SmolVLA는 이미 배운 것을 옮겨 오므로 스텝이 훨씬 적다. 대신
  "log_tail": ["…"], "error": null}
 ```
 
-읽는 쪽에서 조심할 것이 하나 있다. LeRobot은 step을 `format_big_number`로 줄여 찍으므로
-로그에는 `step:20K`로 나온다 — 숫자만 집으면 20이 되고, 화면은 10만 스텝 학습이 0.02%
-진행됐다고 말한다. 접미사를 되돌려 읽는다. `running`이 아닌데 `step < steps`이면 로그에서
+`step`은 두 곳에서 온다. LeRobot의 metric 줄(`step:20K`)과 tqdm의 진행 막대
+(`| 20147/100000 [11:00<…`)이고, 둘 중 큰 값을 쓴다.
+
+**metric 줄만 보면 처음 몇 분이 비어 있다.** 그 줄은 `log_freq`(기본 200)마다 나오는데
+이 팔의 ACT 학습은 스텝당 2.1초이므로 첫 줄이 **7분 뒤**다. 실제로 학습을 띄우고 30초를
+지켜보는 동안 `step`이 계속 `null`이었다. tqdm은 매 스텝 갱신하므로 그것을 읽으면 30초
+안에 75 → 83으로 올라가는 것이 보인다. `loss`는 tqdm이 나르지 않으므로 metric 줄에서만
+온다.
+
+숫자를 읽을 때 접미사를 되돌려야 한다 — `step:20K`에서 숫자만 집으면 20이 되고, 화면은
+10만 스텝 학습이 0.02% 진행됐다고 말한다. `running`이 아닌데 `step < steps`이면 로그에서
 `Traceback`이나 `Error`가 든 마지막 줄을 골라 `error`에 담는다 — 끝나지 않았는데 세션이
 없다는 것은 무언가 죽었다는 뜻이고, 사람이 tmux에 붙지 않고도 이유를 볼 수 있어야 한다.
 
 목록은 `checkpoints/last` 심볼릭 링크를 건너뛴다(`os.path.islink`). 따라가면 같은 체크포인트가
-두 번 나와 화면이 있지도 않은 회수를 센다. 체크포인트가 아직 하나도 없는 실행도 싣는다 —
-ACT의 첫 저장은 2만 스텝 뒤이고, 그때까지 목록에서 사라져 있으면 사람은 학습이 시작됐는지조차
-알 수 없다.
+두 번 나와 화면이 있지도 않은 회수를 센다.
 
 이 전부를 원격 파이썬 스크립트 하나 안에서 한다. 실행마다 ssh를 왕복하면 tailnet 너머에서
 화면이 눈에 띄게 굼떠진다.
@@ -183,6 +214,10 @@ ACT의 첫 저장은 2만 스텝 뒤이고, 그때까지 목록에서 사라져 
 `POST /api/spark/runs/{run}/stop`은 `tmux send-keys C-c`를 먼저 보낸다. 사람이 tmux에 붙어
 눌렀을 때와 같은 길이고, LeRobot은 그 신호를 받고 정리한 뒤 나간다. 2초 뒤에도 살아 있으면
 `kill-session`한다. 어느 쪽이든 **이미 디스크에 쓰인 체크포인트는 그대로 남는다.**
+
+실측(2026-09-05): 90스텝째의 ACT 학습을 세웠을 때 `killed: false`였다 — Ctrl-C만으로 2초
+안에 나갔다. 그 뒤 `training`은 `running: false`, `error: null`이다. 사람이 세운 것과 죽은
+것은 로그에 트레이스백이 있는지로 갈린다.
 
 ### 전송은 원자적이다
 
@@ -268,7 +303,7 @@ curl -X POST http://127.0.0.1:8088/api/spark/runs/<run>/<step>
 
 ```bash
 ssh <계정>@<학습서버> 'tmux capture-pane -pt train-<run> | tail -20'
-ssh <계정>@<학습서버> 'tail -f outputs/<run>/train.log'
+ssh <계정>@<학습서버> 'tail -f outputs/.runs/<run>/train.log'
 ```
 
 회수한 것은 `checkpoints/<run>/<step>/`에 놓인다. `training_state`는 가져오지 않는다 —

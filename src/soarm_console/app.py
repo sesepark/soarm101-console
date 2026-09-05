@@ -23,7 +23,15 @@ from .spark import push_dataset as spark_push_dataset
 from .spark import train_command as spark_train_command
 from .record_manager import RecordManager
 from .teleop import TeleopError, TeleopManager
-from .vleader.api import VirtualLeader, build_router
+from .torque import TorqueError
+from .torque import release as release_torque_on
+from .vleader.api import (
+    RELEASE_CONFIRMATION,
+    VirtualLeader,
+    _authorise_motion,
+    _token_from,
+    build_router,
+)
 from .vleader.backend import HardwareError
 
 
@@ -417,6 +425,37 @@ def doctor() -> dict[str, object]:
         raise HTTPException(status_code=409, detail="Cannot inspect serial buses during an active mode")
     last_doctor = run_hardware_doctor(settings)
     return last_doctor
+
+
+class TorqueReleaseRequest(BaseModel):
+    arm: str
+    confirmation: str
+
+
+@app.post("/api/torque/release")
+def release_torque(request: Request, body: TorqueReleaseRequest) -> dict[str, object]:
+    """Let one arm go limp, on purpose.
+
+    A previous session leaves torque on — nothing here turns it off on exit, because a
+    fault that drops the arm is worse than a fault that holds it. The cost is that the
+    next teleop is refused until someone releases it, and until now the console had no
+    way to do that outside the virtual leader. This is that way.
+
+    It writes to the motors, so it needs the motion token and the same typed phrase the
+    virtual leader asks for. It refuses while a mode is running: that process owns the
+    bus, and the arm is holding a pose it was told to hold."""
+    _authorise_motion(_token_from(request))
+    if body.confirmation != RELEASE_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
+    if teleop.running or recorder.running or vleader.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the running mode before releasing torque",
+        )
+    try:
+        return release_torque_on(settings, body.arm)
+    except TorqueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/teleoperation/start")

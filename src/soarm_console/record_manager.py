@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -27,6 +28,20 @@ SLOW_LOOP_MARKER = "Record loop is running slower"
 #: 경로로 쓰기 전에 다시 본다.
 _DATASET_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}")
 
+#: 수집이 받아들이는 조작. `esc`와 `abort`는 둘 다 회차를 끝내지만 결과가 다르다 —
+#: `abort`는 찍던 회를 버리고, `esc`는 저장한다. `recording._GuiControlListener`가
+#: 그 차이를 만든다.
+CONTROLS = ("right", "left", "esc", "abort")
+
+
+def preview_path(runtime_dir: Path, role: str) -> Path:
+    """수집 중 스냅숏이 놓이는 자리.
+
+    쓰는 쪽(`recording._PreviewWriter`)과 내주는 쪽(`app`)이 같은 이름을 봐야 하므로
+    이름을 만드는 자리를 하나만 둔다.
+    """
+    return runtime_dir / f"preview-{role}.jpg"
+
 
 class RecordManager:
     def __init__(self, settings: Settings):
@@ -37,6 +52,7 @@ class RecordManager:
         self._owner_locks: DeviceLockSet | None = None
         self._camera_controls: dict[str, dict[str, object]] = {}
         self._slow_loop_warnings = 0
+        self._resumed = False
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
         self.log_path = self.runtime_dir / "record.log"
 
@@ -70,8 +86,20 @@ class RecordManager:
         return problems
 
     def start(
-        self, task: str, episodes: int, episode_seconds: int, teleop_source: str = "leader"
+        self,
+        task: str,
+        episodes: int,
+        episode_seconds: int,
+        teleop_source: str = "leader",
+        dataset: str | None = None,
+        resume: bool = False,
     ) -> None:
+        """수집 자식을 띄운다.
+
+        `resume`이면 `dataset`이 가리키는 기존 데이터셋에 회차를 이어 붙인다. 그 데이터셋이
+        실제로 이어 찍어도 되는 것인지 — 있는가, 과제가 같은가 — 는 `app`이 요청을 받는
+        자리에서 본다. 여기서는 이름과 깃발을 자식에게 넘기는 일만 한다.
+        """
         if not 1 <= episodes <= 1000:
             raise TeleopError("episodes must be between 1 and 1000")
         if not 5 <= episode_seconds <= 300:
@@ -96,6 +124,17 @@ class RecordManager:
                     "SOARM_TELEOP_SOURCE": teleop_source,
                 }
             )
+            # 이어 찍기가 아니면 이름은 자식이 짓는다(`recording.default_dataset_name`).
+            # 환경에서 지워 두지 않으면 지난 실행의 이름이 남아 다른 회차가 같은 폴더로
+            # 들어간다 — parent의 환경을 복사해 오기 때문이다.
+            env.pop("SOARM_DATASET_NAME", None)
+            env.pop("SOARM_RESUME", None)
+            if resume:
+                if dataset is None:
+                    raise TeleopError("Resuming needs the name of the dataset to append to")
+                env["SOARM_DATASET_NAME"] = dataset
+                env["SOARM_RESUME"] = "1"
+            self._resumed = resume
             devices = [
                 self.settings.follower_port,
                 self.settings.scene_camera,
@@ -142,8 +181,11 @@ class RecordManager:
                 target=self._watch_exit, args=(self._process, owner_locks), daemon=True
             ).start()
 
+    def preview_path(self, role: str) -> Path:
+        return preview_path(self.runtime_dir, role)
+
     def control(self, key: str) -> None:
-        if key not in {"right", "left", "esc"}:
+        if key not in CONTROLS:
             raise TeleopError("Unknown recording control")
         if not self.running:
             raise TeleopError("Recording is not running")
@@ -228,9 +270,9 @@ class RecordManager:
                 handle.close()
 
     def _archive_log(self) -> None:
-        """끝난 로그를 데이터셋 폴더 안으로 옮긴다.
+        """끝난 로그와 이번 실행의 품질 요약을 데이터셋 폴더 안에 남긴다.
 
-        `spark.push_dataset`는 데이터셋 폴더째 학습 서버로 보낸다. 로그가 그 안에 있어야
+        `spark.push_dataset`는 데이터셋 폴더째 학습 서버로 보낸다. 둘이 그 안에 있어야
         나중에 학습 서버에서 "이 데이터가 정말 30Hz로 찍혔나"를 데이터만 보고 답할 수 있다.
         """
         try:
@@ -245,6 +287,36 @@ class RecordManager:
             return
         try:
             shutil.copyfile(self.log_path, target / "record.log")
+        except OSError:
+            pass
+        self._write_quality(target, runtime)
+
+    def _write_quality(self, target: Path, runtime: dict[str, object]) -> None:
+        """`soarm_quality.json` — 이 데이터가 어떻게 찍혔는지 한 장.
+
+        데이터셋 자신은 이것을 말하지 못한다. `timestamp`는 `frame_index / fps`로 합성된
+        값이라 루프가 느렸어도 파케이는 30Hz라고 적혀 있고, 정지 장면과 멈춘 카메라는
+        영상에서 구별되지 않는다. 그래서 찍는 동안 세어 둔 값을 여기 적어 함께 보낸다.
+
+        이어 찍기면 지난 실행의 경고 수에 이번 것을 더한다. 파일 하나가 데이터셋 전체를
+        말해야 하므로, 마지막 실행만 남기면 앞 회차들이 조용해진다.
+        """
+        path = target / "soarm_quality.json"
+        warnings = self._slow_loop_warnings
+        if self._resumed:
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+                warnings += int(previous.get("slow_loop_warnings", 0))
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+        quality = {
+            "loop_hz": runtime.get("loop_hz"),
+            "camera_stale_pct": runtime.get("camera_stale_pct"),
+            "slow_loop_warnings": warnings,
+            "recorded_at": time.time(),
+        }
+        try:
+            path.write_text(json.dumps(quality), encoding="utf-8")
         except OSError:
             pass
 

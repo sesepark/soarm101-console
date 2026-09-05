@@ -62,7 +62,7 @@ async function refresh() {
     const runtime = state.recording.runtime || {};
     $('#record-phase').textContent = recording ? (runtime.phase || 'STARTING').toUpperCase() : 'INACTIVE';
     $('#record-dataset').textContent = runtime.dataset_name ? `dataset · ${runtime.dataset_name}` : 'dataset —';
-    for (const id of ['record-success', 'record-retry', 'record-stop']) $(`#${id}`).disabled = !recording;
+    for (const id of ['record-success', 'record-retry', 'record-stop', 'record-abort']) $(`#${id}`).disabled = !recording;
     const logs = recording ? state.recording.logs : state.teleoperation.logs;
     if (logs.length) {
       $('#logs').textContent = logs.join('\n');
@@ -147,6 +147,9 @@ $('#focus-close').addEventListener('click', () => { $('#focus-view').classList.r
 $('#record-success').addEventListener('click', async () => { await request('/api/recording/control', 'POST', {key: 'right'}); await refresh(); });
 $('#record-retry').addEventListener('click', async () => { await request('/api/recording/control', 'POST', {key: 'left'}); await refresh(); });
 $('#record-stop').addEventListener('click', async () => { await request('/api/recording/control', 'POST', {key: 'esc'}); await refresh(); });
+// `esc`는 루프를 빠져나온 뒤 save_episode()가 그대로 돌아 찍다 만 회를 저장한다. 그 회가
+// 필요 없을 때 누르는 것이 이쪽이다 — 버퍼를 비우고 나간다.
+$('#record-abort').addEventListener('click', async () => { await request('/api/recording/control', 'POST', {key: 'abort'}); await refresh(); });
 $('#clear-log').addEventListener('click', () => { $('#logs').textContent = '로그를 지웠습니다.'; scrollLogToBottom(); });
 
 switchView(['observe', 'teleop', 'dataset'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'observe');

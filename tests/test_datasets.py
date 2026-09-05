@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -242,3 +243,140 @@ def test_episode_urls_carry_their_own_range(data_root, monkeypatch):
 def test_unknown_dataset_reports_not_found(data_root):
     with pytest.raises(FileNotFoundError):
         datasets.describe("never_recorded")
+
+
+# MARK: 목록에 실리는 것들
+
+
+def _write_tasks(directory: Path, tasks: list[str]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table({"task_index": list(range(len(tasks))), "task": tasks}),
+        directory / "meta/tasks.parquet",
+    )
+
+
+def test_the_listing_carries_the_task_and_the_quality_the_console_measured(data_root):
+    """앱이 데이터셋마다 상세를 한 번씩 더 묻지 않게 한다.
+
+    품질은 데이터셋 자신이 말하지 못하는 것이다 — `timestamp`가 `frame_index / fps`로
+    합성된 값이라, 루프가 느렸어도 파케이는 30Hz라고 적혀 있다.
+    """
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_tasks(directory, ["Pick and place"])
+    (directory / "soarm_quality.json").write_text(
+        json.dumps({
+            "loop_hz": 29.4,
+            "camera_stale_pct": {"scene": 0.0, "wrist": 12.5},
+            "slow_loop_warnings": 3,
+            "recorded_at": 1.0,
+        }),
+        encoding="utf-8",
+    )
+
+    (listed,) = datasets.list_datasets()
+
+    assert listed["tasks"] == ["Pick and place"]
+    assert listed["quality"]["loop_hz"] == 29.4
+    assert listed["quality"]["slow_loop_warnings"] == 3
+    assert listed["quality"]["camera_stale_pct"]["wrist"] == 12.5
+
+
+def test_a_dataset_without_a_quality_file_says_so_rather_than_guessing(data_root):
+    _make_dataset(data_root, "soarm101_pick")
+    (listed,) = datasets.list_datasets()
+    assert listed["quality"] is None
+    assert listed["tasks"] == []
+
+
+def test_tasks_are_deduplicated_and_sorted(data_root):
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_tasks(directory, ["Wipe", "Pick", "Wipe"])
+    assert datasets.dataset_tasks("soarm101_pick") == ["Pick", "Wipe"]
+
+
+# MARK: 지우기
+
+
+def test_deleting_a_dataset_moves_it_out_of_the_listing_but_not_off_the_disk(data_root):
+    """몇 시간짜리 시연을 담은 폴더를 웹 요청 하나가 영구히 없애도 되는 이유가 없다."""
+    _make_dataset(data_root, "soarm101_pick")
+
+    moved = datasets.move_to_trash("soarm101_pick")
+
+    assert datasets.list_datasets() == []
+    assert moved.is_dir()
+    assert moved.parent == data_root / ".trash"
+    assert (moved / "meta/info.json").exists()
+    # `.trash`는 점으로 시작하므로 목록의 이름 규칙에 걸리지 않는다.
+    assert not datasets.NAME_PATTERN.match(".trash")
+
+
+def test_two_deletions_of_the_same_name_do_not_collide(data_root, monkeypatch):
+    _make_dataset(data_root, "soarm101_pick")
+    first = datasets.move_to_trash("soarm101_pick")
+    _make_dataset(data_root, "soarm101_pick")
+    monkeypatch.setattr(datasets, "_trash_target", lambda name: datasets.trash_root() / "later")
+    second = datasets.move_to_trash("soarm101_pick")
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+
+
+def test_deleting_a_dataset_that_is_not_there_is_not_found(data_root):
+    with pytest.raises(FileNotFoundError):
+        datasets.move_to_trash("never_recorded")
+    with pytest.raises(datasets.DatasetError):
+        datasets.move_to_trash("../config")
+
+
+def test_deleting_an_episode_that_is_not_in_the_dataset_is_not_found(data_root):
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_episode(directory, 0, [[0.0] * 6, [1.0] * 6])
+
+    with pytest.raises(FileNotFoundError):
+        datasets.delete_episode("soarm101_pick", 7)
+
+
+def test_a_failed_episode_edit_puts_the_dataset_back_where_it_was(data_root, monkeypatch):
+    """제자리 편집은 원본을 `<name>_old`로 먼저 옮긴다. 편집이 실패해도 데이터셋이
+    사라진 채로 남으면 안 된다."""
+    import subprocess
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_episode(directory, 0, [[0.0] * 6])
+
+    def fake_run(args, **kwargs):
+        # LeRobot이 원본을 옮겨 둔 뒤 실패하는 자리를 흉내낸다.
+        shutil.move(str(directory), str(directory.with_name("soarm101_pick_old")))
+        return subprocess.CompletedProcess(args, 1, "", "RuntimeError: something went wrong")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(datasets.DatasetError):
+        datasets.delete_episode("soarm101_pick", 0)
+
+    assert (data_root / "soarm101_pick" / "meta/info.json").exists()
+    assert not (data_root / "soarm101_pick_old").exists()
+
+
+def test_the_backup_the_editor_leaves_behind_does_not_become_a_second_dataset(
+    data_root, monkeypatch
+):
+    """`<name>_old`는 `NAME_PATTERN`에 맞는 이름이라, 그냥 두면 목록에 데이터셋이 하나 더
+    생긴다. 실제로 `lerobot_edit_dataset.get_output_path`가 그 자리에 만든다."""
+    import subprocess
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_episode(directory, 0, [[0.0] * 6])
+
+    def fake_run(args, **kwargs):
+        shutil.copytree(directory, directory.with_name("soarm101_pick_old"))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    datasets.delete_episode("soarm101_pick", 0)
+
+    assert [entry["name"] for entry in datasets.list_datasets()] == ["soarm101_pick"]
+    assert not (data_root / "soarm101_pick_old").exists()
+    assert any(path.name.startswith("soarm101_pick_old-") for path in datasets.trash_root().iterdir())

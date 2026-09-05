@@ -109,6 +109,50 @@ GB10은 GPU 전용 메모리가 따로 없고 시스템 RAM 121GB를 공유한�
 **batch 32–64.** 처리량은 batch 8과 같고, 메모리 여유(13–26GB)가 충분해 다른 작업과 함께
 돌려도 안전하다. 128은 49GB를 잡아 이득 없이 여유만 줄이고, 256은 기계를 잃는다.
 
+## 데이터셋이 담는 열과 학습
+
+수집은 2026-09-05부터 서보의 나머지 판독값을 **별도 열**로 함께 남긴다. 학습에서 중요한
+것은 한 가지다: **`observation.state`는 관절 위치 여섯 그대로다.** 새 값이 그 벡터에
+섞였다면 지금까지 찍은 데이터로 배운 정책도, 사전학습 정규화 통계도 모양이 어긋난다.
+
+| 열 | shape | names | 단위 |
+| --- | --- | --- | --- |
+| `observation.state` | [6] | `<motor>.pos` | *(기존)* 관절 위치 — **바뀌지 않는다** |
+| `action` | [6] | `<motor>.pos` | *(기존)* 보낸 목표 — **바뀌지 않는다** |
+| `observation.load` | [6] | `<motor>.load` | 부호 포함 −1000..1000 |
+| `observation.velocity` | [6] | `<motor>.vel` | 부호 포함, 서보 눈금/s |
+| `observation.temperature` | [6] | `<motor>.temp` | °C |
+| `observation.voltage` | [6] | `<motor>.volt` | V |
+| `observation.servo_status` | [6] | `<motor>.status` | 상태 바이트(과부하·과열 비트) |
+| `observation.servo_moving` | [6] | `<motor>.moving` | 0/1 |
+| `observation.current` | [6] | `<motor>.current` | raw (이 펌웨어에서는 0이나 1로만 읽힌다) |
+| `observation.wall_time` | [1] | `since_start` | 이 프레임의 위치를 읽은 시각, 수집 시작으로부터의 초 |
+| `observation.camera_fresh` | [2] | `scene`, `wrist` | 이 틱이 새 프레임을 받았는가, 0/1 |
+
+`<motor>`는 `shoulder_pan`·`shoulder_lift`·`elbow_flex`·`wrist_flex`·`wrist_roll`·`gripper`
+순서다.
+
+**ACT를 비롯한 기존 정책은 이 열들을 읽지 않는다.** `dataset_to_policy_features`는
+`observation.*`을 전부 `FeatureType.STATE`로 분류하지만, 정책이 상태로 집어 가는 것은
+`robot_state_feature` — 이름이 정확히 `observation.state`인 열 **하나**뿐이고, 영상은
+`FeatureType.VISUAL`만 간다(`lerobot/configs/policies.py`). 새 열은 배치에 실려 정규화까지는
+지나가지만 모델에 들어가지 않는다. 그러므로:
+
+- 지금까지 찍은 데이터셋으로 학습한 체크포인트는 그대로 유효하다.
+- 새 열이 있는 데이터셋과 없는 데이터셋을 각각 학습해도 정책 입력은 같다.
+- 이 열들을 실제로 **쓰려면** 정책 쪽에서 명시적으로 `input_features`에 넣어야 한다. 그것이
+  이 열들을 남기는 목적(모터 부하로 간접 촉각을 추정)의 다음 단계다.
+
+새 열이 없는 옛 데이터셋에는 이어 찍을 수 없다. `LeRobotDataset.resume` 뒤의
+`sanity_check_dataset_robot_compatibility`가 feature 차이로 막으므로, 콘솔이 먼저 400으로
+거절한다(`Dataset was recorded without the sensor columns; start a new dataset`). Spark로
+보내고 학습하는 것은 옛 데이터셋도 그대로 된다 — 막히는 것은 **이어 찍기**뿐이다.
+
+각 수집 세션의 조건은 데이터셋 폴더 안 `soarm_provenance.json`에 배열로 쌓인다(커밋,
+lerobot 버전, calibration `sha256`, 카메라 컨트롤, 시작 진단, fps). `spark.push_dataset`이
+폴더째 보내므로 학습 서버에서도 "이 데이터가 어떤 조건에서 찍혔나"를 데이터만 보고 답할 수
+있다.
+
 ## 콘솔 API
 
 `src/soarm_console/spark.py`가 SSH와 rsync를 감싼다. 셸을 거치지 않고 인자 리스트로만

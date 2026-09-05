@@ -13,10 +13,12 @@ from pydantic import BaseModel
 
 from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
+from . import sensors
 from .datasets import (
     NAME_PATTERN,
     DatasetError,
     TrajectoryTooLargeError,
+    dataset_extras,
     dataset_tasks,
     delete_episode,
     describe,
@@ -177,6 +179,9 @@ CAPABILITIES = [
     "replay_preview",
     # 팔로워가 리더 자세까지 걸어간 뒤에 루프가 시작된다.
     "soft_start",
+    # 수집이 서보의 나머지 판독값(부하·속도·온도·전압·상태·이동·전류)과 프레임 시각,
+    # 카메라 새 프레임 여부를 별도 열로 함께 남긴다.
+    "sensor_extras",
 ]
 
 
@@ -644,6 +649,7 @@ def _check_resumable(name: str | None, task: str) -> None:
     try:
         # `dataset_tasks`가 `meta/info.json`이 있는지까지 본다 — 없으면 `FileNotFoundError`다.
         tasks = dataset_tasks(name)
+        extras = dataset_extras(name)
     except (FileNotFoundError, DatasetError) as exc:
         raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
     if tasks != [task.strip()]:
@@ -653,6 +659,15 @@ def _check_resumable(name: str | None, task: str) -> None:
                 f"Dataset task does not match: dataset has {tasks}, "
                 f"request has {[task.strip()]}"
             ),
+        )
+    # 서보 판독값 열이 생기기 전에 찍은 데이터셋이다. `record()`는 `LeRobotDataset.resume`
+    # 뒤 `sanity_check_dataset_robot_compatibility`에서 feature가 다르다며 자식 프로세스
+    # 안에서 죽는데, 그 죽음은 화면에 로그 한 줄로만 나타난다. 여기서 먼저 거절해야 사람이
+    # 무엇을 해야 하는지 — 새 데이터셋으로 찍는 것 — 를 읽을 수 있다.
+    if not set(sensors.extra_suffixes()) <= set(extras):
+        raise HTTPException(
+            status_code=400,
+            detail="Dataset was recorded without the sensor columns; start a new dataset",
         )
 
 
@@ -701,6 +716,9 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
             teleop_source=request.teleop,
             dataset=request.dataset,
             resume=request.resume,
+            # 이 회의 provenance에 함께 적힌다. 가상 리더로 찍을 때는 진단을 돌리지 않으므로
+            # `None`이고, 그 `None`도 "진단 없이 찍었다"는 기록이다.
+            doctor=last_doctor if request.teleop == "leader" else None,
         )
     except TeleopError as exc:
         if request.teleop == "virtual":

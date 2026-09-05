@@ -53,6 +53,9 @@ class RecordManager:
         self._camera_controls: dict[str, dict[str, object]] = {}
         self._slow_loop_warnings = 0
         self._resumed = False
+        #: 이 회를 시작하기 직전의 하드웨어 진단. `app`이 넘겨 준다 — 가상 리더로 찍을
+        #: 때는 진단을 돌리지 않으므로 `None`이다. `soarm_provenance.json`에 함께 적힌다.
+        self._doctor: dict[str, object] | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
         self.log_path = self.runtime_dir / "record.log"
 
@@ -93,6 +96,7 @@ class RecordManager:
         teleop_source: str = "leader",
         dataset: str | None = None,
         resume: bool = False,
+        doctor: dict[str, object] | None = None,
     ) -> None:
         """수집 자식을 띄운다.
 
@@ -159,6 +163,7 @@ class RecordManager:
                 "wrist": apply_recording_controls(self.settings.wrist_camera),
             }
             self._camera_controls = camera_controls
+            self._doctor = doctor
             command = [str(Path(__file__).parents[2] / "scripts/record.sh")]
             try:
                 self._process = subprocess.Popen(
@@ -290,6 +295,7 @@ class RecordManager:
         except OSError:
             pass
         self._write_quality(target, runtime)
+        self._append_provenance(target, runtime)
 
     def _write_quality(self, target: Path, runtime: dict[str, object]) -> None:
         """`soarm_quality.json` — 이 데이터가 어떻게 찍혔는지 한 장.
@@ -318,6 +324,37 @@ class RecordManager:
         try:
             path.write_text(json.dumps(quality), encoding="utf-8")
         except OSError:
+            pass
+
+    def _append_provenance(self, target: Path, runtime: dict[str, object]) -> None:
+        """`soarm_provenance.json` — 이 회가 어떤 조건에서 찍혔는지, 회마다 한 항목씩.
+
+        **배열에 덧붙인다.** 한 데이터셋에 여러 번 이어 찍으면 조건이 회마다 다를 수
+        있고(카메라 컨트롤이 안 걸린 회, 진단이 다른 회, 다른 커밋으로 찍은 회), 마지막
+        것만 남기면 앞의 회차들이 무슨 조건에서 찍혔는지 답할 곳이 사라진다.
+
+        자식과 부모가 아는 것이 다르다. 시작 epoch·커밋·calibration 해시·fps는 자식이
+        상태 파일에 적어 두고, 카메라 컨트롤 되읽기와 시작 진단은 여기 부모에게만 있다.
+        둘을 여기서 합쳐 한 항목으로 쓴다 — 파일 하나를 두 프로세스가 쓰지 않는다.
+        """
+        provenance = runtime.get("provenance")
+        if not isinstance(provenance, dict):
+            return
+        entry = dict(provenance)
+        entry["camera_controls"] = self._camera_controls
+        entry["doctor"] = self._doctor
+        path = target / "soarm_provenance.json"
+        history: list[object] = []
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, list):
+                history = existing
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        history.append(entry)
+        try:
+            path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        except (OSError, TypeError):
             pass
 
     def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:

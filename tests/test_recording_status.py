@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from soarm_console import recording
+from soarm_console import recording, sensors
 
 
 class _Robot:
@@ -454,3 +454,122 @@ def test_a_preview_failure_never_stops_the_recording(tmp_path, monkeypatch):
     writer.stop()
 
     assert not (tmp_path / "preview-scene.jpg").exists()
+
+
+# MARK: 서보 판독값이 관측에 얹히는 자리
+
+
+class _BusRobot(_CameraRobot):
+    """버스를 가진 팔로워. 블록 읽기가 몇 번 일어나는지 세기 위한 것이다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+        self.last_read: tuple[int, int, tuple[int, ...]] | None = None
+        robot = self
+
+        class _Bus:
+            motors = {
+                name: SimpleNamespace(id=index + 1)
+                for index, name in enumerate(sensors.MOTORS)
+            }
+            # 어느 레지스터를 물어보든 7을 돌려준다. 여기서 보려는 것은 값이 아니라
+            # "틱당 몇 번 읽었나"와 "값이 관측에 실렸나"이다. 바이트를 쪼개고 부호를 푸는
+            # 쪽은 `test_sensors.py`가 진짜 버스로 본다.
+            sync_reader = SimpleNamespace(getData=lambda *args: 7)
+
+            def _sync_read(self, addr, length, ids, **kwargs):
+                robot.reads += 1
+                robot.last_read = (addr, length, tuple(ids))
+                return {id_: 0 for id_ in ids}, 0
+
+            def _is_comm_success(self, comm):
+                return comm == 0
+
+            def _decode_sign(self, data_name, ids_values):
+                return ids_values
+
+        self.bus = _Bus()
+
+
+def test_an_episode_reads_the_servo_block_once_per_tick_and_lands_it_on_the_observation(
+    tmp_path, monkeypatch
+):
+    robot = _BusRobot()
+    runtime = _run_loop(monkeypatch, tmp_path, robot, ticks=6)
+
+    assert robot.reads == 6
+    assert robot.last_read == (sensors.BLOCK_ADDRESS, sensors.BLOCK_LENGTH, (1, 2, 3, 4, 5, 6))
+    # 관측 dict에 값이 실렸다. `build_dataset_frame`이 이 키들을 보고 열을 채운다.
+    observation = robot.last_observation
+    assert observation["gripper.load"] == 7.0
+    assert observation["shoulder_pan.temp"] == 7.0
+    assert observation["since_start"] > 0.0
+    assert observation[sensors.CAMERA_FRESH_KEY] == [1.0, 1.0]
+    # 그리고 카메라 그림은 그대로 남아 있다.
+    assert observation["scene"] is robot._held["scene"]
+    # 상태는 이 읽기가 30Hz 예산에서 얼마를 가져갔는지 말한다.
+    assert runtime["extras_read_ms"] >= 0.0
+    assert runtime["extras_read_failures"] == 0
+
+
+def test_the_reset_segment_does_not_touch_the_bus(tmp_path, monkeypatch):
+    """정리 구간의 값은 어느 프레임에도 들어가지 않는다. 읽으면 버스 시간만 쓴다."""
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    robot = _BusRobot()
+
+    def fake_record_loop(*args, **kwargs):
+        for _ in range(4):
+            kwargs["robot"].get_observation()
+
+    monkeypatch.setattr(recording, "_ORIGINAL_RECORD_LOOP", fake_record_loop)
+    recording._record_loop_with_status(robot=robot, dataset=None, control_time_s=5)
+
+    assert robot.reads == 0
+    assert "gripper.load" not in robot.last_observation
+
+
+# MARK: 회 단위 provenance
+
+
+def test_provenance_says_what_this_run_was_recorded_with(tmp_path, monkeypatch):
+    from soarm_console.config import Settings
+
+    settings = Settings(
+        scene_camera="/dev/v4l/by-path/scene", wrist_camera="/dev/v4l/by-path/wrist"
+    )
+    config = recording.build_record_config(settings, "Pick and place", "soarm101_pick")
+
+    provenance = recording._provenance(settings, config)
+
+    assert provenance["started_at"] == recording._started_at
+    assert provenance["fps"] == 30
+    assert provenance["episode_seconds"] == config.dataset.episode_time_s
+    assert provenance["reset_seconds"] == config.dataset.reset_time_s
+    assert provenance["extras_schema"] == sensors.EXTRAS_SCHEMA
+    assert provenance["lerobot"].startswith("0.6")
+    # calibration 해시는 파일이 있을 때만 값이 있다. 없다는 것도 기록이다.
+    assert set(provenance) == {
+        "started_at",
+        "server_commit",
+        "lerobot",
+        "follower_calibration_sha256",
+        "leader_calibration_sha256",
+        "episode_seconds",
+        "reset_seconds",
+        "fps",
+        "extras_schema",
+    }
+
+
+def test_calibration_hashes_identify_the_ruler_the_data_was_measured_with(tmp_path):
+    calibration = tmp_path / "follower.json"
+    calibration.write_text('{"shoulder_pan": {}}', encoding="utf-8")
+
+    import hashlib
+
+    assert recording._file_sha256(calibration) == hashlib.sha256(
+        calibration.read_bytes()
+    ).hexdigest()
+    assert recording._file_sha256(tmp_path / "absent.json") is None

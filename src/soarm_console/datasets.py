@@ -84,6 +84,37 @@ def _episode_rows(directory: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def dataset_tasks(name: str) -> list[str]:
+    """이 데이터셋이 담고 있는 과제들. 정렬된 문자열 목록.
+
+    이어 찍기가 이 값을 본다. LeRobot은 과제가 다른 회차도 같은 데이터셋에 넣을 수
+    있지만, 이 콘솔에서 데이터셋 하나는 학습 한 번의 단위다 — 서로 다른 시연이 한 폴더에
+    섞이면 그 사실은 파케이 안에만 남고 화면 어디에도 나타나지 않는다.
+    """
+    directory = _dataset_dir(name)
+    path = directory / "meta/tasks.parquet"
+    if not path.exists():
+        return []
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, columns=["task"])
+    return sorted({str(value) for value in table.column("task").to_pylist()})
+
+
+def dataset_quality(name: str) -> dict[str, Any] | None:
+    """`record_manager`가 수집이 끝나며 남긴 품질 요약. 없으면 `None`.
+
+    데이터셋 자신은 자기가 어떻게 찍혔는지 말하지 못한다 — `timestamp`는
+    `frame_index / fps`로 합성된 값이라 루프가 느렸어도 파케이는 30Hz라고 적혀 있다.
+    """
+    directory = _dataset_dir(name)
+    try:
+        return json.loads((directory / "soarm_quality.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 def summarize(name: str) -> dict[str, Any]:
     directory = _dataset_dir(name)
     info = _read_info(directory)
@@ -97,6 +128,10 @@ def summarize(name: str) -> dict[str, Any]:
         "cameras": video_keys(info),
         "size_bytes": _directory_size(directory),
         "recorded_at": (directory / "meta/info.json").stat().st_mtime,
+        # 목록에 함께 싣는다. 맥 앱이 데이터셋마다 상세를 한 번씩 더 묻지 않게 하려는
+        # 것이고, 둘 다 파일 하나를 읽는 값이라 목록이 무거워지지 않는다.
+        "tasks": dataset_tasks(name),
+        "quality": dataset_quality(name),
     }
 
 
@@ -152,6 +187,88 @@ def describe(name: str) -> dict[str, Any]:
     summary = summarize(name)
     summary["episodes_detail"] = episodes
     return summary
+
+
+# MARK: 지우기
+
+
+def trash_root() -> Path:
+    """지운 것이 가는 자리.
+
+    점으로 시작하므로 `list_datasets`의 `NAME_PATTERN`에 걸리지 않는다 — 지운 데이터셋이
+    목록에 다시 나타나지 않으면서도 디스크에는 남는다. 실제로 지우는 것은 사람이
+    `rm -rf data/.trash`로 한다. 몇 시간짜리 시연을 담은 폴더를 웹 요청 하나가
+    영구히 없애도 되는 이유가 없다.
+    """
+    return data_root() / ".trash"
+
+
+def _trash_target(name: str) -> Path:
+    from datetime import datetime
+
+    root = trash_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def move_to_trash(name: str) -> Path:
+    """데이터셋 하나를 `data/.trash` 아래로 옮긴다. 옮겨 간 자리를 돌려준다."""
+    directory = _dataset_dir(name)
+    target = _trash_target(name)
+    shutil.move(str(directory), str(target))
+    return target
+
+
+def delete_episode(name: str, episode_index: int, *, timeout: float = 900) -> dict[str, Any]:
+    """회차 하나를 데이터셋에서 들어낸다.
+
+    직접 파케이를 고치지 않는다. v3의 한 회차는 데이터 파케이의 행들, 에피소드 메타의
+    한 줄, 카메라마다 영상 파일 안의 한 구간, 그리고 `info.json`의 합계에 걸쳐 있고,
+    그것을 다시 꿰는 코드는 이미 LeRobot 안에 있다(`lerobot-edit-dataset`). 여기서 다시
+    쓰면 두 번째 구현이 생기고, 틀렸을 때 데이터셋이 조용히 망가진다.
+
+    제자리 편집이라 LeRobot은 원본을 `data/<name>_old`로 옮겨 둔다
+    (`lerobot_edit_dataset.get_output_path`). 그 이름은 `NAME_PATTERN`에 맞으므로 그냥
+    두면 목록에 데이터셋이 하나 더 생긴다. 끝난 뒤 `.trash`로 보낸다.
+    """
+    import subprocess
+
+    directory = _dataset_dir(name)
+    if episode_index not in {
+        int(row.get("episode_index", -1)) for row in _episode_rows(directory)
+    }:
+        raise FileNotFoundError(str(episode_index))
+
+    project = data_root().parent
+    result = subprocess.run(
+        [
+            str(project / ".venv/bin/lerobot-edit-dataset"),
+            "--operation.type=delete_episodes",
+            f"--operation.episode_indices=[{int(episode_index)}]",
+            f"--repo_id={name}",
+            f"--root={directory}",
+            f"--new_repo_id={name}",
+            f"--new_root={directory}",
+        ],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    backup = directory.with_name(f"{directory.name}_old")
+    if result.returncode != 0:
+        if backup.is_dir() and not directory.is_dir():
+            # 편집이 실패했는데 원본은 이미 옮겨져 있다. 데이터셋이 사라진 채로 두지
+            # 않는다 — 되돌려 놓고 나서 실패를 말한다.
+            shutil.move(str(backup), str(directory))
+        raise DatasetError(
+            (result.stderr or result.stdout or "").strip().splitlines()[-1:][0]
+            if (result.stderr or result.stdout or "").strip()
+            else f"lerobot-edit-dataset exited with {result.returncode}"
+        )
+    if backup.is_dir():
+        shutil.move(str(backup), str(_trash_target(backup.name)))
+    return describe(name)
 
 
 def _find_episode(directory: Path, episode_index: int) -> dict[str, Any]:

@@ -13,9 +13,22 @@ uv sync --all-groups
 ./scripts/doctor.sh
 ```
 
-`doctor.sh`는 모터 register를 바꾸지 않고 ID 1–6, model 777, voltage, position, torque 상태를
-읽는다. 읽기도 serial packet을 보내므로 다른 owner가 있으면 장치 lock이 거절한다. motion
-시작 전 기대값은 두 팔 모두 healthy이고 torque가 꺼진 상태다.
+`doctor.sh`는 모터 register를 바꾸지 않고 ID 1–6, model 777, voltage, position, torque,
+temperature를 읽는다. 읽기도 serial packet을 보내므로 다른 owner가 있으면 장치 lock이
+거절한다. motion 시작 전 기대값은 두 팔 모두 `healthy`이고, **torque가 켜져 있어도 된다**
+(2026-09-05). 텔레옵과 수집은 팔이 떨어지지 않도록 토크를 켠 채 끝나므로, 켜져 있는 것이
+정상적으로 끝낸 세션 다음의 모습이다. 자세한 이유는 `SAFETY.md`의 "진단이 더 이상 토크를
+묻지 않는다"에 있다.
+
+### 1.1 영상 인코딩에 필요한 시스템 라이브러리
+
+이 기계에는 `libavdevice.so.58`이 없어 `torchcodec`이 로드되지 않는다. 동작 자체는
+`pyav` 폴백으로 돌지만, `record.log`가 100줄짜리 트레이스백으로 시작해 정작 읽어야 할
+경고를 밀어낸다. 사람이 한 번 설치한다:
+
+```bash
+sudo apt install ffmpeg
+```
 
 ## 2. Observation-only 웹 UI
 
@@ -65,17 +78,28 @@ Follower와 Leader를 안전한 가운데 자세에 두고, 안내되는 관절�
 
 ## 4. 첫 물리 리더 Teleoperation
 
-1. 두 팔을 대응되는 비슷한 자세로 손으로 맞춘다.
-2. 현장에 사람이 있고 follower 주변에 장애물이 없는지 확인한다.
-3. `config/soarm.env`의 `SOARM_ENABLE_MOTION=1`을 확인하고 웹 서비스를 재시작한다.
-4. 웹 `환경 진단`에서 healthy와 torque disabled를 확인한다.
-5. `텔레옵 시작`에서 현장 확인 문구를 사람이 직접 입력한다. UI가 미리 채우지 않는다.
+1. 현장에 사람이 있고 follower 주변에 장애물이 없는지 확인한다.
+2. `config/soarm.env`의 `SOARM_ENABLE_MOTION=1`을 확인하고 웹 서비스를 재시작한다.
+3. 웹 `환경 진단`에서 `healthy`를 확인한다. 토크 상태는 이제 시작을 막지 않는다.
+4. `텔레옵 시작`에서 현장 확인 문구를 사람이 직접 입력한다. UI가 미리 채우지 않는다.
+5. **팔로워가 리더의 지금 자세까지 스스로 걸어간다**(최대 6초). 그동안 리더를 움직이지
+   않는다 — 목표는 시작하는 순간의 리더 자세로 한 번만 잡는다. 걸어가는 도중 무언가
+   잘못되면 `현재 모드 중지`가 그 자리에서 세운다(토크는 유지된다).
 6. 작은 변화로 관절 방향을 하나씩 확인한다.
 7. 문제가 있으면 `현재 모드 중지`를 누르고 물리 전원 차단을 준비한다.
 
+두 팔을 손으로 맞춰 두지 않아도 된다(2026-09-05). 예전에는 1번이 "두 팔을 비슷한 자세로
+손으로 맞춘다"였는데, LeRobot의 첫 틱이 리더 자세를 그대로 보내므로 그 맞춤이 사람의
+책임이었다. 지금은 시작 정렬이 그 일을 하고, 사람이 하던 맞춤보다 정확하다.
+
 물리 리더 경로에는 가상 리더의 lease/watchdog/health trip이 없다. LeRobot의
-`max_relative_target=2`와 현장 사람만 남는다. 종료나 예외에서 자동 torque-off하지 않도록
+`max_relative_target`과 현장 사람만 남는다. 종료나 예외에서 자동 torque-off하지 않도록
 설정되어 있으므로, 프로세스가 멈췄다는 사실을 팔의 무에너지 상태로 해석하지 않는다.
+
+텔레옵 자식은 `scripts/teleoperate.sh` → `soarm_console.teleoperating`이다. 로그는
+`/api/status`의 `teleoperation.logs`에 실리고, 정렬이 시작될 때
+`Walking the follower to the leader's pose over N.Ns (furthest joint <이름> <거리>)` 한 줄을
+남긴다.
 
 ## 5. Dataset recording
 
@@ -84,8 +108,56 @@ Follower와 Leader를 안전한 가운데 자세에 두고, 안내되는 관절�
 2. 두 preview로 역할과 방향을 확인한 뒤 preview를 중지한다.
 3. `SOARM_CAMERA_ROLES_CONFIRMED=1`을 확인한다.
 4. 수집 확인 문구는 사람이 직접 입력하고 task, episode 수와 시간을 고른다.
-5. 성공은 오른쪽, 재시도는 왼쪽, 종료는 Esc에 해당하는 웹 제어로 기록한다.
-6. `data/`의 dataset과 `runtime/record/status.json` 상태를 확인한다.
+5. 첫 회차 앞에서 팔로워가 리더 자세까지 걸어간다(`phase="aligning"`). 그동안 리더를
+   움직이지 않는다.
+6. 성공은 오른쪽, 재시도는 왼쪽, 저장하고 종료는 Esc, **찍던 회를 버리고 종료는 `abort`**에
+   해당하는 웹 제어로 기록한다.
+7. `data/`의 dataset과 `runtime/record/status.json` 상태를 확인한다.
+
+### 5.1 회차를 버리는 것과 저장하고 끝내는 것
+
+`esc`는 루프를 빠져나온 뒤 `save_episode()`가 그대로 돌아 **찍다 만 회를 저장한다.**
+`data/soarm101_20260905_092024`의 2회차가 그렇게 남았다 — 82프레임, 2.7초. 잘못된 회차를
+남기지 않고 끝내려면 `abort`를 쓴다.
+
+이미 들어 있는 회차를 꺼내려면:
+
+```bash
+curl -X DELETE http://127.0.0.1:8088/api/datasets/<name>/episodes/<index>
+```
+
+제자리 편집이므로 LeRobot이 원본을 `data/<name>_old`로 옮겼다가 콘솔이 그것을
+`data/.trash/`로 보낸다. 수집이나 재생이 도는 동안에는 409다. 데이터셋 전체를 지우는
+`DELETE /api/datasets/<name>`도 `data/.trash/<name>-<시각>`으로 **옮기기만** 한다 —
+디스크를 실제로 비우는 것은 사람이 `rm -rf data/.trash`로 한다.
+
+### 5.2 이어 찍기
+
+```bash
+curl -X POST http://127.0.0.1:8088/api/recording/start \
+  -H 'content-type: application/json' \
+  -d '{"confirmation":"RECORD SOARM101","task":"<기존과 똑같은 과제>",
+       "episodes":5,"episode_seconds":30,"dataset":"<name>","resume":true}'
+```
+
+과제 문자열이 데이터셋에 적힌 것과 **정확히** 같아야 한다. 다르면 400
+`Dataset task does not match: dataset has […], request has […]`다.
+
+### 5.3 수집 중에 카메라가 무엇을 보고 있나
+
+수집이 도는 동안 콘솔의 MJPEG 프리뷰는 꺼진다 — 장치를 쥔 것은 record 자식이다. 대신
+찍는 쪽이 보는 프레임이 5Hz로 내려온다:
+
+```bash
+curl -s http://127.0.0.1:8088/api/recording/preview/scene.jpg -o /tmp/scene.jpg
+```
+
+3초보다 오래된 그림은 404다. 404가 계속 나오는데 수집은 돌고 있다면 그 카메라가 프레임을
+주지 못하고 있다는 뜻이므로 `/api/status`의 `recording.runtime.camera_stale_pct`를 본다.
+
+수집이 끝나면 `data/<name>/record.log`와 `data/<name>/soarm_quality.json`이 남는다. 후자에는
+마지막 회차의 `loop_hz`, 카메라별 stale 비율, 이번 실행에서 센 느린 루프 경고 수가 들어 있고,
+`GET /api/datasets`가 그것을 함께 실어 보낸다.
 
 수집 중 serial과 camera owner는 `lerobot-record`다. 가상 리더 수집이면 콘솔은 목표만
 중계한다. 이때 부하·전류·온도·추종오차 감지는 **아직 구현되지 않았다**. 조사 결과만

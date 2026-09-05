@@ -344,10 +344,10 @@ def test_replay_takes_only_the_three_speeds(client, episode, near, started):
     assert started == []
 
 
-def test_replay_starts_from_eighty_degrees_away(
+def test_replay_starts_from_eighty_degrees_away_and_the_preview_says_so(
     client, episode, started, monkeypatch
 ):
-    """한때 이 자세는 400이었다. 지금은 걸어서 데려간다."""
+    """한때 이 자세는 400이었다. 지금은 시작하고, 사람은 미리보기로 거리를 읽는다."""
     from soarm_console import app as app_module
 
     # 팔꿈치가 에피소드의 첫 자세에서 80도 떨어져 있다.
@@ -355,11 +355,33 @@ def test_replay_starts_from_eighty_degrees_away(
         app_module, "present_position", lambda settings: _pose(1.0, 2.0, 83.0, 4.0, 5.0, 6.0)
     )
 
+    preview = client.get("/api/replay/preview", params={"dataset": "soarm101_pick", "episode": 0})
+    assert preview.status_code == 200
+    body = preview.json()
+    assert body["refusal"] is None
+    elbow = next(joint for joint in body["joints"] if joint["name"] == "elbow_flex")
+    assert elbow["distance"] == pytest.approx(80.0)
+    assert elbow["unit"] == "°"
+    # 관절 순서는 데이터셋이 정한 feature 순서 그대로다.
+    assert [joint["name"] for joint in body["joints"]] == MOTORS
+    # 걸어가는 데 걸리는 시간도 함께. 80도면 첨두 20°/s로 6초다.
+    assert body["align_seconds"] == pytest.approx(6.0)
+
     assert client.post("/api/replay/start", json=_body()).status_code == 200
     assert started == [("soarm101_pick", 0, 0.5)]
 
 
-    assert client.post("/api/replay/start", json=_body()).status_code == 200
+def test_replay_preview_refuses_while_another_mode_owns_the_arm(
+    client, episode, near, monkeypatch
+):
+    from soarm_console.record_manager import RecordManager
+
+    monkeypatch.setattr(RecordManager, "running", True)
+    response = client.get("/api/replay/preview", params={"dataset": "soarm101_pick"})
+    assert response.status_code == 409
+    assert "one owner" in response.json()["detail"]
+
+
 def test_replay_starts_at_half_speed_by_default(client, episode, near, started):
     response = client.post("/api/replay/start", json=_body())
     assert response.status_code == 200

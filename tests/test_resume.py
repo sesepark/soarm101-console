@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from soarm_console import datasets
+from soarm_console import datasets, sensors
 from soarm_console.config import Settings
 from soarm_console.recording import build_record_config
 
@@ -25,7 +25,7 @@ def data_root(tmp_path, monkeypatch):
     return root
 
 
-def _record_one_episode(root, name: str, task: str = TASK):
+def _record_one_episode(root, name: str, task: str = TASK, sensor_columns: bool = True):
     """LeRobot이 실제로 쓰는 길로 데이터셋 하나를 만든다.
 
     파케이를 손으로 짜 넣지 않는 이유가 있다. 이어 찍기가 통과해야 하는 것은 우리가
@@ -36,6 +36,9 @@ def _record_one_episode(root, name: str, task: str = TASK):
     카메라는 넣지 않는다. 영상 인코딩은 이 기계에 `libavdevice`가 없어 돌지 않고
     (`RUNBOOK`), 이어 찍기가 보는 것 — 로봇 종류, fps, feature, 과제 — 은 카메라 없이도
     그대로 시험된다.
+
+    `sensor_columns=False`는 서보 판독값 열이 생기기 전에 찍은 데이터셋을 만든다. 지금
+    남아 있는 두 시험용 데이터셋이 그 모양이고, 콘솔은 그것에 이어 찍기를 거절해야 한다.
     """
     from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
     from lerobot.datasets import (
@@ -63,6 +66,9 @@ def _record_one_episode(root, name: str, task: str = TASK):
             use_videos=True,
         ),
     )
+    if sensor_columns:
+        # 수집이 실제로 하는 것과 같은 자리에서 더한다(`recording._combine_feature_dicts_with_sensors`).
+        features.update(sensors.extra_features())
     dataset = LeRobotDataset.create(
         f"local/{name}", 30, root=root / name, robot_type=robot.name, features=features,
         use_videos=True,
@@ -174,6 +180,46 @@ def test_resuming_the_same_task_starts_and_tells_the_child_to_append(client, dat
     (_, kwargs), = started
     assert kwargs["dataset"] == "soarm101_pick"
     assert kwargs["resume"] is True
+
+
+def test_resuming_a_dataset_recorded_without_the_sensor_columns_is_refused(client, data_root):
+    """새 열이 없는 데이터셋에는 이어 찍을 수 없다.
+
+    `record()`는 `LeRobotDataset.resume` 뒤 `sanity_check_dataset_robot_compatibility`에서
+    feature가 다르다며 자식 프로세스 안에서 죽는다. 그 죽음은 화면에 로그 한 줄로만
+    나타나므로, 사람은 무엇을 해야 하는지 알 수 없다. 여기서 먼저 거절하고 그 답 — 새
+    데이터셋으로 찍으라 — 을 문장에 담는다.
+    """
+    session, started = client
+    _record_one_episode(data_root, "soarm101_pick", sensor_columns=False)
+
+    response = session.post("/api/recording/start", json=_body())
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Dataset was recorded without the sensor columns; start a new dataset"
+    )
+    assert started == []
+    # 그리고 그 데이터셋은 자기가 무엇을 담고 있지 않은지 목록에서도 말한다.
+    assert datasets.summarize("soarm101_pick")["extras"] == []
+
+
+def test_a_dataset_recorded_with_the_sensor_columns_still_passes_lerobots_own_check(data_root):
+    """새 열을 넣고 만든 데이터셋이 `LeRobotDataset.resume`을 그대로 지난다.
+
+    features에 열을 더하는 자리를 잘못 잡으면(관측 features에 더하면) `observation.state`가
+    여섯에서 마흔둘로 늘고, 그때도 데이터셋은 만들어진다 — 어긋난 것은 다음 이어 찍기와
+    지금까지 학습한 정책 쪽이다. 그래서 상태 벡터의 모양을 여기서 함께 못 박는다.
+    """
+    from lerobot.datasets import LeRobotDataset
+
+    robot, features, sanity_check = _record_one_episode(data_root, "soarm101_pick")
+
+    resumed = LeRobotDataset.resume("local/soarm101_pick", root=data_root / "soarm101_pick")
+    sanity_check(resumed, robot, 30, features)
+
+    assert resumed.meta.features["observation.state"]["shape"] == (6,)
+    assert datasets.summarize("soarm101_pick")["extras"] == list(sensors.extra_suffixes())
 
 
 def test_a_fresh_recording_does_not_need_a_dataset_name(client):

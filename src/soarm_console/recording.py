@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import json
+import subprocess
 import threading
 import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
+from importlib.metadata import version
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +23,7 @@ from lerobot.scripts.lerobot_record import RecordConfig
 from lerobot.teleoperators.so_leader import SO101LeaderConfig
 from lerobot.utils.keyboard_input import apply_recording_control
 
+from . import sensors
 from .calibration import validate_calibration
 from .config import Settings
 from .follower_start import (
@@ -39,6 +43,8 @@ STATUS_PATH = RUNTIME_DIR / "status.json"
 _STATUS_LOCK = threading.Lock()
 _ORIGINAL_RECORD_LOOP = lerobot_record.record_loop
 _ORIGINAL_SAVE_EPISODE = LeRobotDataset.save_episode
+_ORIGINAL_COMBINE_FEATURE_DICTS = lerobot_record.combine_feature_dicts
+_ORIGINAL_BUILD_DATASET_FRAME = lerobot_record.build_dataset_frame
 DATA_ROOT = Path(__file__).parents[2] / "data"
 NAME_PATTERN = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\Z")
 
@@ -57,6 +63,11 @@ PREVIEW_QUALITY = 75
 #: 상태에 함께 적는다 — 회차가 몇 개 남았는지는 수집이 끝난 뒤에도 화면이 물어보는 것이다.
 _episodes_saved = 0
 
+#: 이 프로세스가 시작한 epoch. `observation.wall_time`의 기준이고, 그 기준이 무엇이었는지는
+#: `soarm_provenance.json`의 `started_at`에 적힌다. 모듈을 읽는 자리에서 한 번만 잰다 —
+#: 회차마다 다시 재면 회차 사이에서 시계가 뒤로 간다.
+_started_at = time.time()
+
 #: 시작 정렬을 할 것인가. 가상 리더로 찍을 때는 하지 않는다 —
 #: `vleader.start_relay`가 이미 팔로워의 지금 자세에서 목표를 이어 준다.
 _align_on_start = False
@@ -69,7 +80,13 @@ def _idle_rate_fields() -> dict[str, object]:
     지난 회차의 loop_hz와 카메라 수치가 상태에 남아 있으면, 멈춘 수집이 계속 30Hz로
     돌고 있는 것처럼 보인다.
     """
-    return {"loop_hz": 0.0, "camera_fresh_hz": {}, "camera_stale_pct": {}}
+    return {
+        "loop_hz": 0.0,
+        "camera_fresh_hz": {},
+        "camera_stale_pct": {},
+        "extras_read_ms": 0.0,
+        "extras_read_failures": 0,
+    }
 
 
 def _write_status(**updates: object) -> None:
@@ -92,10 +109,13 @@ def _write_status(**updates: object) -> None:
 class _LoopRateMonitor:
     """Publish a rolling rate without doing file I/O in the control loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, reader: sensors.SensorReader | None = None) -> None:
         self.samples: deque[float] = deque()
         # 카메라별 (시각, 새 프레임인가) 표본. 루프 표본과 같은 창을 쓴다.
         self.camera_samples: dict[str, deque[tuple[float, bool]]] = {}
+        # 서보 블록 읽기가 한 틱에서 얼마나 쓰는지. 이 값이 곧 새 열이 30Hz 예산에서
+        # 가져간 몫이고, 사람이 실물로 확인할 때 물어보는 첫 번째 숫자다.
+        self.reader = reader
         self.lock = threading.Lock()
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -151,10 +171,17 @@ class _LoopRateMonitor:
 
     def _publish(self) -> None:
         loop_hz, fresh_hz, stale_pct = self.snapshot()
+        extras: dict[str, object] = {}
+        if self.reader is not None:
+            extras = {
+                "extras_read_ms": round(self.reader.read_ms(), 3),
+                "extras_read_failures": self.reader.read_failures,
+            }
         _write_status(
             loop_hz=float(loop_hz),
             camera_fresh_hz=fresh_hz,
             camera_stale_pct=stale_pct,
+            **extras,
         )
 
     def _run(self) -> None:
@@ -236,17 +263,27 @@ class _PreviewWriter:
 
 
 class _RateTrackedRobot:
-    """Count loop entries while leaving the LeRobot robot object untouched."""
+    """Count loop entries, and hang the servo's other readings off the same tick.
+
+    LeRobot이 관측에서 데이터셋으로 옮기는 값은 `robot.observation_features`가 정하는데,
+    거기에 무엇을 더하면 `hw_to_dataset_features`가 그것을 **`observation.state`로 묶는다**.
+    그러면 상태 벡터가 여섯에서 마흔둘로 늘고 기존 데이터로 배운 정책과 사전학습 정규화
+    통계가 전부 어긋난다. 그래서 features 쪽은 따로 손대고(`_combine_feature_dicts_with_sensors`),
+    값은 여기서 관측 dict에 직접 얹는다 — `build_dataset_frame`이 `names`를 키로 값을
+    모아 가므로, 열 이름만 맞으면 나머지는 LeRobot이 한다.
+    """
 
     def __init__(
         self,
         robot: object,
         monitor: _LoopRateMonitor,
         preview: _PreviewWriter | None = None,
+        reader: sensors.SensorReader | None = None,
     ) -> None:
         self._robot = robot
         self._monitor = monitor
         self._preview = preview
+        self._reader = reader
         self._last_frames: dict[str, np.ndarray] = {}
 
     def __getattr__(self, name: str) -> object:
@@ -254,11 +291,29 @@ class _RateTrackedRobot:
 
     def get_observation(self) -> object:
         self._monitor.tick()
+        # `SOFollower.get_observation()`은 맨 처음에 `Present_Position`을 읽는다. 그래서
+        # 여기가 이 프레임의 상태가 실제로 측정된 시각이다 — 카메라를 읽고 돌아온 뒤에
+        # 재면 그사이의 수 밀리초가 위치의 시각인 것처럼 적힌다.
+        position_read_at = time.time()
         observation = self._robot.get_observation()
-        # 관찰값은 읽기만 한다. 이 proxy는 LeRobot에게 투명해야 한다.
-        self._monitor.observe_cameras(self._camera_freshness(observation))
+        fresh = self._camera_freshness(observation)
+        self._monitor.observe_cameras(fresh)
         self._offer_previews(observation)
+        self._add_sensor_extras(observation, position_read_at, fresh)
         return observation
+
+    def _add_sensor_extras(
+        self, observation: object, position_read_at: float, fresh: dict[str, bool]
+    ) -> None:
+        """서보의 나머지 판독값을 관측 dict에 얹는다.
+
+        카메라 그림을 다 읽은 **뒤에** 버스를 만지는 것이 맞다. `read_latest()`는 블로킹이
+        아니지만 위치 읽기는 시리얼 왕복이고, 그 사이에 블록 읽기를 끼우면 위치와 그림의
+        시차가 그만큼 벌어진다.
+        """
+        if self._reader is None or not isinstance(observation, dict):
+            return
+        observation.update(self._reader.observation_extras(position_read_at, fresh))
 
     def _offer_previews(self, observation: object) -> None:
         if self._preview is None or not isinstance(observation, dict):
@@ -333,7 +388,14 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     robot = kwargs["robot"]
     dataset = kwargs.get("dataset")
     control_time_s = kwargs["control_time_s"]
-    monitor = _LoopRateMonitor()
+    # 정리 구간(`dataset is None`)에서는 서보 블록을 읽지 않는다. 그 구간의 값은 어느
+    # 프레임에도 들어가지 않으므로, 읽어 봐야 버스 시간만 쓴다.
+    reader = (
+        sensors.SensorReader(getattr(robot, "bus", None), _started_at)
+        if dataset is not None
+        else None
+    )
+    monitor = _LoopRateMonitor(reader)
     preview = _PreviewWriter(RUNTIME_DIR)
 
     if dataset is None:
@@ -360,13 +422,54 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
         )
 
     forwarded = dict(kwargs)
-    forwarded["robot"] = _RateTrackedRobot(robot, monitor, preview)
+    forwarded["robot"] = _RateTrackedRobot(robot, monitor, preview, reader)
     monitor.start()
     try:
         return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
     finally:
         monitor.stop()
         preview.stop()
+
+
+def _combine_feature_dicts_with_sensors(*dicts: dict) -> dict:
+    """LeRobot이 만든 features에 서보 판독값 열 아홉 개를 더한다.
+
+    여기가 그 자리인 이유. `hw_to_dataset_features`는 `robot.observation_features`의 float
+    항목을 **전부 `observation.state` 하나로 묶는다.** 그러니 관측 features에 더하면 상태
+    벡터가 늘어나고, 그 순간 기존 데이터셋으로 배운 정책도 사전학습 정규화 통계도 모양이
+    맞지 않게 된다. 묶기가 끝난 **뒤** 결과 dict에 별도 열로 더하면 그런 일이 없다 —
+    정책은 자기가 모르는 열을 지나친다.
+
+    `LeRobotDataset.create`가 이 dict를 그대로 `info.json`에 적고, 그 뒤로는 그 파일이
+    "이 데이터셋에 무엇이 들어 있나"의 답이 된다.
+    """
+    features = _ORIGINAL_COMBINE_FEATURE_DICTS(*dicts)
+    features.update(sensors.extra_features())
+    return features
+
+
+def _build_dataset_frame_with_sensors(
+    ds_features: dict, values: dict, prefix: str
+) -> dict:
+    """`observation.camera_fresh`만 손으로 채우고 나머지는 LeRobot에게 맡긴다.
+
+    다른 여덟 열은 `names`가 관측 dict의 키와 그대로 맞아떨어지므로 원본이 알아서 모은다.
+    이 열의 이름은 `scene`·`wrist`인데, 관측 dict의 그 두 키에는 이미 카메라가 준 그림이
+    들어 있다. 원본에게 맡기면 `np.array([그림, 그림], dtype=float32)`를 만들다 죽는다.
+    그래서 이 열만 features에서 빼서 원본을 부르고, 값은 옆으로 실어 온 자리에서 꺼낸다.
+    """
+    handled = {
+        key: ft
+        for key, ft in ds_features.items()
+        if key in sensors.SIDE_CHANNEL_COLUMNS and key.startswith(prefix)
+    }
+    if not handled:
+        return _ORIGINAL_BUILD_DATASET_FRAME(ds_features, values, prefix)
+    remaining = {key: ft for key, ft in ds_features.items() if key not in handled}
+    frame = _ORIGINAL_BUILD_DATASET_FRAME(remaining, values, prefix)
+    for key in handled:
+        frame[key] = np.asarray(values[key], dtype=np.float32)
+    return frame
 
 
 def _save_episode_with_status(self, *args: object, **kwargs: object) -> object:
@@ -523,6 +626,57 @@ def build_record_config(
     )
 
 
+def _file_sha256(path: Path) -> str | None:
+    """이 파일의 내용 해시. 없거나 읽지 못하면 `None`.
+
+    calibration은 데이터를 읽는 방식 자체다 — 같은 서보 눈금이 어떤 각도로 번역되는지가
+    거기 적혀 있다. 다시 잰 calibration으로 찍은 회차는 앞의 회차와 **다른 좌표계**에
+    있고, 그 사실은 데이터셋 안에서 전혀 보이지 않는다. 해시를 남겨 두면 나중에 두 회차가
+    같은 자로 잰 것인지 물어볼 수 있다.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _server_commit() -> str | None:
+    """이 데이터를 찍은 코드의 커밋. 저장소가 아니거나 git이 없으면 `None`."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).parents[2]), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _provenance(settings: Settings, config: RecordConfig) -> dict[str, object]:
+    """이 수집 회가 어떤 조건에서 찍혔는지. 자식이 아는 몫만.
+
+    카메라 컨트롤과 시작 진단은 부모(`record_manager`)가 쥐고 있으므로 여기서 적지 않는다.
+    부모가 회가 끝나는 자리에서 그 둘을 얹어 `data/<dataset>/soarm_provenance.json`에
+    **덧붙인다** — 한 데이터셋에 여러 번 이어 찍으면 항목이 그만큼 늘어난다.
+    """
+    return {
+        # `observation.wall_time`이 재는 0초. 이것이 없으면 그 열은 아무 시각도 가리키지 않는다.
+        "started_at": _started_at,
+        "server_commit": _server_commit(),
+        "lerobot": version("lerobot"),
+        "follower_calibration_sha256": _file_sha256(settings.follower_calibration),
+        "leader_calibration_sha256": _file_sha256(settings.leader_calibration),
+        "episode_seconds": int(config.dataset.episode_time_s),
+        "reset_seconds": int(config.dataset.reset_time_s),
+        "fps": int(config.dataset.fps),
+        "extras_schema": sensors.EXTRAS_SCHEMA,
+    }
+
+
 def _existing_episode_count(dataset_name: str) -> int:
     """이어 찍기 전에 이미 들어 있는 회차 수.
 
@@ -605,6 +759,8 @@ def main() -> None:
             reset_seconds=int(config.dataset.reset_time_s),
             episodes_saved=_episodes_saved,
             last_control=None,
+            started_at=_started_at,
+            provenance=_provenance(settings, config),
             **_idle_rate_fields(),
         )
         # 물리 리더로 찍을 때만 정렬한다. 가상 리더는 `vleader.start_relay`가 팔로워의
@@ -614,6 +770,10 @@ def main() -> None:
         install_safe_leader_start()
         lerobot_record.init_keyboard_listener = _init_gui_listener
         lerobot_record.record_loop = _record_loop_with_status
+        # 서보 판독값 열. features를 만드는 자리와 프레임을 채우는 자리를 함께 갈아 끼운다 —
+        # 한쪽만 바꾸면 `validate_frame`이 "열은 있는데 값이 없다"로 회차를 통째로 막는다.
+        lerobot_record.combine_feature_dicts = _combine_feature_dicts_with_sensors
+        lerobot_record.build_dataset_frame = _build_dataset_frame_with_sensors
         LeRobotDataset.save_episode = _save_episode_with_status
         try:
             # 여기서 `phase="recording"`을 쓰지 않는다. 모터와 카메라를 여는 데 몇 초가

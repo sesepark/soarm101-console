@@ -443,6 +443,7 @@ def test_status_names_every_capability_the_app_looks_for():
         "train",
         "replay_preview",
         "soft_start",
+        "sensor_extras",
     ]
 
 
@@ -465,6 +466,16 @@ def test_every_named_capability_has_something_behind_it():
     assert ("/api/spark/train", "POST") in methods
     assert ("/api/spark/runs/{run}/stop", "POST") in methods
     assert "/api/recording/control" in paths
+    # `sensor_extras`가 가리키는 길은 새 끝점이 아니라 기존 응답에 실리는 열이다.
+    # 궤적이 내주겠다고 적어 둔 열은 전부 수집이 실제로 쓰는 열이어야 한다 — 아니면 앱은
+    # 영원히 오지 않는 값을 기다린다.
+    from soarm_console import datasets, sensors
+
+    assert set(datasets.TRAJECTORY_EXTRAS) <= set(sensors.extra_columns())
+    # 그리고 요약이 내보내는 `extras` 목록은 수집이 넣은 열 그대로다.
+    assert datasets.extra_columns({"features": sensors.extra_features()}) == list(
+        sensors.extra_suffixes()
+    )
 
 
 def test_abort_is_a_control_the_recorder_accepts():
@@ -629,6 +640,38 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
     assert quality["camera_stale_pct"] == {"wrist": 9.0}
     assert quality["slow_loop_warnings"] == 2
     assert quality["recorded_at"] > 0
+
+
+def test_provenance_appends_one_entry_per_collection_session(tmp_path, monkeypatch):
+    """이어 찍으면 항목이 늘어난다. 마지막 것만 남기면 앞 회차의 조건이 사라진다."""
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=0)
+    manager._camera_controls = {"scene": {"values": {"auto_exposure": 3}, "failures": []}}
+    manager._doctor = {"healthy": True}
+    first = {"started_at": 1000.0, "server_commit": "abc123", "fps": 30, "extras_schema": 1}
+    second = {"started_at": 2000.0, "server_commit": "def456", "fps": 30, "extras_schema": 1}
+
+    manager._append_provenance(data, {"provenance": first})
+    manager._append_provenance(data, {"provenance": second})
+
+    history = json.loads((data / "soarm_provenance.json").read_text(encoding="utf-8"))
+    assert [entry["started_at"] for entry in history] == [1000.0, 2000.0]
+    assert [entry["server_commit"] for entry in history] == ["abc123", "def456"]
+    # 자식이 모르는 두 가지는 부모가 얹는다.
+    assert history[0]["camera_controls"]["scene"]["values"] == {"auto_exposure": 3}
+    assert history[0]["doctor"] == {"healthy": True}
+
+
+def test_a_run_that_wrote_no_provenance_leaves_the_history_alone(tmp_path, monkeypatch):
+    """옛 자식이나 시작하다 죽은 자식이다. 빈 항목을 넣어 기록을 흐리지 않는다."""
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=0)
+
+    manager._append_provenance(data, {"dataset_name": "soarm101_pick"})
+
+    assert not (data / "soarm_provenance.json").exists()
 
 
 def test_resuming_adds_this_runs_warnings_to_the_ones_already_counted(tmp_path, monkeypatch):

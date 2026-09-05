@@ -61,6 +61,38 @@ def video_keys(info: dict[str, Any]) -> list[str]:
     return sorted(key for key, value in features.items() if value.get("dtype") == "video")
 
 
+#: `observation.*` 가운데 이 열은 "추가로 남긴 값"이 아니다. 관절 위치이고, 정책이 읽는
+#: 상태 벡터 그 자체다.
+STATE_FEATURE = "observation.state"
+
+#: 궤적 응답이 함께 내줄 수 있는 열과, 응답에서 부르는 이름.
+TRAJECTORY_EXTRAS = {
+    "observation.load": "load",
+    "observation.velocity": "velocity",
+    "observation.camera_fresh": "camera_fresh",
+    "observation.wall_time": "wall_time",
+}
+
+
+def extra_columns(info: dict[str, Any]) -> list[str]:
+    """이 데이터셋이 위치 말고 무엇을 더 담고 있는가. 열 이름의 마지막 마디만.
+
+    화면이 물어보는 것은 "이 데이터셋에 부하가 들어 있나"이지 열 이름 전체가 아니다.
+    영상과 상태와 LeRobot이 늘 넣는 기본 열(`timestamp`·`frame_index` 따위, 어느 것도
+    `observation.`으로 시작하지 않는다)은 뺀다. 순서는 `info.json`에 적힌 순서 그대로다 —
+    정렬하면 어느 열이 함께 들어왔는지가 흐려진다.
+    """
+    features = info.get("features") or {}
+    return [
+        key.split(".")[-1]
+        for key, value in features.items()
+        if key.startswith("observation.")
+        and key != STATE_FEATURE
+        and not key.startswith("observation.images.")
+        and (value or {}).get("dtype") not in {"video", "image", "string"}
+    ]
+
+
 def _directory_size(directory: Path) -> int:
     return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
@@ -102,6 +134,15 @@ def dataset_tasks(name: str) -> list[str]:
     return sorted({str(value) for value in table.column("task").to_pylist()})
 
 
+def dataset_extras(name: str) -> list[str]:
+    """이 데이터셋이 담고 있는 서보 판독값 열. 이름으로 묻는 길.
+
+    이어 찍기 판정이 이 값을 본다 — 새 열이 없는 데이터셋에 이어 찍으면
+    `sanity_check_dataset_robot_compatibility`가 자식 프로세스 안에서 막는다.
+    """
+    return extra_columns(_read_info(_dataset_dir(name)))
+
+
 def dataset_quality(name: str) -> dict[str, Any] | None:
     """`record_manager`가 수집이 끝나며 남긴 품질 요약. 없으면 `None`.
 
@@ -132,6 +173,9 @@ def summarize(name: str) -> dict[str, Any]:
         # 것이고, 둘 다 파일 하나를 읽는 값이라 목록이 무거워지지 않는다.
         "tasks": dataset_tasks(name),
         "quality": dataset_quality(name),
+        # 서보가 함께 남긴 값들. 없으면 빈 목록이다 — 새 열이 생기기 전에 찍은 데이터셋이
+        # 그렇고, 그 데이터셋에는 이어 찍을 수 없다(`app._check_resumable`).
+        "extras": extra_columns(info),
     }
 
 
@@ -309,6 +353,16 @@ def _episode_data_table(directory: Path, episode_index: int, episode: dict[str, 
     ).sort_by([("frame_index", "ascending")])
 
 
+def _rows_of(values: list[Any]) -> list[list[float]]:
+    """프레임마다 값 하나짜리 열도 프레임마다 **목록**으로 내준다.
+
+    파케이는 `shape [1]`짜리 열(`observation.wall_time`)을 그냥 숫자로 돌려준다. 그대로
+    내보내면 이 열만 `state`·`load`와 다른 모양이 되고, 화면은 열마다 다른 방식으로
+    읽어야 한다. 선언한 모양(프레임 × 열 폭)을 응답에서도 지킨다.
+    """
+    return [value if isinstance(value, list) else [value] for value in values]
+
+
 def _feature_joint_names(info: dict[str, Any], feature: str) -> list[str]:
     names = ((info.get("features") or {}).get(feature) or {}).get("names")
     if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
@@ -328,12 +382,16 @@ def trajectory(name: str, episode_index: int) -> dict[str, Any]:
             f"Episode has {expected_frames} frames; limit is {TRAJECTORY_FRAME_LIMIT}"
         )
 
-    joints = _feature_joint_names(info, "observation.state")
+    joints = _feature_joint_names(info, STATE_FEATURE)
+    features = info.get("features") or {}
+    # 있는 열만 읽는다. `pq.read_table`은 없는 열 이름 하나에 통째로 실패하므로, 새 열이
+    # 생기기 전에 찍은 데이터셋의 궤적도 여기서 막히면 안 된다.
+    present = [column for column in TRAJECTORY_EXTRAS if column in features]
     table = _episode_data_table(
         directory,
         episode_index,
         episode,
-        ["episode_index", "frame_index", "observation.state", "action"],
+        ["episode_index", "frame_index", STATE_FEATURE, "action", *present],
     )
     frames = table.num_rows
     if frames > TRAJECTORY_FRAME_LIMIT:
@@ -345,15 +403,21 @@ def trajectory(name: str, episode_index: int) -> dict[str, Any]:
             f"Episode metadata says {expected_frames} frames but parquet contains {frames}"
         )
 
-    return {
+    payload = {
         "fps": info.get("fps", 0),
         "frames": frames,
         # Do not sort this list: each column in both arrays corresponds to this
         # exact feature order from meta/info.json.
         "joints": joints,
-        "state": table.column("observation.state").to_pylist(),
+        "state": table.column(STATE_FEATURE).to_pylist(),
         "action": table.column("action").to_pylist(),
     }
+    for column in present:
+        payload[TRAJECTORY_EXTRAS[column]] = _rows_of(table.column(column).to_pylist())
+    if "observation.camera_fresh" in present:
+        # 값만으로는 첫 열이 어느 카메라인지 알 수 없다. 이름을 `info.json`에서 그대로 옮긴다.
+        payload["camera_keys"] = _feature_joint_names(info, "observation.camera_fresh")
+    return payload
 
 
 def episode_actions(name: str, episode_index: int) -> dict[str, Any]:

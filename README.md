@@ -17,6 +17,7 @@
 - **이어 찍기와 데이터셋 정리** — `POST /api/recording/start`에 `{dataset, resume: true}`를 주면 기존 데이터셋에 회차를 이어 붙입니다(LeRobot의 `LeRobotDataset.resume` 경로). 과제가 다르면 400으로 거절합니다 — 데이터셋 하나는 학습 한 번의 단위이고, 섞인 데이터는 파케이를 열기 전에는 섞였다는 사실조차 보이지 않습니다. 회차 하나는 `DELETE /api/datasets/{name}/episodes/{index}`가 `lerobot-edit-dataset`으로 들어내고, 데이터셋 자체는 `DELETE /api/datasets/{name}`이 `data/.trash/`로 **옮기기만** 합니다. 새 데이터셋 이름은 UTC가 아니라 **로컬 시각**으로 짓고, 과제가 ASCII면 그것을 앞에 둡니다(`pick_and_place_20260905_1820`).
 - **수집 중 스냅숏과 품질 기록** — 수집이 도는 동안 카메라를 쥔 것은 record 자식이라 콘솔의 MJPEG 프리뷰는 꺼집니다. 그래서 찍는 쪽이 보는 프레임을 5Hz로 `GET /api/recording/preview/{scene|wrist}.jpg`에 내려놓습니다(인코딩은 별 스레드에서 하므로 30Hz 루프를 막지 않고, 3초보다 오래된 그림은 404입니다 — 멈춘 카메라의 마지막 장면을 계속 보여 주면 화면은 아무 일도 없다는 듯 그것을 보여 줍니다). 수집이 끝나면 `data/<name>/soarm_quality.json`에 `loop_hz`·`camera_stale_pct`·`slow_loop_warnings`가 남고, `GET /api/datasets`가 그것과 과제 목록을 함께 실어 보냅니다.
 - **카메라 프레임률과 수집 색 설정** — 프리뷰는 V4L2의 기본 버퍼 큐를 유지해 두 카메라를 함께 볼 때도 30fps에 가까운 처리량을 보존합니다. 고른 프레임률보다 빨리 오는 프레임은 콘솔이 솎아 내는데, 이때 다음에 내보낼 시각을 **지난 예정 시각에 주기를 더해** 정합니다. 방금 내보낸 시각으로 다시 맞추면, 요청한 값이 장치가 실제로 내주는 속도와 가까울 때 프레임의 3분의 1이 사라집니다 — 지터로 한 주기보다 조금 일찍 온 프레임이 문턱에 걸려 버려지고, 그러면 다음 프레임을 한 주기 더 기다리기 때문입니다. 640×480 두 대를 함께 열고 잰 값입니다(2026-09-05): 장치는 인코딩 없이 30.1fps를 주는데, 예정 시각을 다시 맞출 때 프리뷰로 나간 것은 18.7·19.0fps였고 주기를 더하면 29.2·29.4fps입니다(남은 차이는 JPEG 인코딩 몫입니다). **fps는 어디서 재는지를 함께 적어야 합니다** — 여기 적은 30.1fps는 장치가 내주는 원본을 디코드 없이 센 값이고, 코드 주석과 `tests/test_cameras.py`가 쓰는 26.8fps는 같은 흐름을 디코드까지 마친 뒤 센 값입니다. 어긋난 측정이 아니라 파이프라인의 서로 다른 지점이고, 그 사이의 차이가 CPU 디코드 몫입니다. 목표가 장치보다 한참 낮은 `절약`(2fps)이나 `보통`(8fps)에서는 원래 나지 않던 일이고, `전체`(30fps)에서만 났습니다. 오래 멈췄다 재개할 때 밀린 예정 시각을 몰아서 내보내지 않도록 현재 시각으로 한 번 당깁니다. 수집 직전에는 LeRobot이 카메라를 열기 전에 60Hz 전원 주파수, 고정 4600K 화이트 밸런스, dynamic-framerate 해제를 직접 적용하되 노출은 자동으로 둡니다. 실제 장치에서 되읽은 값과 지원하지 않는 컨트롤은 `/api/status`의 `cameras.{scene,wrist}.recording_controls`에 표시됩니다. 수집 중에는 루프가 카메라에서 **새 프레임을 실제로 몇 장 받았는지**가 `/api/status`의 `recording.runtime`에 카메라별 `camera_fresh_hz`와 `camera_stale_pct`로 실립니다(`loop_hz`와 같은 3초 창, 1초 주기). LeRobot의 `read_latest()`는 블로킹이 아니라서 새 프레임이 아직 없으면 버퍼에 있던 것을 그대로 다시 돌려주므로, 돌려받은 ndarray의 버퍼 주소가 직전과 같으면 그 틱은 새 프레임을 받지 못한 것으로 셉니다 — `camera_stale_pct`가 그 비율(%)이고 `camera_fresh_hz`는 남은 비율에 `loop_hz`를 곱한 값이라, 30Hz 루프에서 15Hz만 나오면 카메라가 절반을 흘리고 있다는 뜻입니다. **픽셀을 비교하거나 찍힌 영상에서 세면 안 됩니다** — 움직이지 않는 장면은 서로 다른 두 번의 촬영인데도 같은 값을 내고, AV1 인코더는 움직임 없는 두 프레임을 하나로 합치므로 카메라가 같은 프레임을 두 번 준 것과 구별되지 않습니다(실제로 그 둘을 혼동해 없는 문제를 쫓은 적이 있습니다, 2026-09-05). 데이터셋의 `timestamp`는 언제나 `frame_index / fps`로 합성되어 파일에는 흔적이 남지 않으니, 원천에서 세는 수밖에 없습니다.
+- **서보 판독값을 함께 남긴다** — 수집이 매 프레임(30Hz) 위치 말고도 부하·속도·온도·전압·상태 바이트·이동 플래그·전류와, 그 프레임의 위치를 읽은 시각, 카메라별 새 프레임 여부를 **별도 열**로 남깁니다(아래 [데이터셋이 담는 열](#데이터셋이-담는-열)). 목적은 나중에 모터 부하로 간접 촉각을 추정하는 연구이고, 시연은 다시 찍을 수 없으므로 읽지 않으면 사라지는 값들입니다. `observation.state`는 관절 위치 여섯 그대로 두므로 지금까지 학습한 정책과 사전학습 정규화 통계는 그대로입니다 — 정책은 자기가 모르는 열을 지나갑니다. 서보 읽기는 **틱당 블록 하나**입니다(주소 56~70의 15바이트를 한 번에 읽어 우리가 쪼갭니다). 레지스터마다 따로 읽으면 버스 왕복이 틱당 일곱 번이 되어 30Hz가 흔들리고, 늘어난 시간축은 `timestamp`가 합성값이라 파일에 남지도 않습니다. 부호를 푸는 것은 가상 리더가 쓰는 `MotorsBus._decode_sign` 그대로입니다 — 두 곳이 다르게 풀면 같은 힘이 다른 숫자가 됩니다. 열이 없는 옛 데이터셋에 이어 찍기는 400으로 거절합니다(`Dataset was recorded without the sensor columns; start a new dataset`). `GET /api/status`의 `capabilities`에 `sensor_extras`가 실립니다.
 - **학습 서버 연동** — 수집한 데이터셋을 DGX Spark로 보내고, 학습된 체크포인트를 되받습니다. 전송은
   `.incoming`에 다 받은 뒤 제자리로 옮기므로 끊긴 전송이 멀쩡한 데이터셋처럼 보이지 않고, 남은 조각에서
   이어받습니다. **학습은 콘솔이 띄우되 품지 않습니다** — `POST /api/spark/train`이 원격 tmux 세션
@@ -120,6 +121,53 @@ Doctor는 모터 ID, 모델, firmware, 현재 위치, 전압, torque 상태만 �
 | 5 | demonstration 기록 | camera role 확인을 추가로 요구. 실패한 회차는 `abort`로 버림 |
 | 6 | 데이터셋 정리 | 지우기는 `data/.trash`로 옮기기만 하고, 수집·재생 중에는 거절 |
 | 7 | 학습 시작 | 원격 tmux 세션에서 돌고, GPU가 하나라 동시 실행은 409 |
+
+## 데이터셋이 담는 열
+
+LeRobot v3 features. 아래 아홉 열이 `observation.state`·`action`·영상 옆에 **더해집니다**.
+값은 전부 `float32`이고 매 프레임(30Hz) 채워집니다. `<motor>`는
+`shoulder_pan`·`shoulder_lift`·`elbow_flex`·`wrist_flex`·`wrist_roll`·`gripper` 순서이며,
+이는 `observation.state`의 이름 순서와 같습니다.
+
+| 열 | shape | names | 출처와 단위 |
+| --- | --- | --- | --- |
+| `observation.state` | [6] | `<motor>.pos` | *(기존)* 관절 위치. **바뀌지 않습니다** |
+| `observation.load` | [6] | `<motor>.load` | `Present_Load`(60). 부호 포함 −1000..1000 |
+| `observation.velocity` | [6] | `<motor>.vel` | `Present_Velocity`(58). 부호 포함, 서보 눈금/s |
+| `observation.temperature` | [6] | `<motor>.temp` | `Present_Temperature`(63). °C |
+| `observation.voltage` | [6] | `<motor>.volt` | `Present_Voltage`(62) ÷ 10. V |
+| `observation.servo_status` | [6] | `<motor>.status` | `Status`(65) 바이트 그대로. 과부하·과열 비트 |
+| `observation.servo_moving` | [6] | `<motor>.moving` | `Moving`(66). 0/1 |
+| `observation.current` | [6] | `<motor>.current` | `Present_Current`(69). **이 펌웨어(3.9)에서는 0이나 1로만 읽힙니다**(2026-09-05 확인). 그래도 남깁니다 — 값이 없다는 사실 자체가 기록입니다 |
+| `observation.wall_time` | [1] | `since_start` | 이 프레임의 `Present_Position`을 읽은 시각. **수집 프로세스 시작 epoch으로부터의 초**입니다(float32에 epoch을 그대로 넣으면 30Hz 프레임이 전부 같은 시각이 됩니다). 기준 epoch은 `soarm_provenance.json`의 `started_at` |
+| `observation.camera_fresh` | [2] | `scene`, `wrist` | 이 틱이 카메라에서 **새** 프레임을 받았는가. 0/1 |
+
+**부호는 2의 보수가 아니라 부호-크기(sign-magnitude)입니다.** 부하는 비트 10이, 속도는
+비트 15가 부호이고, 푸는 것은 `MotorsBus._decode_sign`(가상 리더가 부하를 읽을 때 지나는
+바로 그 코드)에 맡깁니다.
+
+읽기가 실패한 틱은 마지막으로 성공한 값을 한 번 더 씁니다 — `validate_frame`은 열이 하나만
+비어도 회차를 통째로 막으므로 값을 뺄 수는 없고, 버스 패킷 하나가 깨졌다고 30초짜리 시연을
+잃는 편이 훨씬 나쁩니다. 몇 번 그랬는지는 `/api/status`의 `recording.runtime`에
+`extras_read_failures`로, 블록 읽기가 30Hz 예산에서 가져간 몫은 `extras_read_ms`로 실립니다.
+
+### API
+
+- `GET /api/datasets`, `GET /api/datasets/{name}` — `extras`에 이 데이터셋이 담은 열의 마지막
+  마디 목록(`["load","velocity",…,"camera_fresh"]`). 열이 없는 옛 데이터셋은 `[]`입니다.
+- `GET /api/datasets/{name}/episodes/{i}/trajectory` — 기존 `fps`·`frames`·`joints`·`state`·
+  `action`에 더해, 열이 있으면 `load`·`velocity`(frames × 6), `camera_fresh`(frames × 2),
+  `camera_keys`(`["scene","wrist"]`), `wall_time`(frames × 1). 없으면 키 자체가 빠집니다.
+
+### 회 단위 provenance
+
+수집 세션마다 `data/<dataset>/soarm_provenance.json`의 배열에 항목이 **하나 덧붙습니다**
+(이어 찍으면 늘어납니다). 담기는 것: `started_at`(위 `wall_time`의 기준 epoch),
+`server_commit`, `lerobot` 버전, 팔로워·리더 calibration의 `sha256`, 되읽은
+`camera_controls`, 시작 시 `doctor` 진단, `episode_seconds`, `reset_seconds`, `fps`,
+`extras_schema`. calibration 해시를 남기는 이유는 그것이 **데이터를 읽는 자 자체**이기
+때문입니다 — 다시 잰 calibration으로 찍은 회차는 앞 회차와 다른 좌표계에 있는데, 그 사실은
+데이터셋 안에서 전혀 보이지 않습니다.
 
 ## 저장소 구조
 

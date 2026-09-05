@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -15,6 +17,17 @@ from .teleop import TeleopError
 from .v4l2_controls import apply_recording_controls
 
 
+#: 기록 루프가 목표 fps를 못 지킬 때 LeRobot이 내는 문장. 데이터셋의 `timestamp`는
+#: `frame_index / fps`로 합성된 값이라(LeRobot `dataset_writer`), 루프가 느렸어도 파케이나
+#: 영상에는 흔적이 남지 않는다. 시간축이 조용히 늘어난 데이터가 스스로 30Hz라고 말하게
+#: 되는데, 그 사실을 알려 주는 것은 이 경고뿐이다.
+SLOW_LOOP_MARKER = "Record loop is running slower"
+
+#: `recording.py`가 데이터셋 이름에 허용하는 것과 같은 모양. 상태 파일에서 읽은 이름을
+#: 경로로 쓰기 전에 다시 본다.
+_DATASET_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}")
+
+
 class RecordManager:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -23,7 +36,9 @@ class RecordManager:
         self._lock = threading.Lock()
         self._owner_locks: DeviceLockSet | None = None
         self._camera_controls: dict[str, dict[str, object]] = {}
+        self._slow_loop_warnings = 0
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
+        self.log_path = self.runtime_dir / "record.log"
 
     @property
     def running(self) -> bool:
@@ -71,6 +86,7 @@ class RecordManager:
                 raise TeleopError("; ".join(problems))
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             self._logs.clear()
+            self._slow_loop_warnings = 0
             env = os.environ.copy()
             env.update(
                 {
@@ -170,6 +186,10 @@ class RecordManager:
             "return_code": process.poll() if process else None,
             "runtime": runtime,
             "logs": list(self._logs)[-100:],
+            # 이 회차가 30Hz를 지켰는지. 0이 아니면 데이터가 주장하는 fps와 실제로 찍힌
+            # 속도가 다르다는 뜻이고, 그 데이터로 배운 정책은 시연보다 빠르게 움직인다.
+            "slow_loop_warnings": self._slow_loop_warnings,
+            "log_path": str(self.log_path),
         }
 
     def camera_controls(self, role: str) -> dict[str, object] | None:
@@ -187,11 +207,50 @@ class RecordManager:
         process = self._process
         if process is None or process.stdout is None:
             return
-        for line in process.stdout:
-            self._logs.append(line.rstrip())
+        # 메모리에만 담으면 회차가 끝나는 순간 증거가 사라진다. 수집이 정말 30Hz로
+        # 돌았는지는 데이터셋 파일만 봐서는 알 수 없으므로(SLOW_LOOP_MARKER 설명 참고),
+        # 이 출력은 디스크에 남아야 한다.
+        try:
+            handle = self.log_path.open("w", encoding="utf-8")
+        except OSError:
+            handle = None
+        try:
+            for line in process.stdout:
+                text = line.rstrip()
+                self._logs.append(text)
+                if SLOW_LOOP_MARKER in text:
+                    self._slow_loop_warnings += 1
+                if handle is not None:
+                    # 곧바로 흘려 보낸다. 수집이 중간에 죽어도 그때까지의 경고는 남는다.
+                    print(text, file=handle, flush=True)
+        finally:
+            if handle is not None:
+                handle.close()
+
+    def _archive_log(self) -> None:
+        """끝난 로그를 데이터셋 폴더 안으로 옮긴다.
+
+        `spark.push_dataset`는 데이터셋 폴더째 학습 서버로 보낸다. 로그가 그 안에 있어야
+        나중에 학습 서버에서 "이 데이터가 정말 30Hz로 찍혔나"를 데이터만 보고 답할 수 있다.
+        """
+        try:
+            runtime = json.loads((self.runtime_dir / "status.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        name = runtime.get("dataset_name")
+        if not isinstance(name, str) or not _DATASET_NAME.fullmatch(name):
+            return
+        target = Path(__file__).parents[2] / "data" / name
+        if not target.is_dir():
+            return
+        try:
+            shutil.copyfile(self.log_path, target / "record.log")
+        except OSError:
+            pass
 
     def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
         process.wait()
+        self._archive_log()
         with self._lock:
             if self._process is process and self._owner_locks is owner_locks:
                 self._owner_locks = None

@@ -12,6 +12,14 @@ class SparkError(RuntimeError):
     pass
 
 
+class SparkNotFound(SparkError):
+    """찾는 것이 학습 기계에 없다. `app`이 404로 옮긴다."""
+
+
+class SparkBusy(SparkError):
+    """학습 기계가 이미 그 일을 하고 있다. `app`이 409로 옮긴다."""
+
+
 # 원격 명령은 항상 인자 리스트로 만들고 셸을 거치지 않는다. 데이터셋 이름이 그대로 원격
 # 경로가 되므로, 셸을 한 번이라도 거치면 이름 하나로 임의 명령을 실행할 수 있다.
 # 이름 규칙은 `datasets.py`의 것을 그대로 재사용한다 — 검사 지점을 둘로 나누면 한쪽만
@@ -64,17 +72,95 @@ print(json.dumps(out))
 # 학습 산출물은 `<output_root>/<run>/checkpoints/<step>/pretrained_model`에 쌓인다.
 # 추론에 필요한 것은 `pretrained_model` 하나뿐이고 `training_state`는 재개용이라
 # 목록에서 크기를 따로 알려 준다 — 회수할 때 무엇을 가져올지 화면에서 고르게 하려는 것이다.
+# 진행 상황은 `train.log`와 `soarm_train.json`이 말한다. 셋을 한 스크립트 안에서 읽는
+# 이유는 ssh 왕복 때문이다 — 실행이 열 개면 왕복도 열 번이 되고, tailnet 너머에서 그것은
+# 화면이 눈에 띄게 굼떠지는 값이다.
 _LIST_RUNS = """
-import json, os, sys
+import json, os, re, subprocess, sys
 root = os.path.expanduser(sys.argv[1])
+
+# LeRobot은 step을 `format_big_number`로 줄여 찍는다 — `step:20K`. 숫자만 집으면 20이
+# 되므로 접미사를 되돌려야 한다.
+SUFFIX = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12, "Q": 10**15}
+STEP = re.compile(r"step:([0-9.]+)([KMBTQ]?)")
+LOSS = re.compile(r"loss:([0-9.eE+-]+)")
+
+
+def as_number(text, suffix):
+    try:
+        return int(round(float(text) * SUFFIX.get(suffix, 1)))
+    except ValueError:
+        return None
+
+
+def session_alive(name):
+    try:
+        return subprocess.run(
+            ["tmux", "has-session", "-t", name], capture_output=True
+        ).returncode == 0
+    except OSError:
+        return False
+
+
+def training(run, directory):
+    try:
+        with open(os.path.join(directory, "soarm_train.json"), encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    log = os.path.join(directory, "train.log")
+    try:
+        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+        updated_at = os.path.getmtime(log)
+    except OSError:
+        lines, updated_at = [], None
+    step = loss = None
+    for line in reversed(lines):
+        found = STEP.search(line)
+        if found:
+            step = as_number(found.group(1), found.group(2))
+            hit = LOSS.search(line)
+            if hit:
+                try:
+                    loss = float(hit.group(1))
+                except ValueError:
+                    loss = None
+            break
+    running = session_alive("train-" + run)
+    steps = meta.get("steps")
+    error = None
+    if not running and isinstance(steps, int) and (step or 0) < steps:
+        # 끝나지 않았는데 세션이 없다. 로그가 왜 멈췄는지 말할 수 있는 줄을 찾는다.
+        for line in reversed(lines):
+            if "Traceback" in line or "Error" in line:
+                error = line.strip()
+                break
+    return {
+        "running": running,
+        "step": step,
+        "steps": steps,
+        "loss": loss,
+        "policy": meta.get("policy"),
+        "started_at": meta.get("started_at"),
+        "updated_at": updated_at,
+        "log_tail": lines[-5:],
+        "error": error,
+    }
+
+
 out = []
 if os.path.isdir(root):
     for run in sorted(os.listdir(root)):
-        ckpt_root = os.path.join(root, run, "checkpoints")
-        if not os.path.isdir(ckpt_root):
+        directory = os.path.join(root, run)
+        if not os.path.isdir(directory):
             continue
+        ckpt_root = os.path.join(directory, "checkpoints")
         steps = []
-        for step in sorted(os.listdir(ckpt_root)):
+        for step in sorted(os.listdir(ckpt_root)) if os.path.isdir(ckpt_root) else []:
+            # `checkpoints/last`는 가장 최근 체크포인트를 가리키는 심볼릭 링크다. 따라가면
+            # 같은 체크포인트가 목록에 두 번 나오고, 화면은 있지도 않은 회수를 센다.
+            if os.path.islink(os.path.join(ckpt_root, step)):
+                continue
             model = os.path.join(ckpt_root, step, "pretrained_model")
             if not os.path.isdir(model):
                 continue
@@ -90,9 +176,46 @@ if os.path.isdir(root):
                 "size_bytes": size,
                 "finished_at": os.path.getmtime(model),
             })
-        if steps:
-            out.append({"run": run, "checkpoints": steps})
+        info = training(run, directory)
+        # 체크포인트가 아직 하나도 없어도 싣는다. 첫 저장은 2만 스텝 뒤이고, 그때까지
+        # 목록에서 사라져 있으면 사람은 학습이 시작됐는지조차 알 수 없다.
+        if steps or info is not None:
+            out.append({"run": run, "checkpoints": steps, "training": info})
 print(json.dumps(out))
+"""
+
+# 학습을 띄우기 전에 원격에서 한 번에 확인하는 것들: 데이터셋이 와 있는가, 이미 도는
+# 학습이 있는가. 둘을 따로 물으면 그 사이에 다른 사람이 학습을 시작할 틈이 생긴다.
+_TRAIN_PREFLIGHT = """
+import json, os, subprocess, sys
+dataset_root, = sys.argv[1:2]
+present = os.path.isfile(os.path.join(os.path.expanduser(dataset_root), "meta", "info.json"))
+running = []
+try:
+    out = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True
+    )
+    if out.returncode == 0:
+        running = [
+            name.strip()[len("train-"):]
+            for name in out.stdout.splitlines()
+            if name.strip().startswith("train-")
+        ]
+except OSError:
+    pass
+print(json.dumps({"dataset_present": present, "running": running}))
+"""
+
+# 적을 내용은 인자가 아니라 **스크립트 안에** 넣는다. `_remote_python`의 argv는 ssh가
+# 공백으로 이어 붙여 원격 셸이 다시 가르는 자리라, 따옴표와 공백이 든 JSON은 그 길로
+# 넘어가지 못한다. `json.dumps`가 만든 문자열 리터럴은 파이썬 소스로서 안전하다.
+_WRITE_TRAIN_META = """
+import json, os, sys
+directory = os.path.expanduser(sys.argv[1])
+os.makedirs(directory, exist_ok=True)
+with open(os.path.join(directory, "soarm_train.json"), "w", encoding="utf-8") as handle:
+    handle.write(__PAYLOAD__)
+print(json.dumps({"ok": True}))
 """
 
 _PROBE = """
@@ -233,8 +356,155 @@ def list_datasets(settings: Settings) -> list[dict[str, Any]]:
 
 
 def list_runs(settings: Settings) -> list[dict[str, Any]]:
-    """Spark의 학습 실행별 체크포인트 목록."""
+    """Spark의 학습 실행별 체크포인트와 진행 상황."""
     return _remote_python(settings, _LIST_RUNS, settings.spark_output_root, timeout=60)
+
+
+# `lerobot-train`이 이 콘솔에서 띄울 수 있는 정책과 그 값들.
+#
+# 두 벌뿐인 이유는 이 팔에서 실제로 돌려 본 것이 둘이기 때문이다. ACT는 처음부터
+# 배우므로 10만 스텝이 필요하고, SmolVLA는 이미 배운 것을 옮겨 오므로 2만 스텝이면
+# 충분하다 — 대신 첫 실행은 HF에서 기반 모델을 내려받느라 오래 걸린다.
+TRAINING_POLICIES: dict[str, dict[str, Any]] = {
+    "act": {"flag": "--policy.type=act", "steps": 100_000, "batch_size": 64, "save_freq": 20_000},
+    "smolvla": {
+        "flag": "--policy.path=lerobot/smolvla_base",
+        "steps": 20_000,
+        "batch_size": 32,
+        "save_freq": 5_000,
+    },
+}
+
+#: `run` 이름에서 데이터셋 부분이 쓸 수 있는 길이. 전체가 `NAME_PATTERN`(80자) 안에
+#: 남아야 `pull_checkpoint`가 그 실행의 체크포인트를 가져올 수 있다.
+_RUN_DATASET_CHARS = 56
+
+
+def run_name(dataset: str, policy: str, now: Any = None) -> str:
+    """`<dataset>__<policy>__<시각>`.
+
+    시각을 넣는 이유는 LeRobot이 `output_dir`이 이미 있으면 `FileExistsError`로
+    거절하기 때문이다(`configs/train.py`). 예전의 `train-command`는 `outputs/<dataset>`을
+    고정으로 썼고, 그래서 같은 데이터셋의 두 번째 학습은 **반드시** 실패했다. 그 실패는
+    tmux 안에서 일어나므로 화면에는 "시작했다"만 남았다.
+    """
+    from datetime import datetime
+
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M")
+    return f"{dataset[:_RUN_DATASET_CHARS]}__{policy}__{stamp}"
+
+
+def train_shell_line(settings: Settings, dataset: str, policy: str, run: str) -> str:
+    """tmux 안에서 도는 한 줄. 원격 셸이 이 문자열 하나를 받는다."""
+    values = TRAINING_POLICIES[policy]
+    output = f"{settings.spark_output_root.rstrip('/')}/{run}"
+    return (
+        "source ~/venvs/lerobot/bin/activate && "
+        f"mkdir -p {output} && "
+        "lerobot-train "
+        f"--dataset.repo_id={dataset} "
+        f"--dataset.root={_remote_dataset_root(settings)}/{dataset} "
+        f"{values['flag']} "
+        "--policy.device=cuda "
+        "--policy.push_to_hub=false "
+        f"--steps={values['steps']} "
+        f"--batch_size={values['batch_size']} "
+        f"--save_freq={values['save_freq']} "
+        f"--output_dir={output} "
+        "--wandb.enable=false "
+        f"2>&1 | tee {output}/train.log"
+    )
+
+
+def start_training(settings: Settings, dataset: str, policy: str) -> dict[str, Any]:
+    """학습을 tmux 안에서 띄운다. 콘솔은 그 뒤로 진행만 읽는다.
+
+    콘솔이 학습 프로세스를 직접 품지 않는 것이 중요하다. 학습은 몇 시간 돌고, 콘솔은
+    `systemctl --user restart`로 다시 시작되는 서비스다. tmux 안에 있으면 콘솔이
+    내려갔다 올라와도 학습은 그대로 돈다.
+    """
+    import shlex
+    import time as _time
+
+    if not NAME_PATTERN.match(dataset):
+        raise DatasetError("Unknown dataset name")
+    if policy not in TRAINING_POLICIES:
+        raise DatasetError(f"Unknown policy type: expected one of {sorted(TRAINING_POLICIES)}")
+
+    root = _remote_dataset_root(settings)
+    state = _remote_python(settings, _TRAIN_PREFLIGHT, f"{root}/{dataset}", timeout=45)
+    if not state.get("dataset_present"):
+        raise SparkNotFound(
+            f"Dataset is not on the training machine: {dataset}. Push it first."
+        )
+    already = [str(name) for name in state.get("running") or []]
+    if already:
+        # 이 기계에는 GPU가 하나다. 두 학습이 동시에 돌면 둘 다 메모리에서 쫓겨나거나
+        # 둘 다 느려진다. 무엇이 돌고 있는지를 문구에 적어, 사람이 그것을 멈출지
+        # 기다릴지 고를 수 있게 한다.
+        raise SparkBusy(f"Training is already running: {already[0]}")
+
+    run = run_name(dataset, policy)
+    values = TRAINING_POLICIES[policy]
+    line = train_shell_line(settings, dataset, policy, run)
+    _run(
+        [
+            "ssh",
+            *SSH_OPTIONS,
+            _target(settings),
+            "tmux",
+            "new",
+            "-d",
+            "-s",
+            f"train-{run}",
+            shlex.quote(line),
+        ],
+        timeout=60,
+    )
+    meta = json.dumps({
+        "dataset": dataset,
+        "policy": policy,
+        "steps": values["steps"],
+        "batch_size": values["batch_size"],
+        "started_at": _time.time(),
+    })
+    _remote_python(
+        settings,
+        _WRITE_TRAIN_META.replace("__PAYLOAD__", json.dumps(meta)),
+        f"{settings.spark_output_root.rstrip('/')}/{run}",
+        timeout=45,
+    )
+    return {"run": run, "dataset": dataset, "policy": policy, "steps": values["steps"]}
+
+
+def stop_training(settings: Settings, run: str) -> dict[str, Any]:
+    """도는 학습에 Ctrl-C를 보낸다. 체크포인트는 그대로 남는다.
+
+    먼저 `send-keys C-c`인 이유는 그것이 사람이 tmux에 붙어 눌렀을 때와 같은 길이기
+    때문이다 — LeRobot은 그 신호를 받고 정리한 뒤 나간다. 그래도 살아 있으면 세션을
+    죽인다. 어느 쪽이든 이미 디스크에 쓰인 체크포인트는 건드리지 않는다.
+    """
+    import time as _time
+
+    if not NAME_PATTERN.match(run):
+        raise DatasetError("Unknown run")
+    session = f"train-{run}"
+    target = _target(settings)
+    try:
+        _run(["ssh", *SSH_OPTIONS, target, "tmux", "send-keys", "-t", session, "C-c"], timeout=30)
+    except SparkError as error:
+        raise SparkNotFound(f"No such training run: {run} ({error})") from error
+    _time.sleep(2.0)
+    alive = subprocess.run(
+        ["ssh", *SSH_OPTIONS, target, "tmux", "has-session", "-t", session],
+        capture_output=True,
+        text=True,
+    )
+    killed = False
+    if alive.returncode == 0:
+        _run(["ssh", *SSH_OPTIONS, target, "tmux", "kill-session", "-t", session], timeout=30)
+        killed = True
+    return {"run": run, "killed": killed}
 
 
 def _local_dataset_dir(name: str):

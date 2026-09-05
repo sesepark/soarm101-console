@@ -29,6 +29,15 @@ from .spark import pull_checkpoint as spark_pull_checkpoint
 from .spark import push_dataset as spark_push_dataset
 from .spark import train_command as spark_train_command
 from .record_manager import RecordManager
+from .replay_manager import ReplayManager
+from .replaying import (
+    DEFAULT_SPEED,
+    SPEEDS,
+    ReplayError,
+    alignment_refusal,
+    episode_first_pose,
+    present_position,
+)
 from .teleop import TeleopError, TeleopManager
 from .torque import TorqueError
 from .torque import release as release_torque_on
@@ -45,6 +54,7 @@ from .vleader.backend import HardwareError
 settings = Settings()
 teleop = TeleopManager(settings)
 recorder = RecordManager(settings)
+replayer = ReplayManager(settings)
 cameras = {
     "scene": CameraWorker(settings.scene_camera),
     "wrist": CameraWorker(settings.wrist_camera),
@@ -64,6 +74,10 @@ async def lifespan(_: FastAPI):
     # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
     with suppress(Exception):
         vleader.stop(force=True)
+    # 재생은 팔을 움직이는 중일 수 있다. 서버가 내려가면서 그것을 두고 가면 아무도
+    # 멈출 수 없는 팔이 남는다. 멈추기만 하고 토크는 그대로 둔다.
+    with suppress(TeleopError):
+        replayer.stop()
     with suppress(TeleopError):
         recorder.stop()
     with suppress(TeleopError):
@@ -127,6 +141,19 @@ class RecordRequest(BaseModel):
 
 class RecordControlRequest(BaseModel):
     key: str
+
+
+#: 팔이 움직이는 경로는 전부 같은 게이트를 지난다. 텔레옵의 `START SOARM101`,
+#: 수집의 `RECORD SOARM101`과 나란한 문구다.
+REPLAY_CONFIRMATION = "REPLAY SOARM101"
+
+
+class ReplayRequest(BaseModel):
+    confirmation: str
+    dataset: str
+    episode: int = 0
+    #: 0.25 / 0.5 / 1.0. 기본은 절반이다 — 처음 보는 재생은 느린 편이 낫다.
+    speed: float = DEFAULT_SPEED
 
 
 class CameraSettingsRequest(BaseModel):
@@ -257,6 +284,8 @@ def status() -> dict[str, object]:
         "record_preflight": recorder.preflight(),
         "teleoperation": teleop.status(),
         "recording": recorder.status(),
+        "replay": replayer.status(),
+        "replay_preflight": replayer.preflight(),
         "virtual_leader": vleader.status(),
         "doctor": last_doctor,
     }
@@ -488,6 +517,11 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if recorder.running:
         raise HTTPException(status_code=409, detail="Stop recording before teleoperation")
+    if replayer.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the replay before teleoperation: the follower has one owner",
+        )
     if vleader.running:
         raise HTTPException(
             status_code=409,
@@ -522,6 +556,11 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if teleop.running:
         raise HTTPException(status_code=409, detail="Stop teleoperation before recording")
+    if replayer.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the replay before recording: the follower has one owner",
+        )
     if request.teleop not in {"leader", "virtual"}:
         raise HTTPException(status_code=400, detail="teleop must be 'leader' or 'virtual'")
     if request.teleop == "leader":
@@ -563,9 +602,79 @@ def control_recording(request: RecordControlRequest) -> dict[str, object]:
     return recorder.status()
 
 
+@app.post("/api/replay/start")
+def start_replay(request: ReplayRequest) -> dict[str, object]:
+    """찍은 에피소드를 실제 팔에 다시 흘린다.
+
+    팔이 사람 손 없이 혼자 움직이는 유일한 경로다. 그래서 게이트가 셋이다: 텔레옵·수집과
+    같은 확인 문구, 모션 게이트, 그리고 **팔이 지금 그 에피소드가 시작하는 자리 근처에
+    있는가**. 마지막 것이 이 경로에만 있는 이유는, 녹화의 첫 자세가 팔이 지금 서 있는
+    자세와 아무 관계가 없기 때문이다.
+    """
+    if request.confirmation != REPLAY_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
+    if replayer.running:
+        raise HTTPException(status_code=409, detail="Stop the replay that is already running")
+    if recorder.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop recording before replaying: the follower has one owner",
+        )
+    if teleop.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop teleoperation before replaying: the follower has one owner",
+        )
+    if vleader.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the virtual leader before replaying: the follower has one owner",
+        )
+    if not settings.motion_enabled:
+        raise HTTPException(
+            status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
+        )
+    if request.speed not in SPEEDS:
+        raise HTTPException(
+            status_code=400, detail=f"speed must be one of {[float(value) for value in SPEEDS]}"
+        )
+    try:
+        goal = episode_first_pose(request.dataset, request.episode)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No such dataset or episode: {request.dataset} #{request.episode}",
+        ) from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        start = present_position(settings)
+    except ReplayError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    refusal = alignment_refusal(start, goal)
+    if refusal:
+        raise HTTPException(status_code=400, detail=refusal)
+    try:
+        replayer.start(request.dataset, request.episode, request.speed)
+    except TeleopError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return replayer.status()
+
+
+@app.post("/api/replay/stop")
+def stop_replay() -> dict[str, object]:
+    """멈춘다. 토크는 걸어 둔 채 팔이 그 자리에 선다 — 멈추는 것과 힘을 놓는 것은 다르다."""
+    replayer.request_stop()
+    return replayer.status()
+
+
 @app.post("/api/mode/stop")
 def stop_active_mode() -> dict[str, object]:
     try:
+        # 재생을 먼저 세운다. 이 셋 가운데 사람 손 없이 팔이 혼자 움직이는 것은
+        # 재생뿐이므로, 급한 손이 누르는 단추는 그것부터 멈춰야 한다.
+        if replayer.running:
+            replayer.stop()
         if recorder.running:
             recorder.stop()
         if teleop.running:
@@ -579,5 +688,6 @@ def stop_active_mode() -> dict[str, object]:
     return {
         "teleoperation": teleop.status(),
         "recording": recorder.status(),
+        "replay": replayer.status(),
         "virtual_leader": vleader.status(),
     }

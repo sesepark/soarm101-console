@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.so_follower import SO101FollowerConfig
@@ -37,6 +38,15 @@ LOOP_HZ_WINDOW_S = 3.0
 LOOP_HZ_PUBLISH_S = 1.0
 
 
+def _idle_rate_fields() -> dict[str, object]:
+    """루프가 아직 돌지 않는 구간에서 내보낼 속도 값.
+
+    지난 회차의 loop_hz와 카메라 수치가 상태에 남아 있으면, 멈춘 수집이 계속 30Hz로
+    돌고 있는 것처럼 보인다.
+    """
+    return {"loop_hz": 0.0, "camera_fresh_hz": {}, "camera_stale_pct": {}}
+
+
 def _write_status(**updates: object) -> None:
     # The GUI control listener and the loop-rate publisher are separate threads.
     # Serialize their read-modify-write cycles so neither can erase the other's
@@ -59,6 +69,8 @@ class _LoopRateMonitor:
 
     def __init__(self) -> None:
         self.samples: deque[float] = deque()
+        # 카메라별 (시각, 새 프레임인가) 표본. 루프 표본과 같은 창을 쓴다.
+        self.camera_samples: dict[str, deque[tuple[float, bool]]] = {}
         self.lock = threading.Lock()
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -74,14 +86,51 @@ class _LoopRateMonitor:
             while self.samples and self.samples[0] < cutoff:
                 self.samples.popleft()
 
-    def rate(self) -> float:
+    def observe_cameras(self, fresh: dict[str, bool]) -> None:
+        if not fresh:
+            return
+        now = time.perf_counter()
+        cutoff = now - LOOP_HZ_WINDOW_S
         with self.lock:
-            if len(self.samples) < 2:
-                return 0.0
-            return (len(self.samples) - 1) / (self.samples[-1] - self.samples[0])
+            for key, is_fresh in fresh.items():
+                samples = self.camera_samples.setdefault(key, deque())
+                samples.append((now, is_fresh))
+                while samples and samples[0][0] < cutoff:
+                    samples.popleft()
+
+    def _rate_locked(self) -> float:
+        if len(self.samples) < 2:
+            return 0.0
+        return (len(self.samples) - 1) / (self.samples[-1] - self.samples[0])
+
+    def snapshot(self) -> tuple[float, dict[str, float], dict[str, float]]:
+        """Loop rate plus, per camera, how much of that rate carried a new frame.
+
+        All three come from one lock hold so they describe the same window. A
+        fresh-frame rate published next to a loop rate it cannot divide into
+        would read as a second measurement contradicting the first.
+        """
+        fresh_hz: dict[str, float] = {}
+        stale_pct: dict[str, float] = {}
+        with self.lock:
+            loop_hz = self._rate_locked()
+            for key, samples in self.camera_samples.items():
+                if not samples:
+                    fresh_hz[key] = 0.0
+                    stale_pct[key] = 0.0
+                    continue
+                ratio = sum(1 for _, is_fresh in samples if is_fresh) / len(samples)
+                fresh_hz[key] = loop_hz * ratio
+                stale_pct[key] = 100.0 * (1.0 - ratio)
+        return loop_hz, fresh_hz, stale_pct
 
     def _publish(self) -> None:
-        _write_status(loop_hz=float(self.rate()))
+        loop_hz, fresh_hz, stale_pct = self.snapshot()
+        _write_status(
+            loop_hz=float(loop_hz),
+            camera_fresh_hz=fresh_hz,
+            camera_stale_pct=stale_pct,
+        )
 
     def _run(self) -> None:
         while not self.stopped.wait(LOOP_HZ_PUBLISH_S):
@@ -99,13 +148,42 @@ class _RateTrackedRobot:
     def __init__(self, robot: object, monitor: _LoopRateMonitor) -> None:
         self._robot = robot
         self._monitor = monitor
+        self._last_frames: dict[str, np.ndarray] = {}
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._robot, name)
 
     def get_observation(self) -> object:
         self._monitor.tick()
-        return self._robot.get_observation()
+        observation = self._robot.get_observation()
+        # 관찰값은 읽기만 한다. 이 proxy는 LeRobot에게 투명해야 한다.
+        self._monitor.observe_cameras(self._camera_freshness(observation))
+        return observation
+
+    def _camera_freshness(self, observation: object) -> dict[str, bool]:
+        """카메라마다, 이번 틱이 직전 틱과 다른 프레임을 받았는지.
+
+        `SOFollower.get_observation()`은 카메라마다 `read_latest()`를 부른다. 이 호출은
+        블로킹이 아니라서, 새 프레임이 아직 없으면 지난번에 돌려준 바로 그 버퍼를 다시
+        돌려준다. 그래서 판정은 버퍼의 주소로 한다. 픽셀을 비교하면 안 된다 — 움직이지
+        않는 장면은 서로 다른 두 번의 촬영인데도 같은 값이 나오고, 30Hz 루프에서 640x480
+        두 장을 매 틱 비교하는 비용도 든다.
+
+        영상에서 세는 것도 답이 되지 않는다. AV1 인코더는 움직임 없는 두 프레임을 하나로
+        합치므로, 카메라가 같은 프레임을 두 번 준 것과 구별되지 않는다. 원천에서 세야 한다.
+        """
+        if not isinstance(observation, dict):
+            return {}
+        fresh: dict[str, bool] = {}
+        for key, value in observation.items():
+            if not isinstance(value, np.ndarray):
+                continue
+            previous = self._last_frames.get(key)
+            fresh[key] = previous is None or previous.ctypes.data != value.ctypes.data
+            # 주소만이 아니라 배열 자체를 붙잡아 둔다. 놓아 버리면 그 버퍼가 해제되고,
+            # 다음 프레임이 같은 주소를 받아 새 프레임이 stale로 읽힐 수 있다.
+            self._last_frames[key] = value
+        return fresh
 
 
 def _record_loop_with_status(*args: object, **kwargs: object) -> object:
@@ -121,14 +199,14 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     monitor = _LoopRateMonitor()
 
     if dataset is None:
-        _write_status(phase="resetting", episode_started_at=None, loop_hz=0.0)
+        _write_status(phase="resetting", episode_started_at=None, **_idle_rate_fields())
     else:
         _write_status(
             phase="recording",
             episode_started_at=time.time(),
             episode_seconds=int(control_time_s),
             episode_index=int(dataset.num_episodes),
-            loop_hz=0.0,
+            **_idle_rate_fields(),
         )
 
     forwarded = dict(kwargs)
@@ -277,7 +355,7 @@ def main() -> None:
             episode_started_at=None,
             episode_seconds=int(config.dataset.episode_time_s),
             episode_index=0,
-            loop_hz=0.0,
+            **_idle_rate_fields(),
         )
         lerobot_record.init_keyboard_listener = _init_gui_listener
         lerobot_record.record_loop = _record_loop_with_status

@@ -24,6 +24,28 @@ def test_status_is_observation_only_and_exposes_all_subsystems():
     assert "doctor" in payload
 
 
+def test_status_exposes_only_read_back_recording_camera_controls(monkeypatch):
+    from soarm_console.app import recorder
+
+    scene = {
+        "values": {
+            "power_line_frequency": 2,
+            "exposure_dynamic_framerate": 0,
+            "white_balance_automatic": 0,
+            "white_balance_temperature": 4600,
+            "auto_exposure": 3,
+        },
+        "failures": [],
+    }
+    wrist = {"values": {"power_line_frequency": 1}, "failures": ["Auto Exposure"]}
+    monkeypatch.setattr(recorder, "_camera_controls", {"scene": scene, "wrist": wrist})
+
+    cameras = status()["cameras"]
+
+    assert cameras["scene"]["recording_controls"] == scene
+    assert cameras["wrist"]["recording_controls"] == wrist
+
+
 def test_motion_endpoints_require_exact_confirmation_before_hardware_access():
     with pytest.raises(HTTPException) as teleop_error:
         start_teleoperation(MotionRequest(confirmation="wrong"))

@@ -15,6 +15,7 @@ from typing import Any
 # episode being watched into H.264 and caches it.
 PLAYABLE_CODECS = {"h264", "hevc"}
 CLIP_CACHE_LIMIT = 200
+TRAJECTORY_FRAME_LIMIT = 20_000
 
 
 # `recording.py`가 데이터셋 이름에 허용하는 것과 같은 문자만 받는다. 이름이 그대로 경로가
@@ -25,6 +26,10 @@ VIDEO_KEY_PATTERN = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}\Z")
 
 
 class DatasetError(ValueError):
+    pass
+
+
+class TrajectoryTooLargeError(DatasetError):
     pass
 
 
@@ -146,6 +151,70 @@ def describe(name: str) -> dict[str, Any]:
     summary = summarize(name)
     summary["episodes_detail"] = episodes
     return summary
+
+
+def trajectory(name: str, episode_index: int) -> dict[str, Any]:
+    """Follower state and requested action for one episode, in frame order."""
+    directory = _dataset_dir(name)
+    info = _read_info(directory)
+    episode = next(
+        (row for row in _episode_rows(directory) if int(row.get("episode_index", -1)) == episode_index),
+        None,
+    )
+    if episode is None:
+        raise FileNotFoundError(str(episode_index))
+
+    expected_frames = int(episode.get("length", 0))
+    if expected_frames > TRAJECTORY_FRAME_LIMIT:
+        raise TrajectoryTooLargeError(
+            f"Episode has {expected_frames} frames; limit is {TRAJECTORY_FRAME_LIMIT}"
+        )
+
+    features = info.get("features") or {}
+    state_feature = features.get("observation.state") or {}
+    joints = state_feature.get("names")
+    if not isinstance(joints, list) or not all(isinstance(name, str) for name in joints):
+        raise DatasetError("Dataset does not describe observation.state joint names")
+
+    chunk_index = episode.get("data/chunk_index")
+    file_index = episode.get("data/file_index")
+    if chunk_index is None or file_index is None:
+        raise DatasetError("Episode does not identify its data parquet file")
+    path = (
+        directory
+        / "data"
+        / f"chunk-{int(chunk_index):03d}"
+        / f"file-{int(file_index):03d}.parquet"
+    )
+    if not path.exists():
+        raise FileNotFoundError(path.name)
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(
+        path,
+        columns=["episode_index", "frame_index", "observation.state", "action"],
+        filters=[("episode_index", "=", episode_index)],
+    ).sort_by([("frame_index", "ascending")])
+    frames = table.num_rows
+    if frames > TRAJECTORY_FRAME_LIMIT:
+        raise TrajectoryTooLargeError(
+            f"Episode has {frames} frames; limit is {TRAJECTORY_FRAME_LIMIT}"
+        )
+    if frames != expected_frames:
+        raise DatasetError(
+            f"Episode metadata says {expected_frames} frames but parquet contains {frames}"
+        )
+
+    return {
+        "fps": info.get("fps", 0),
+        "frames": frames,
+        # Do not sort this list: each column in both arrays corresponds to this
+        # exact feature order from meta/info.json.
+        "joints": joints,
+        "state": table.column("observation.state").to_pylist(),
+        "action": table.column("action").to_pylist(),
+    }
 
 
 def _clip_cache() -> Path:

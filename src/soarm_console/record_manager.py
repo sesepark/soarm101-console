@@ -12,6 +12,7 @@ from .calibration import validate_calibration
 from .config import Settings
 from .owner_lock import DeviceLockError, DeviceLockSet
 from .teleop import TeleopError
+from .v4l2_controls import apply_recording_controls
 
 
 class RecordManager:
@@ -21,6 +22,7 @@ class RecordManager:
         self._logs: deque[str] = deque(maxlen=400)
         self._lock = threading.Lock()
         self._owner_locks: DeviceLockSet | None = None
+        self._camera_controls: dict[str, dict[str, object]] = {}
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
 
     @property
@@ -94,6 +96,14 @@ class RecordManager:
             # record child도 같은 열린 file description을 물려받는다. parent가 죽어도 child가
             # 장치를 쓰는 동안 flock이 남아야 한다.
             env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
+            # LeRobot OpenCVCamera가 장치를 열기 전에 넣어야 한다. V4L2 컨트롤은 장치에
+            # 남으므로 여기서 닫은 뒤 record child가 열어도 되며, 지원하지 않는 컨트롤은
+            # 카메라 교체 시 생길 수 있으므로 경고만 남기고 수집은 계속한다.
+            camera_controls = {
+                "scene": apply_recording_controls(self.settings.scene_camera),
+                "wrist": apply_recording_controls(self.settings.wrist_camera),
+            }
+            self._camera_controls = camera_controls
             command = [str(Path(__file__).parents[2] / "scripts/record.sh")]
             try:
                 self._process = subprocess.Popen(
@@ -161,6 +171,17 @@ class RecordManager:
             "runtime": runtime,
             "logs": list(self._logs)[-100:],
         }
+
+    def camera_controls(self, role: str) -> dict[str, object] | None:
+        """Values read back immediately before the collection process opened the cameras."""
+        with self._lock:
+            state = self._camera_controls.get(role)
+            if state is None:
+                return None
+            return {
+                "values": dict(state["values"]),
+                "failures": list(state["failures"]),
+            }
 
     def _collect_logs(self) -> None:
         process = self._process

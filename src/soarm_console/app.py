@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import version
 from pathlib import Path
@@ -13,20 +14,26 @@ from pydantic import BaseModel
 from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
 from .datasets import (
+    NAME_PATTERN,
     DatasetError,
     TrajectoryTooLargeError,
+    dataset_tasks,
+    delete_episode,
     describe,
     list_datasets,
+    move_to_trash,
     playable_clip,
     trajectory,
 )
-from .diagnostics import run_hardware_doctor
-from .spark import SparkError
+from .diagnostics import doctor_failure, run_hardware_doctor
+from .spark import SparkBusy, SparkError, SparkNotFound
 from .spark import list_datasets as spark_list_datasets
 from .spark import list_runs as spark_list_runs
 from .spark import probe as spark_probe
 from .spark import pull_checkpoint as spark_pull_checkpoint
 from .spark import push_dataset as spark_push_dataset
+from .spark import start_training as spark_start_training
+from .spark import stop_training as spark_stop_training
 from .spark import train_command as spark_train_command
 from .record_manager import RecordManager
 from .replay_manager import ReplayManager
@@ -35,8 +42,10 @@ from .replaying import (
     SPEEDS,
     ReplayError,
     alignment_refusal,
+    alignment_seconds,
     episode_first_pose,
     present_position,
+    unit_of,
 )
 from .teleop import TeleopError, TeleopManager
 from .torque import TorqueError
@@ -137,6 +146,38 @@ class RecordRequest(BaseModel):
     episode_seconds: int = 30
     #: `leader`는 물리 리더 팔, `virtual`은 3D 뷰어로 만드는 가상 리더.
     teleop: str = "leader"
+    #: 이어 찍을 데이터셋. `resume`이 참일 때만 본다. 비어 있으면 자식이 새 이름을 짓는다.
+    dataset: str | None = None
+    #: 참이면 새 데이터셋을 만들지 않고 `dataset`에 회차를 이어 붙인다.
+    resume: bool = False
+
+
+class TrainRequest(BaseModel):
+    dataset: str
+    policy: str = "act"
+
+
+#: 이 서버가 답할 수 있는 것들. 맥 앱은 이 목록에 이름이 있을 때만 그 기능을 켠다 —
+#: 화면이 서버보다 앞서 나가면 사람은 눌리지 않는 단추를 보게 되고, 서버가 앞서 나가면
+#: 새 기능이 아무에게도 보이지 않는다. 이름은 글자까지 계약이다.
+CAPABILITIES = [
+    # 찍던 회를 버리고 끝낸다.
+    "abort",
+    # 기존 데이터셋에 회차를 이어 붙인다.
+    "resume",
+    # 수집 중인 카메라 그림을 JPEG 한 장으로 내준다.
+    "preview",
+    # 데이터셋 목록에 `loop_hz`와 카메라 stale 비율이 함께 실린다.
+    "quality",
+    # 데이터셋과 회차를 `data/.trash`로 보낸다.
+    "delete",
+    # 콘솔이 학습 서버에 학습을 띄우고 진행을 읽는다.
+    "train",
+    # 재생을 시작하기 전에 관절별 거리와 정렬 시간을 미리 본다.
+    "replay_preview",
+    # 팔로워가 리더 자세까지 걸어간 뒤에 루프가 시작된다.
+    "soft_start",
+]
 
 
 class RecordControlRequest(BaseModel):
@@ -279,6 +320,7 @@ def status() -> dict[str, object]:
         # 수집은 프리뷰에서 무엇을 고르든 이 값으로 돌아간다. 화면이 그렇게 말할 수 있도록
         # 값을 숨기지 않고 내보인다.
         "recording_profile": RECORDING_PROFILE.as_dict(),
+        "capabilities": CAPABILITIES,
         "preflight": teleop.preflight(),
         "teleop_preflight": teleop.preflight(),
         "record_preflight": recorder.preflight(),
@@ -441,6 +483,41 @@ def spark_runs() -> list[dict[str, object]]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post("/api/spark/train")
+def spark_train_start(request: TrainRequest) -> dict[str, object]:
+    """학습 서버에서 학습을 띄운다. tmux 안에서 돌고, 콘솔은 그 뒤로 진행만 읽는다.
+
+    콘솔이 학습 프로세스를 품지 않는 것이 요점이다. 학습은 몇 시간 돌고 콘솔은
+    `systemctl --user restart`로 다시 시작되는 서비스라, 둘의 수명이 묶이면 콘솔을
+    고치는 일이 곧 학습을 죽이는 일이 된다.
+    """
+    try:
+        return spark_start_training(settings, request.dataset, request.policy)
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SparkNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SparkBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# 이 경로는 아래 `/{step}`보다 **먼저** 적혀야 한다. FastAPI는 적힌 순서대로 맞춰 보므로,
+# 뒤에 두면 `stop`이 체크포인트 이름으로 읽힌다.
+@app.post("/api/spark/runs/{run}/stop")
+def spark_train_stop(run: str) -> dict[str, object]:
+    """도는 학습을 멈춘다. 이미 쓰인 체크포인트는 그대로 남는다."""
+    try:
+        return spark_stop_training(settings, run)
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SparkNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/spark/runs/{run}/{step}")
 def spark_pull(run: str, step: str) -> dict[str, object]:
     """Fetch one checkpoint back for local inference."""
@@ -528,10 +605,13 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
             detail="Stop the virtual leader before physical-leader teleoperation: the follower has one owner",
         )
     last_doctor = run_hardware_doctor(settings)
-    if not last_doctor["safe_for_motion_start"]:
+    if not last_doctor["healthy"]:
+        # 토크가 걸려 있는지는 더 이상 묻지 않는다 — `diagnostics.run_hardware_doctor`가
+        # 그 이유를 적어 두었다. 여기서 막는 것은 모터가 답하지 않거나 전압이 이상한
+        # 경우뿐이고, 어느 팔의 무엇인지를 문구에 담는다.
         raise HTTPException(
             status_code=409,
-            detail="Read-only hardware doctor did not confirm healthy buses with torque disabled",
+            detail=f"Hardware doctor did not pass: {doctor_failure(last_doctor)}",
         )
     try:
         teleop.start()
@@ -549,6 +629,33 @@ def stop_teleoperation() -> dict[str, object]:
     return teleop.status()
 
 
+def _check_resumable(name: str | None, task: str) -> None:
+    """이 데이터셋에 이어 찍어도 되는가.
+
+    과제가 같은지를 보는 이유는, 데이터셋 하나가 학습 한 번의 단위이기 때문이다. LeRobot
+    자체는 과제가 다른 회차도 같은 폴더에 넣어 주지만, 그렇게 섞인 데이터는 파케이를 열기
+    전에는 섞였다는 사실조차 보이지 않는다. 여기서 막는 편이 낫다.
+
+    로봇·fps·feature가 맞는지는 여기서 보지 않는다. `record()`가 `LeRobotDataset.resume`
+    뒤에 `sanity_check_dataset_robot_compatibility`로 확인하고, 그 검사가 훨씬 정확하다.
+    """
+    if not name or not NAME_PATTERN.match(name):
+        raise HTTPException(status_code=404, detail=f"No such dataset: {name}")
+    try:
+        # `dataset_tasks`가 `meta/info.json`이 있는지까지 본다 — 없으면 `FileNotFoundError`다.
+        tasks = dataset_tasks(name)
+    except (FileNotFoundError, DatasetError) as exc:
+        raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
+    if tasks != [task.strip()]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Dataset task does not match: dataset has {tasks}, "
+                f"request has {[task.strip()]}"
+            ),
+        )
+
+
 @app.post("/api/recording/start")
 def start_recording(request: RecordRequest) -> dict[str, object]:
     global last_doctor
@@ -563,14 +670,19 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         )
     if request.teleop not in {"leader", "virtual"}:
         raise HTTPException(status_code=400, detail="teleop must be 'leader' or 'virtual'")
+    if request.resume:
+        _check_resumable(request.dataset, request.task)
     if request.teleop == "leader":
         if vleader.running:
             raise HTTPException(
                 status_code=409, detail="Stop the virtual leader before recording with the physical leader"
             )
         last_doctor = run_hardware_doctor(settings)
-        if not last_doctor["safe_for_motion_start"]:
-            raise HTTPException(status_code=409, detail="Hardware doctor did not pass")
+        if not last_doctor["healthy"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Hardware doctor did not pass: {doctor_failure(last_doctor)}",
+            )
     else:
         # 가상 리더로 찍는다. 팔로워 serial의 소유자는 이제 record 프로세스이므로
         # 콘솔은 장치를 놓고 목표만 중계한다. 진단은 돌리지 않는다 — 그 진단도 serial을
@@ -583,7 +695,12 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         worker.stop()
     try:
         recorder.start(
-            request.task, request.episodes, request.episode_seconds, teleop_source=request.teleop
+            request.task,
+            request.episodes,
+            request.episode_seconds,
+            teleop_source=request.teleop,
+            dataset=request.dataset,
+            resume=request.resume,
         )
     except TeleopError as exc:
         if request.teleop == "virtual":
@@ -600,6 +717,140 @@ def control_recording(request: RecordControlRequest) -> dict[str, object]:
     except TeleopError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return recorder.status()
+
+
+#: 이보다 오래된 스냅숏은 내주지 않는다. 5Hz로 갱신되므로 3초는 열다섯 번을 놓쳤다는
+#: 뜻이고, 그때 화면에 뜨는 그림은 "지금 무엇을 찍고 있나"에 대한 답이 아니다.
+PREVIEW_MAX_AGE_S = 3.0
+
+
+@app.get("/api/recording/preview/{role}.jpg")
+def recording_preview(role: str) -> FileResponse:
+    """수집 중인 카메라가 방금 본 것. 한 장짜리 JPEG.
+
+    수집이 도는 동안 콘솔의 MJPEG 스트림은 꺼져 있다 — 카메라를 쥔 것은 record 자식이고
+    장치 하나를 두 프로세스가 열 수는 없다. 그래서 찍는 쪽이 파일로 내려놓은 그림을
+    여기서 그대로 내준다.
+
+    오래된 그림은 404다. 멈춘 카메라의 마지막 장면을 계속 내주면, 화면은 아무 일도
+    없다는 듯 그것을 보여 준다.
+    """
+    if role not in cameras:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    if not recorder.running:
+        raise HTTPException(status_code=404, detail="Recording is not running")
+    path = recorder.preview_path(role)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="No preview yet") from exc
+    if age > PREVIEW_MAX_AGE_S:
+        raise HTTPException(status_code=404, detail="No preview yet")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        # 이 파일은 자리를 지키고 내용만 바뀐다. 캐시에 한 장이 남으면 화면은 그 한 장을
+        # 계속 보여 주면서 갱신되고 있다고 믿는다.
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/datasets/{name}")
+def delete_dataset(name: str) -> dict[str, object]:
+    """데이터셋 하나를 `data/.trash`로 보낸다. **지우지는 않는다.**
+
+    몇 시간짜리 시연을 담은 폴더를 웹 요청 하나가 영구히 없애도 되는 이유가 없다.
+    목록에서 사라지는 것으로 충분하고, 디스크를 실제로 비우는 것은 사람이
+    `rm -rf data/.trash`로 한다.
+    """
+    if recorder.running or replayer.running:
+        raise HTTPException(
+            status_code=409, detail="Cannot delete while recording or replaying"
+        )
+    try:
+        moved = move_to_trash(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"name": name, "trashed_to": str(moved)}
+
+
+@app.delete("/api/datasets/{name}/episodes/{episode_index}")
+def delete_dataset_episode(name: str, episode_index: int) -> dict[str, object]:
+    """회차 하나를 데이터셋에서 들어내고, 남은 것을 돌려준다.
+
+    찍다 만 회차가 데이터셋 안에서 온전한 시연인 척하는 것을 고치는 길이다. 앞으로
+    찍는 것은 `abort`가 막지만, 이미 들어 있는 것을 꺼낼 자리도 있어야 한다.
+    """
+    if recorder.running or replayer.running:
+        raise HTTPException(
+            status_code=409, detail="Cannot delete while recording or replaying"
+        )
+    try:
+        return delete_episode(name, episode_index)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"No such dataset episode: {name}/{episode_index}"
+        ) from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/replay/preview")
+def replay_preview(dataset: str, episode: int = 0) -> dict[str, object]:
+    """시작하기 전에, 팔이 어디서 어디로 갈지.
+
+    거리 제한을 사실상 없앴으므로(`replaying.ALIGN_REFUSE_DISTANCE`) 판단은 사람이 한다.
+    판단에는 재료가 필요하다 — 관절마다 지금 어디에 있고 어디로 가야 하는지, 그리고 그
+    걸음에 몇 초가 걸리는지. 맥 앱의 확인 시트가 이 값을 그대로 적는다.
+
+    팔로워 serial을 읽으므로 다른 모드가 돌고 있으면 거절한다. 장치 하나에 소유자는
+    하나다.
+    """
+    if recorder.running or teleop.running or vleader.running or replayer.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the running mode before reading the follower: it has one owner",
+        )
+    try:
+        goal = episode_first_pose(dataset, episode)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"No such dataset or episode: {dataset} #{episode}"
+        ) from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        start = present_position(settings)
+    except ReplayError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # 순서는 데이터셋이 정한 feature 순서 그대로다. 화면의 표가 매번 같은 줄에 같은
+    # 관절을 놓으려면 그 순서가 흔들리면 안 된다.
+    joints = [
+        {
+            "name": name,
+            "from": start.get(name),
+            "to": value,
+            "distance": None if name not in start else abs(value - start[name]),
+            "unit": unit_of(name),
+        }
+        for name, value in goal.items()
+    ]
+    refusal = alignment_refusal(start, goal)
+    try:
+        seconds = alignment_seconds(start, goal)
+    except ReplayError:
+        # 거리를 잴 수 없는 자세다. 그 이유는 `refusal`이 이미 말하고 있다.
+        seconds = None
+    return {
+        "dataset": dataset,
+        "episode": episode,
+        "joints": joints,
+        "align_seconds": seconds,
+        "refusal": refusal,
+    }
 
 
 @app.post("/api/replay/start")

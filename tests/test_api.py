@@ -425,3 +425,224 @@ def test_adding_to_the_home_screen_works_from_whichever_page_is_open():
 
     # 문서 바깥으로 남는 띠는 머리글·아래 탭과 같은 색이어야 한다. 색까지 확인하는 것은
     # 위 `test_the_document_stays_in_flow_so_ios_has_nothing_left_to_paint`가 한다.
+
+
+# MARK: 계약 — 앱이 무엇을 켤지 정하는 목록
+
+
+def test_status_names_every_capability_the_app_looks_for():
+    """맥 앱은 이 목록에 이름이 있을 때만 그 기능을 켠다. 이름은 글자까지 계약이다."""
+    capabilities = status()["capabilities"]
+
+    assert capabilities == [
+        "abort",
+        "resume",
+        "preview",
+        "quality",
+        "delete",
+        "train",
+        "replay_preview",
+        "soft_start",
+    ]
+
+
+def test_every_named_capability_has_something_behind_it():
+    """목록에 이름만 있고 길이 없으면, 앱은 눌리지 않는 단추를 보여 준다."""
+    from soarm_console.app import app
+
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    methods = {
+        (route.path, method)
+        for route in app.routes
+        if hasattr(route, "methods")
+        for method in route.methods
+    }
+
+    assert ("/api/recording/preview/{role}.jpg", "GET") in methods
+    assert ("/api/datasets/{name}", "DELETE") in methods
+    assert ("/api/datasets/{name}/episodes/{episode_index}", "DELETE") in methods
+    assert ("/api/replay/preview", "GET") in methods
+    assert ("/api/spark/train", "POST") in methods
+    assert ("/api/spark/runs/{run}/stop", "POST") in methods
+    assert "/api/recording/control" in paths
+
+
+def test_abort_is_a_control_the_recorder_accepts():
+    from soarm_console.record_manager import CONTROLS
+
+    assert "abort" in CONTROLS
+
+
+def test_an_unknown_control_says_so_with_the_phrase_the_app_translates():
+    from soarm_console.app import recorder
+    from soarm_console.teleop import TeleopError
+
+    with pytest.raises(TeleopError) as error:
+        recorder.control("launch")
+    assert str(error.value) == "Unknown recording control"
+
+
+# MARK: 수집 중 스냅숏
+
+
+def test_the_snapshot_is_only_served_while_a_recording_is_running(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app, recorder
+
+    monkeypatch.setattr(recorder, "runtime_dir", tmp_path)
+    client = TestClient(app)
+
+    assert client.get("/api/recording/preview/scene.jpg").status_code == 404
+
+    monkeypatch.setattr(type(recorder), "running", property(lambda self: True))
+    # 수집은 돌지만 아직 그림이 없다.
+    assert client.get("/api/recording/preview/scene.jpg").status_code == 404
+    assert client.get("/api/recording/preview/nose.jpg").status_code == 404
+
+
+def test_a_stale_snapshot_is_not_served_at_all(tmp_path, monkeypatch):
+    """멈춘 카메라의 마지막 장면을 계속 내주면, 화면은 아무 일도 없다는 듯 그것을 보여 준다."""
+    import os
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app, recorder
+
+    monkeypatch.setattr(recorder, "runtime_dir", tmp_path)
+    monkeypatch.setattr(type(recorder), "running", property(lambda self: True))
+    snapshot = tmp_path / "preview-scene.jpg"
+    snapshot.write_bytes(b"jpeg-bytes")
+    client = TestClient(app)
+
+    fresh = client.get("/api/recording/preview/scene.jpg")
+    assert fresh.status_code == 200
+    assert fresh.headers["content-type"] == "image/jpeg"
+    # 자리를 지키고 내용만 바뀌는 파일이다. 캐시에 한 장이 남으면 화면은 그것을 계속 본다.
+    assert fresh.headers["cache-control"] == "no-store"
+    assert fresh.content == b"jpeg-bytes"
+
+    old = time.time() - 10
+    os.utime(snapshot, (old, old))
+    assert client.get("/api/recording/preview/scene.jpg").status_code == 404
+
+
+# MARK: 지우기
+
+
+@pytest.fixture
+def deletable(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from soarm_console import datasets as datasets_module
+    from soarm_console.app import app
+
+    root = tmp_path / "data"
+    (root / "soarm101_pick" / "meta").mkdir(parents=True)
+    (root / "soarm101_pick" / "meta" / "info.json").write_text(
+        json.dumps({"fps": 30, "total_episodes": 2, "features": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(datasets_module, "data_root", lambda: root)
+    return TestClient(app), root
+
+
+def test_deleting_a_dataset_moves_it_to_the_trash(deletable):
+    client, root = deletable
+
+    response = client.request("DELETE", "/api/datasets/soarm101_pick")
+
+    assert response.status_code == 200
+    assert not (root / "soarm101_pick").exists()
+    trashed = list((root / ".trash").iterdir())
+    assert len(trashed) == 1
+    assert trashed[0].name.startswith("soarm101_pick-")
+    assert response.json()["trashed_to"] == str(trashed[0])
+
+
+def test_deleting_a_dataset_that_is_not_there_is_not_found(deletable):
+    client, _ = deletable
+    response = client.request("DELETE", "/api/datasets/never_recorded")
+    assert response.status_code == 404
+    assert response.json()["detail"].startswith("No such dataset")
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "soarm_console.record_manager.RecordManager",
+        "soarm_console.replay_manager.ReplayManager",
+    ],
+)
+def test_nothing_is_deleted_while_the_arm_is_using_the_data(deletable, monkeypatch, owner):
+    """수집은 그 폴더에 쓰는 중이고, 재생은 그 파케이를 읽는 중이다."""
+    client, root = deletable
+    module_name, _, class_name = owner.rpartition(".")
+    module = __import__(module_name, fromlist=[class_name])
+    monkeypatch.setattr(getattr(module, class_name), "running", True)
+
+    dataset = client.request("DELETE", "/api/datasets/soarm101_pick")
+    episode = client.request("DELETE", "/api/datasets/soarm101_pick/episodes/0")
+
+    assert dataset.status_code == 409
+    assert episode.status_code == 409
+    assert dataset.json()["detail"] == "Cannot delete while recording or replaying"
+    assert (root / "soarm101_pick").exists()
+
+
+# MARK: 품질 — 데이터셋이 스스로 말하지 못하는 것
+
+
+def _finished_recording(tmp_path, monkeypatch, name: str, *, resumed: bool, warnings: int):
+    from soarm_console.config import Settings
+    from soarm_console.record_manager import RecordManager
+
+    manager = RecordManager(Settings())
+    monkeypatch.setattr(manager, "runtime_dir", tmp_path / "runtime")
+    monkeypatch.setattr(manager, "log_path", tmp_path / "runtime" / "record.log")
+    manager.runtime_dir.mkdir(parents=True, exist_ok=True)
+    manager.log_path.write_text("Record loop is running slower\n", encoding="utf-8")
+    manager._slow_loop_warnings = warnings
+    manager._resumed = resumed
+    (manager.runtime_dir / "status.json").write_text(
+        json.dumps({
+            "dataset_name": name,
+            "loop_hz": 28.6,
+            "camera_stale_pct": {"scene": 0.0, "wrist": 9.0},
+        }),
+        encoding="utf-8",
+    )
+    return manager
+
+
+def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, monkeypatch):
+    """`timestamp`는 `frame_index / fps`로 합성된 값이라, 루프가 느렸어도 파케이는
+    30Hz라고 적혀 있다. 그 사실을 아는 것은 찍는 동안 세어 둔 이 값뿐이다."""
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=2)
+
+    manager._write_quality(data, {"loop_hz": 28.6, "camera_stale_pct": {"wrist": 9.0}})
+
+    quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
+    assert quality["loop_hz"] == 28.6
+    assert quality["camera_stale_pct"] == {"wrist": 9.0}
+    assert quality["slow_loop_warnings"] == 2
+    assert quality["recorded_at"] > 0
+
+
+def test_resuming_adds_this_runs_warnings_to_the_ones_already_counted(tmp_path, monkeypatch):
+    """파일 하나가 데이터셋 전체를 말해야 한다. 마지막 실행만 남기면 앞 회차가 조용해진다."""
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    (data / "soarm_quality.json").write_text(
+        json.dumps({"slow_loop_warnings": 5, "loop_hz": 22.0}), encoding="utf-8"
+    )
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=True, warnings=3)
+
+    manager._write_quality(data, {"loop_hz": 29.9, "camera_stale_pct": {}})
+
+    quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
+    assert quality["slow_loop_warnings"] == 8
+    # 속도는 이번 실행의 값으로 바뀐다 — 더할 수 있는 것이 아니다.
+    assert quality["loop_hz"] == 29.9

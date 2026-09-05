@@ -220,7 +220,7 @@ class CameraWorker:
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, profile.width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, profile.height)
             capture.set(cv2.CAP_PROP_FPS, profile.fps)
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # 드라이버 큐를 한 칸으로 줄이면 처리 중 다음 버퍼를 채우지 못해 매번 한 프레임을 잃는다.
             if not capture.isOpened():
                 with self._condition:
                     self._error = f"Cannot open camera: {self.path}"

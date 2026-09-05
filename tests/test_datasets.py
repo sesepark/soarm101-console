@@ -12,7 +12,20 @@ def _make_dataset(root: Path, name: str, keys=("observation.images.scene",)) -> 
     directory = root / name
     (directory / "meta").mkdir(parents=True)
     features = {key: {"dtype": "video", "shape": [240, 320, 3]} for key in keys}
-    features["observation.state"] = {"dtype": "float32", "shape": [6]}
+    joints = [
+        "wrist_roll.pos",
+        "shoulder_pan.pos",
+        "elbow_flex.pos",
+        "shoulder_lift.pos",
+        "gripper.pos",
+        "wrist_flex.pos",
+    ]
+    features["observation.state"] = {
+        "dtype": "float32",
+        "shape": [6],
+        "names": joints,
+    }
+    features["action"] = {"dtype": "float32", "shape": [6], "names": joints}
     (directory / "meta/info.json").write_text(
         json.dumps({
             "codebase_version": "v3.0",
@@ -29,6 +42,36 @@ def _make_dataset(root: Path, name: str, keys=("observation.images.scene",)) -> 
         video.mkdir(parents=True)
         (video / "file-000.mp4").write_bytes(b"not really an mp4")
     return directory
+
+
+def _write_episode(directory: Path, episode_index: int, state: list[list[float]]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    action = [[value + 0.5 for value in frame] for frame in state]
+    meta = directory / "meta/episodes/chunk-000/file-000.parquet"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table({
+            "episode_index": [episode_index],
+            "length": [len(state)],
+            "data/chunk_index": [0],
+            "data/file_index": [0],
+        }),
+        meta,
+    )
+    data = directory / "data/chunk-000/file-000.parquet"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    # Store in reverse order so the endpoint has to honor frame_index.
+    pq.write_table(
+        pa.table({
+            "episode_index": [episode_index] * len(state),
+            "frame_index": list(reversed(range(len(state)))),
+            "observation.state": list(reversed(state)),
+            "action": list(reversed(action)),
+        }),
+        data,
+    )
 
 
 @pytest.fixture
@@ -120,7 +163,65 @@ def test_reencodes_only_when_the_client_could_not_play_it(data_root, monkeypatch
     assert len(calls) == 2
 
 
-def test_episode_urls_carry_their_own_range(data_root):
+def test_trajectory_endpoint_returns_frame_order_and_metadata_joint_order(data_root):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    state = [
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+        [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+    ]
+    _write_episode(directory, 1, state)
+
+    response = TestClient(app).get("/api/datasets/soarm101_pick/episodes/1/trajectory")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fps"] == 10
+    assert payload["frames"] == 3
+    assert payload["joints"] == [
+        "wrist_roll.pos",
+        "shoulder_pan.pos",
+        "elbow_flex.pos",
+        "shoulder_lift.pos",
+        "gripper.pos",
+        "wrist_flex.pos",
+    ]
+    assert payload["state"] == state
+    assert payload["action"] == [[value + 0.5 for value in frame] for frame in state]
+
+
+def test_trajectory_endpoint_reports_missing_dataset_and_episode(data_root):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_episode(directory, 0, [[0.0] * 6])
+    client = TestClient(app)
+
+    assert client.get("/api/datasets/never_recorded/episodes/0/trajectory").status_code == 404
+    assert client.get("/api/datasets/soarm101_pick/episodes/7/trajectory").status_code == 404
+
+
+def test_trajectory_endpoint_rejects_an_episode_over_the_frame_limit(data_root, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    _write_episode(directory, 0, [[0.0] * 6, [1.0] * 6])
+    monkeypatch.setattr(datasets, "TRAJECTORY_FRAME_LIMIT", 1)
+
+    response = TestClient(app).get("/api/datasets/soarm101_pick/episodes/0/trajectory")
+
+    assert response.status_code == 413
+
+
+def test_episode_urls_carry_their_own_range(data_root, monkeypatch):
     _make_dataset(data_root, "soarm101_pick")
     row = {
         "episode_index": 0, "tasks": ["집기"], "length": 20,
@@ -130,7 +231,7 @@ def test_episode_urls_carry_their_own_range(data_root):
         "videos/observation.images.scene/to_timestamp": 4.0,
     }
     import soarm_console.datasets as module
-    module._episode_rows = lambda directory: [row]
+    monkeypatch.setattr(module, "_episode_rows", lambda directory: [row])
 
     detail = datasets.describe("soarm101_pick")
 

@@ -12,7 +12,14 @@ from pydantic import BaseModel
 
 from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
-from .datasets import DatasetError, describe, list_datasets, playable_clip
+from .datasets import (
+    DatasetError,
+    TrajectoryTooLargeError,
+    describe,
+    list_datasets,
+    playable_clip,
+    trajectory,
+)
 from .diagnostics import run_hardware_doctor
 from .spark import SparkError
 from .spark import list_datasets as spark_list_datasets
@@ -128,7 +135,7 @@ class CameraSettingsRequest(BaseModel):
     fps: int
 
 
-def camera_status(worker: CameraWorker) -> dict[str, object]:
+def camera_status(worker: CameraWorker, role: str | None = None) -> dict[str, object]:
     """카메라 한 대의 지금 상태.
 
     `requested`와 `actual`을 따로 내보내는 이유가 있다. 드라이버는 못 맞추는 해상도를
@@ -143,6 +150,7 @@ def camera_status(worker: CameraWorker) -> dict[str, object]:
         "requested": worker.profile.as_dict(),
         "actual": actual.as_dict() if actual else None,
         "modes": worker.modes(),
+        "recording_controls": recorder.camera_controls(role) if role is not None else None,
     }
 
 
@@ -240,7 +248,7 @@ def status() -> dict[str, object]:
             },
         },
         "software": {"lerobot": version("lerobot")},
-        "cameras": {name: camera_status(worker) for name, worker in cameras.items()},
+        "cameras": {name: camera_status(worker, name) for name, worker in cameras.items()},
         # 수집은 프리뷰에서 무엇을 고르든 이 값으로 돌아간다. 화면이 그렇게 말할 수 있도록
         # 값을 숨기지 않고 내보인다.
         "recording_profile": RECORDING_PROFILE.as_dict(),
@@ -323,6 +331,21 @@ def dataset(name: str) -> dict[str, object]:
         return describe(name)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{name}/episodes/{episode_index}/trajectory")
+def dataset_trajectory(name: str, episode_index: int) -> dict[str, object]:
+    try:
+        return trajectory(name, episode_index)
+    except TrajectoryTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No such dataset episode: {name}/{episode_index}",
+        ) from exc
     except DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

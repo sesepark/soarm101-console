@@ -5,6 +5,7 @@ import re
 import json
 import threading
 import time
+from collections import deque
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,19 +28,116 @@ from .vleader.teleoperator import SOArmVirtualLeaderConfig
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/record"
 CONTROL_PATH = RUNTIME_DIR / "control.json"
 STATUS_PATH = RUNTIME_DIR / "status.json"
+_STATUS_LOCK = threading.Lock()
+_ORIGINAL_RECORD_LOOP = lerobot_record.record_loop
+
+# A few seconds is long enough to smooth camera jitter, while still making a
+# sustained slowdown visible to the operator before the episode is over.
+LOOP_HZ_WINDOW_S = 3.0
+LOOP_HZ_PUBLISH_S = 1.0
 
 
 def _write_status(**updates: object) -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    current: dict[str, object] = {}
+    # The GUI control listener and the loop-rate publisher are separate threads.
+    # Serialize their read-modify-write cycles so neither can erase the other's
+    # fields or replace the shared temporary file while it is being written.
+    with _STATUS_LOCK:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        current: dict[str, object] = {}
+        try:
+            current = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        current.update(updates, updated_at=time.time())
+        temporary = STATUS_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(current), encoding="utf-8")
+        os.replace(temporary, STATUS_PATH)
+
+
+class _LoopRateMonitor:
+    """Publish a rolling rate without doing file I/O in the control loop."""
+
+    def __init__(self) -> None:
+        self.samples: deque[float] = deque()
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def tick(self) -> None:
+        now = time.perf_counter()
+        with self.lock:
+            self.samples.append(now)
+            cutoff = now - LOOP_HZ_WINDOW_S
+            while self.samples and self.samples[0] < cutoff:
+                self.samples.popleft()
+
+    def rate(self) -> float:
+        with self.lock:
+            if len(self.samples) < 2:
+                return 0.0
+            return (len(self.samples) - 1) / (self.samples[-1] - self.samples[0])
+
+    def _publish(self) -> None:
+        _write_status(loop_hz=float(self.rate()))
+
+    def _run(self) -> None:
+        while not self.stopped.wait(LOOP_HZ_PUBLISH_S):
+            self._publish()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        self.thread.join(timeout=LOOP_HZ_PUBLISH_S + 0.5)
+        self._publish()
+
+
+class _RateTrackedRobot:
+    """Count loop entries while leaving the LeRobot robot object untouched."""
+
+    def __init__(self, robot: object, monitor: _LoopRateMonitor) -> None:
+        self._robot = robot
+        self._monitor = monitor
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._robot, name)
+
+    def get_observation(self) -> object:
+        self._monitor.tick()
+        return self._robot.get_observation()
+
+
+def _record_loop_with_status(*args: object, **kwargs: object) -> object:
+    """Wrap LeRobot's loop and expose episode boundaries plus its real rate.
+
+    LeRobot currently calls this function entirely with keywords. Requiring the
+    fields we consume and forwarding every argument unchanged (apart from the
+    transparent robot proxy) makes an upstream signature change fail loudly.
+    """
+    robot = kwargs["robot"]
+    dataset = kwargs.get("dataset")
+    control_time_s = kwargs["control_time_s"]
+    monitor = _LoopRateMonitor()
+
+    if dataset is None:
+        _write_status(phase="resetting", episode_started_at=None, loop_hz=0.0)
+    else:
+        _write_status(
+            phase="recording",
+            episode_started_at=time.time(),
+            episode_seconds=int(control_time_s),
+            episode_index=int(dataset.num_episodes),
+            loop_hz=0.0,
+        )
+
+    forwarded = dict(kwargs)
+    forwarded["robot"] = _RateTrackedRobot(robot, monitor)
+    monitor.start()
     try:
-        current = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    current.update(updates, updated_at=time.time())
-    temporary = STATUS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(current), encoding="utf-8")
-    os.replace(temporary, STATUS_PATH)
+        return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
+    finally:
+        monitor.stop()
 
 
 class _GuiControlListener:
@@ -170,16 +268,25 @@ def main() -> None:
     with lock_context:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         CONTROL_PATH.unlink(missing_ok=True)
-        _write_status(phase="starting", dataset_name=dataset_name, task=task, teleop=teleop_source)
+        config = build_record_config(settings, task, dataset_name, teleop_source=teleop_source)
+        _write_status(
+            phase="starting",
+            dataset_name=dataset_name,
+            task=task,
+            teleop=teleop_source,
+            episode_started_at=None,
+            episode_seconds=int(config.dataset.episode_time_s),
+            episode_index=0,
+            loop_hz=0.0,
+        )
         lerobot_record.init_keyboard_listener = _init_gui_listener
+        lerobot_record.record_loop = _record_loop_with_status
         try:
             _write_status(phase="recording")
-            lerobot_record.record(
-                build_record_config(settings, task, dataset_name, teleop_source=teleop_source)
-            )
-            _write_status(phase="complete")
+            lerobot_record.record(config)
+            _write_status(phase="complete", episode_started_at=None)
         except BaseException:
-            _write_status(phase="error")
+            _write_status(phase="error", episode_started_at=None)
             raise
 
 

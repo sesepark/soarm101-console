@@ -1,11 +1,14 @@
 from pathlib import Path
 
-from soarm_console.config import Settings
+import pytest
+
+from soarm_console.config import Settings, WIDEST_JOINT_SPAN
 from soarm_console.calibration import validate_calibration
 from soarm_console.diagnostics import EXPECTED_IDS, EXPECTED_MODEL
 from soarm_console.teleop import TeleopManager
 from soarm_console.recording import build_record_config
 from soarm_console.record_manager import RecordManager
+from soarm_console.vleader.spec import load_joint_specs
 
 
 def test_motion_is_disabled_by_default(monkeypatch):
@@ -68,3 +71,32 @@ def test_record_manager_is_gated_before_calibration():
 
 def test_calibration_validator_rejects_missing_file(tmp_path: Path):
     assert validate_calibration(tmp_path / "missing.json").startswith("Missing calibration")
+
+
+def test_widest_joint_span_still_covers_the_real_calibration():
+    """`WIDEST_JOINT_SPAN`은 취향이 아니라 이 하드웨어를 설명하는 숫자다.
+
+    상수가 실제 관절 폭보다 **작아지면** 안전 클램프가 조용히 꺼진다:
+    `effective_max_relative_target`이 걸릴 수 있는 상한까지 `None`으로 바꿔 버리고,
+    LeRobot은 목표를 자르지 않은 채 그대로 모터에 실어 버린다. 화면에도 로그에도
+    아무 말이 남지 않으므로, 틀렸다는 것을 팔이 먼저 알게 된다.
+
+    그래서 방향이 있는 시험이다. calibration을 다시 잡아 어느 관절이 이 상수보다
+    넓어지면 여기서 먼저 깨져야 한다. 상수를 여기에 다시 적는 시험
+    (`WIDEST_JOINT_SPAN == 360`)은 상수가 200이던 시절에도 통과했을 것이라
+    이 버그를 잡지 못한다 — 대조할 상대는 상수가 아니라 calibration이다.
+
+    실물 팔은 필요 없다. calibration 파일만 읽는다.
+    """
+    calibration = Settings().follower_calibration
+    if not calibration.exists():
+        # 실물과 무관한 CI에는 calibration이 없다. 없다고 빨간불을 켜면 이 시험은
+        # 곧 무시당하고, 무시당하는 시험은 상수를 지키지 못한다.
+        pytest.skip(f"No follower calibration on this machine: {calibration}")
+
+    spans = {spec.name: spec.span for spec in load_joint_specs(calibration)}
+    widest = max(spans.values())
+    assert WIDEST_JOINT_SPAN >= widest, (
+        f"관절 폭이 상수를 넘어섰다: {spans}. WIDEST_JOINT_SPAN을 {widest:g} 이상으로 올려야"
+        " max_relative_target 상한이 다시 살아난다."
+    )

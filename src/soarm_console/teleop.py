@@ -26,12 +26,18 @@ class TeleopManager:
 
     def command(self) -> list[str]:
         cfg = self.settings
-        return [
+        limit = cfg.effective_max_relative_target
+        command = [
             str(cfg.lerobot_teleoperate),
             "--robot.type=so101_follower",
             f"--robot.port={cfg.follower_port}",
             f"--robot.id={cfg.follower_id}",
-            f"--robot.max_relative_target={cfg.max_relative_target:g}",
+        ]
+        # 걸릴 수 없는 상한은 아예 넘기지 않는다. 넘기면 LeRobot이 스텝마다 팔로워를
+        # 한 번 더 읽고, 그 왕복은 자르지도 못할 값을 위해 치르는 값이다.
+        if limit is not None:
+            command.append(f"--robot.max_relative_target={limit:g}")
+        command += [
             # 종료나 예외가 곧 torque-off가 되면 팔이 떨어진다. 해제는 사람이 팔을
             # 받친 상태에서 별도 절차로만 한다.
             "--robot.disable_torque_on_disconnect=false",
@@ -41,6 +47,7 @@ class TeleopManager:
             "--fps=30",
             "--display_data=false",
         ]
+        return command
 
     def preflight(self) -> list[str]:
         cfg = self.settings

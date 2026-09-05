@@ -196,7 +196,7 @@ def build_record_config(
         port=settings.follower_port,
         id=settings.follower_id,
         cameras=cameras,
-        max_relative_target=settings.max_relative_target,
+        max_relative_target=settings.effective_max_relative_target,
         # record loop의 정상 종료나 예외가 torque-off가 되면 팔이 떨어진다. 해제는 사람이
         # 팔을 받친 뒤 명시적으로만 한다.
         disable_torque_on_disconnect=False,

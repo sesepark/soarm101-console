@@ -11,16 +11,10 @@ SO-ARM101 leader–follower 팔을 위한 로컬 우선 운영 콘솔임. 브라
 > 3D arm instead of a physical leader; every goal has to clear a server-side safety ladder before it
 > reaches a motor. Python 9.8k lines, 251 tests. Documentation is in Korean.*
 
-<table>
-<tr>
-<td width="62%"><img src="docs/images/console-main.png" alt="콘솔 관찰 화면 — 카메라 두 대와 준비 상태"></td>
-<td width="38%"><img src="docs/images/viewer-phone.png" alt="폰 조작 화면 — 카메라 · 3D 팔 · 타일 넷"></td>
-</tr>
-<tr>
-<td align="center"><sub><b>콘솔</b> — 관찰 · 텔레옵 · 데이터 세 화면과, 시작을 막는 것이 무엇인지 말하는 준비 상태</sub></td>
-<td align="center"><sub><b>폰 조작 화면</b> — 관절 슬라이더 대신 타일 넷. 그 자리를 카메라가 가져감</sub></td>
-</tr>
-</table>
+![콘솔 관찰 화면](docs/images/console-main.png)
+
+<sub><b>콘솔</b> — 관찰 · 텔레옵 · 데이터 세 화면. 오른쪽 `준비 상태`가 시작을 막는 것이 무엇인지
+(모터 응답 · 전압 · calibration) 이름으로 말함.</sub>
 
 ---
 
@@ -105,6 +99,18 @@ flowchart TB
   맡고, 넷 다 누른 채 좌우로 끄는 같은 몸짓임. 그 결과 카메라는 294px(폭에 정확히 4:3이라
   640×480이 잘리지 않는다), 3D는 392px을 씀. **원격으로 팔을 움직이는 사람에게 가장 필요한 것은
   슬라이더가 아니라 팔이 무엇을 하는지 보이는 화면이기 때문임.**
+
+  <table>
+  <tr>
+  <td width="34%"><img src="docs/images/viewer-phone.png" alt="폰 조작 화면"></td>
+  <td width="66%" valign="top"><sub>카메라 294px · 3D 392px. 3D 위에 뜬 타일 넷(<b>앞뒤 · 손목
+  굽힘 · 손목 회전 · 집게</b>)이 관절 슬라이더 여섯 줄을 대신하고, 넷 다 누른 채 좌우로 끄는 같은
+  몸짓임. 아래 탭 넷(조작 · 카메라 · 상태 · 권한) 어디에서도 <b>정지</b>가 늘 보임. 위쪽
+  <code>절약 · 약 55MB/시간</code>은 서버에 거는 카메라 프로필이라, 받는 쪽에서 프레임을 버리는
+  것이 아니라 실제로 덜 찍고 덜 보냄.</sub></td>
+  </tr>
+  </table>
+
 - **찍다 만 회를 온전한 시연인 척 남기지 않음.** 수집 조작은 넷임 — `right`(조기 종료),
   `left`(재촬영), `esc`(저장하고 끝), **`abort`(찍던 회를 버리고 끝)**. `esc`는 루프를 빠져나온 뒤
   `save_episode()`가 그대로 돌아 찍다 만 회를 저장하는데, 실제로 82프레임 2.7초짜리 조각이 남은

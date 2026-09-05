@@ -5,11 +5,12 @@ import os
 import threading
 import time
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 
 from .calibration import validate_calibration
-from .config import Settings
+from .config import WIDEST_JOINT_SPAN, Settings
 from .datasets import episode_actions
 from .diagnostics import MOTORS
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
@@ -31,18 +32,28 @@ DEFAULT_SPEED = 0.5
 #: 데이터셋 안에 들어 있다.
 #:
 #: MoveIt이 줄 수 있는 것은 보간이 아니라 **충돌 회피 경로 계획**이다. 책상 위에 물건을
-#: 두고 그 위를 지나야 하는 날 이 서버에 ROS를 들이는 값을 다시 계산한다. 지금은 아래
-#: 60도 제한과 느린 속도, 그리고 옆에 있는 사람이 그 자리를 대신한다.
+#: 두고 그 위를 지나야 하는 날 이 서버에 ROS를 들이는 값을 다시 계산한다. 지금은 느린
+#: 속도와 시작 전에 관절별 거리를 읽는 사람이 그 자리를 대신한다.
 ALIGN_HZ = 30.0
 ALIGN_DEGREES_PER_SECOND = 20.0
 ALIGN_PERCENT_PER_SECOND = 25.0
 ALIGN_MIN_SECONDS = 2.0
-ALIGN_MAX_SECONDS = 8.0
+ALIGN_MAX_SECONDS = 15.0
 
-#: 이만큼 떨어져 있으면 **시작하지 않는다.** 관절 하나라도 이 거리를 넘는다는 것은 팔이
-#: 그 에피소드와 다른 세계에 있다는 뜻이고, 그때 필요한 것은 느린 보간이 아니라 사람이
-#: 팔을 보고 판단하는 일이다.
-ALIGN_REFUSE_DISTANCE = 60.0
+#: 이만큼 떨어져 있으면 **시작하지 않는다.**
+#:
+#: 한때 60도였다. 통상 흐름에서는 걸리지 않는 값이었지만, 걸리면 빠져나올 길이 없었다 —
+#: 거절당한 팔은 토크가 걸린 채 서 있어서 손으로 옮길 수 없고, 가까이 데려가려면 텔레옵을
+#: 한 번 띄워야 했다. 거절이 사람에게 시키는 일이 거절이 막으려던 일보다 번거로웠다.
+#:
+#: 지금 값은 이 팔에서 가장 넓은 관절의 폭(`config.WIDEST_JOINT_SPAN`)이다. 어느 관절도
+#: 이보다 멀리 떨어질 수 없으므로 거리로는 사실상 거절하지 않는다는 뜻이고, 남는 것은
+#: `joint_distances`가 잡는 두 가지 — NaN/Inf와 관절 이름 불일치 — 다. 그 둘은 거리가
+#: 아니라 **뜻을 알 수 없는 값**이라 여전히 거절해야 한다.
+#:
+#: 대신 판단할 재료를 사람에게 준다. `/api/replay/preview`가 관절별 거리와 정렬에 걸릴
+#: 시간을 그대로 돌려주고, 맥 앱의 확인 시트가 그것을 적는다.
+ALIGN_REFUSE_DISTANCE = WIDEST_JOINT_SPAN
 
 #: 각도가 아니라 퍼센트로 정규화되는 관절. LeRobot `SOFollower`가 집게만 `RANGE_0_100`을
 #: 쓴다(나머지는 `DEGREES`). 데이터셋에 적힌 숫자도 같은 단위다.
@@ -88,8 +99,45 @@ def unit_of(joint: str) -> str:
     return "%" if joint in PERCENT_JOINTS else "°"
 
 
+@dataclass(frozen=True)
+class AlignmentLimits:
+    """정렬 한 번이 지키는 속도와 시간.
+
+    같은 s-curve를 두 곳이 쓴다. 재생은 사람 손이 닿지 않는 자동 동작이라 느리게(첨두
+    20°/s) 가고, 텔레옵·수집의 시작 정렬은 사람이 리더를 쥔 채 보고 있으므로 조금 빠르게
+    (첨두 40°/s) 간다. 다른 것은 이 네 숫자뿐이므로 보간 함수를 복사하지 않고 값만 넘긴다
+    — 두 벌이 되면 한쪽만 고쳐지는 날이 온다.
+    """
+
+    degrees_per_second: float
+    percent_per_second: float
+    min_seconds: float
+    max_seconds: float
+
+    def speed_limit_of(self, joint: str) -> float:
+        return self.percent_per_second if joint in PERCENT_JOINTS else self.degrees_per_second
+
+    @property
+    def smooth_distance(self) -> float:
+        """이 거리까지는 첨두 속도가 실제로 상한이다.
+
+        `max_seconds`에서 시간이 잘리면 그보다 먼 이동은 같은 시간에 더 먼 거리를 가므로
+        속도가 다시 올라간다. 상한이 뜻을 갖는 구간의 끝이 여기다.
+        """
+        return self.max_seconds * self.degrees_per_second / SCURVE_PEAK_FACTOR
+
+
+#: 재생이 쓰는 값. 모듈 상수 그대로다 — 이 표는 상수를 대신하는 것이 아니라 묶는 것이다.
+REPLAY_ALIGNMENT = AlignmentLimits(
+    degrees_per_second=ALIGN_DEGREES_PER_SECOND,
+    percent_per_second=ALIGN_PERCENT_PER_SECOND,
+    min_seconds=ALIGN_MIN_SECONDS,
+    max_seconds=ALIGN_MAX_SECONDS,
+)
+
+
 def speed_limit_of(joint: str) -> float:
-    return ALIGN_PERCENT_PER_SECOND if joint in PERCENT_JOINTS else ALIGN_DEGREES_PER_SECOND
+    return REPLAY_ALIGNMENT.speed_limit_of(joint)
 
 
 def smoothstep(fraction: float) -> float:
@@ -108,8 +156,8 @@ def joint_distances(start: dict[str, float], goal: dict[str, float]) -> dict[str
             "The episode's joints do not match the arm's joints: "
             f"episode {sorted(goal)}, arm {sorted(start)}"
         )
-    # NaN/Inf가 섞이면 아래의 60도 비교가 조용히 참을 내지 못하고 전부 통과한다
-    # (`nan > 60`은 거짓이다). 거리를 재기 전에 재는 대상부터 확인한다.
+    # NaN/Inf가 섞이면 아래의 거리 비교가 조용히 전부 통과한다(`nan > 360`은 거짓이다).
+    # 거리 제한이 사실상 꺼진 지금은 이것이 `alignment_refusal`이 잡는 거의 전부다.
     unusable = sorted(
         name for name in goal if not isfinite(goal[name]) or not isfinite(start[name])
     )
@@ -118,23 +166,30 @@ def joint_distances(start: dict[str, float], goal: dict[str, float]) -> dict[str
     return {name: abs(goal[name] - start[name]) for name in sorted(goal)}
 
 
-def alignment_seconds(start: dict[str, float], goal: dict[str, float]) -> float:
+def alignment_seconds(
+    start: dict[str, float],
+    goal: dict[str, float],
+    limits: AlignmentLimits = REPLAY_ALIGNMENT,
+) -> float:
     """정렬에 쓸 전체 이동 시간.
 
-    가장 오래 걸리는 관절이 정한다. 관절은 초당 20도, 집게는 초당 25%가 상한이고,
-    그 상한은 평균이 아니라 첨두에 건다(`SCURVE_PEAK_FACTOR` 설명 참고).
+    가장 오래 걸리는 관절이 정한다. 재생에서는 관절이 초당 20도, 집게가 초당 25%가
+    상한이고, 그 상한은 평균이 아니라 첨두에 건다(`SCURVE_PEAK_FACTOR` 설명 참고).
     """
     distances = joint_distances(start, goal)
-    needed = [distance / speed_limit_of(name) for name, distance in distances.items()]
+    needed = [distance / limits.speed_limit_of(name) for name, distance in distances.items()]
     slowest = max(needed, default=0.0) * SCURVE_PEAK_FACTOR
-    return min(ALIGN_MAX_SECONDS, max(ALIGN_MIN_SECONDS, slowest))
+    return min(limits.max_seconds, max(limits.min_seconds, slowest))
 
 
 def alignment_frames(
-    start: dict[str, float], goal: dict[str, float], hz: float = ALIGN_HZ
+    start: dict[str, float],
+    goal: dict[str, float],
+    hz: float = ALIGN_HZ,
+    limits: AlignmentLimits = REPLAY_ALIGNMENT,
 ) -> list[dict[str, float]]:
     """정렬 단계가 한 틱에 하나씩 명령할 자세들. 마지막 원소는 정확히 `goal`이다."""
-    seconds = alignment_seconds(start, goal)
+    seconds = alignment_seconds(start, goal, limits)
     steps = max(1, round(seconds * hz))
     frames = []
     for step in range(1, steps + 1):
@@ -170,7 +225,7 @@ def alignment_refusal(start: dict[str, float], goal: dict[str, float]) -> str | 
 def episode_first_pose(dataset_name: str, episode_index: int) -> dict[str, float]:
     """에피소드가 시작하는 관절 자세. 모터 이름으로 돌려준다(`.pos`를 뗀다).
 
-    시작을 판정하는 60도 검사와 실제로 흘려보내는 값이 같은 코드(`datasets.episode_actions`)
+    시작을 판정하는 거리 검사와 실제로 흘려보내는 값이 같은 코드(`datasets.episode_actions`)
     에서 나와야 한다. 판정과 실행이 서로 다른 곳에서 숫자를 읽으면, 검사를 통과한 것과
     팔에 들어가는 것이 달라질 수 있다.
     """
@@ -222,7 +277,7 @@ def _load_follower_calibration(settings: Settings):
 def present_position(settings: Settings, *, acquire_owner_lock: bool = True) -> dict[str, float]:
     """팔로워가 **지금** 서 있는 자세. 읽기만 하고 토크도 목표도 건드리지 않는다.
 
-    60도 검사가 이 값을 본다. 검사는 시작 요청을 받은 콘솔 프로세스에서 하고 재생은
+    정렬 검사가 이 값을 본다. 검사는 시작 요청을 받은 콘솔 프로세스에서 하고 재생은
     자식 프로세스가 하므로, 그 사이에 팔이 움직일 틈이 이론상 남는다. 그래서 자식도
     붙은 뒤에 같은 검사를 한 번 더 한다 — 400을 내는 것은 여기지만, 팔을 실제로 지키는
     것은 저쪽이다.
@@ -284,6 +339,10 @@ def _connect(settings: Settings):
     """
     from lerobot.robots.so_follower import SOFollower
 
+    # 순환 import를 피해 여기서 가져온다. `follower_start`는 정렬 보간을 이 모듈에서
+    # 가져다 쓰므로, 모듈 몸통에서 서로를 부르면 어느 쪽을 먼저 읽어도 반쪽이 된다.
+    from .follower_start import sync_goal_to_present
+
     robot = SOFollower(build_robot_config(settings))
     robot.bus.connect()
     try:
@@ -293,8 +352,7 @@ def _connect(settings: Settings):
                     "Follower calibration file is missing; run scripts/calibrate_follower.sh"
                 )
             robot.bus.write_calibration(robot.calibration)
-        present = robot.bus.sync_read("Present_Position", normalize=False, num_retry=2)
-        robot.bus.sync_write("Goal_Position", present, normalize=False, num_retry=2)
+        sync_goal_to_present(robot.bus)
         # 여기서 토크가 켜진다 — LeRobot의 동작이다. 위에서 목표를 지금 자리로 박아
         # 두었으므로 팔은 선 자리에서 뻣뻣해진다.
         robot.configure()
@@ -348,7 +406,7 @@ def _align(robot, start: dict[str, float], goal: dict[str, float], listener: _St
 
     # 두 값이 같은 곳에서 나와야 한다. 보간이 만든 프레임 수와 틱 간격이 어긋나면
     # 정렬은 계획한 시간이 아니라 다른 시간에 걸쳐 도착한다.
-    frames = alignment_frames(start, goal, ALIGN_HZ)
+    frames = alignment_frames(start, goal, ALIGN_HZ, REPLAY_ALIGNMENT)
     period = 1.0 / ALIGN_HZ
     total = len(frames)
     _write_status(phase="aligning", frame=0, aligning_seconds_left=round(total * period, 2))

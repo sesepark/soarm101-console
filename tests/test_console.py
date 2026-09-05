@@ -25,17 +25,42 @@ def test_settings_read_environment_at_instantiation(monkeypatch):
     assert settings.leader_id == "dynamic_leader"
 
 
-def test_command_uses_stable_ports_and_safety_limit(tmp_path: Path):
+def test_teleop_runs_our_own_module_not_the_lerobot_binary():
+    """텔레옵 자식은 `scripts/teleoperate.sh`다.
+
+    `lerobot-teleoperate` 바이너리로는 붙는 순간의 목표 동기화도 루프 앞의 자세 정렬도
+    부탁할 수 없다. 그 둘이 없으면 시작할 때마다 팔이 뛴다.
+    """
+    command = TeleopManager(Settings()).command()
+    assert len(command) == 1
+    script = Path(command[0])
+    assert script.name == "teleoperate.sh"
+    assert script.exists()
+
+
+def test_teleop_uses_stable_ports_and_safety_limit():
+    """설정값은 이제 CLI 플래그가 아니라 `teleoperating`이 `Settings`에서 직접 읽는다."""
+    from soarm_console import teleoperating
+
     settings = Settings(
         leader_port="/dev/serial/by-id/leader",
         follower_port="/dev/serial/by-id/follower",
     )
-    command = TeleopManager(settings).command()
-    assert "--teleop.port=/dev/serial/by-id/leader" in command
-    assert "--robot.port=/dev/serial/by-id/follower" in command
-    assert "--robot.max_relative_target=2" in command
-    assert "--robot.disable_torque_on_disconnect=false" in command
-    assert "--fps=30" in command
+    robot = teleoperating.build_robot_config(settings)
+    leader = teleoperating.build_teleop_config(settings)
+
+    assert leader.port == "/dev/serial/by-id/leader"
+    assert robot.port == "/dev/serial/by-id/follower"
+    assert robot.max_relative_target == 2
+    # 종료나 예외가 곧 torque-off가 되면 팔이 떨어진다.
+    assert robot.disable_torque_on_disconnect is False
+    # 수집과 같은 주기여야 "텔레옵으로 해 보고 그대로 찍는다"가 성립한다.
+    assert teleoperating.FPS == 30
+
+
+def test_teleop_preflight_looks_for_the_interpreter_it_actually_runs():
+    problems = TeleopManager(Settings()).preflight()
+    assert not any("lerobot-teleoperate" in problem for problem in problems)
 
 
 def test_preflight_reports_closed_motion_gate():

@@ -103,10 +103,3 @@ class Settings:
     @property
     def follower_calibration(self) -> Path:
         return self.calibration_root / "robots/so_follower" / f"{self.follower_id}.json"
-
-    @property
-    def lerobot_teleoperate(self) -> Path:
-        override = os.getenv("LEROBOT_TELEOPERATE")
-        if override:
-            return Path(override).expanduser()
-        return Path(__file__).parents[2] / ".venv/bin/lerobot-teleoperate"

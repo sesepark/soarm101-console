@@ -25,29 +25,15 @@ class TeleopManager:
         self._owner_locks: DeviceLockSet | None = None
 
     def command(self) -> list[str]:
-        cfg = self.settings
-        limit = cfg.effective_max_relative_target
-        command = [
-            str(cfg.lerobot_teleoperate),
-            "--robot.type=so101_follower",
-            f"--robot.port={cfg.follower_port}",
-            f"--robot.id={cfg.follower_id}",
-        ]
-        # 걸릴 수 없는 상한은 아예 넘기지 않는다. 넘기면 LeRobot이 스텝마다 팔로워를
-        # 한 번 더 읽고, 그 왕복은 자르지도 못할 값을 위해 치르는 값이다.
-        if limit is not None:
-            command.append(f"--robot.max_relative_target={limit:g}")
-        command += [
-            # 종료나 예외가 곧 torque-off가 되면 팔이 떨어진다. 해제는 사람이 팔을
-            # 받친 상태에서 별도 절차로만 한다.
-            "--robot.disable_torque_on_disconnect=false",
-            "--teleop.type=so101_leader",
-            f"--teleop.port={cfg.leader_port}",
-            f"--teleop.id={cfg.leader_id}",
-            "--fps=30",
-            "--display_data=false",
-        ]
-        return command
+        """텔레옵 자식을 띄우는 명령.
+
+        `lerobot-teleoperate` 바이너리가 아니라 `scripts/teleoperate.sh`를 가리킨다.
+        그 스크립트가 `soarm_console.teleoperating`을 돌리고, 그쪽이 붙는 순간의 목표
+        동기화와 루프 앞의 자세 정렬을 한 뒤 LeRobot의 루프에 들어간다. 설정값은 이제
+        CLI 플래그가 아니라 그 모듈이 `Settings`에서 직접 읽는다 — 값이 두 군데에 적히면
+        한쪽만 고쳐지는 날이 온다.
+        """
+        return [str(Path(__file__).parents[2] / "scripts/teleoperate.sh")]
 
     def preflight(self) -> list[str]:
         cfg = self.settings
@@ -57,7 +43,9 @@ class TeleopManager:
         for label, path in (
             ("leader port", Path(cfg.leader_port)),
             ("follower port", Path(cfg.follower_port)),
-            ("lerobot-teleoperate", cfg.lerobot_teleoperate),
+            # 예전에는 `lerobot-teleoperate` 바이너리를 찾았다. 이제 텔레옵은 우리
+            # 모듈이므로 그것을 돌릴 인터프리터가 있는지를 본다.
+            ("python interpreter", Path(__file__).parents[2] / ".venv/bin/python"),
         ):
             if not path.exists():
                 problems.append(f"Missing {label}: {path}")
@@ -82,11 +70,16 @@ class TeleopManager:
                 )
             except DeviceLockError as exc:
                 raise TeleopError(str(exc)) from exc
+            env = os.environ.copy()
+            # 텔레옵 자식은 이제 우리 모듈이고, 그 모듈도 lock을 확인한다. parent가 이미
+            # 쥔 것을 자식이 다시 잡을 수는 없으므로, 물려받은 descriptor를 알려 준다 —
+            # `record_manager`가 record child에게 하는 것과 같다.
+            env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
             try:
                 self._process = subprocess.Popen(
                     self.command(),
                     cwd=Path(__file__).parents[2],
-                    env=os.environ.copy(),
+                    env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,

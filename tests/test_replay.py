@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from soarm_console import datasets, replaying
+from soarm_console.follower_start import TELEOP_ALIGNMENT
 from soarm_console.replaying import (
     ALIGN_DEGREES_PER_SECOND,
     ALIGN_HZ,
@@ -21,6 +22,7 @@ from soarm_console.replaying import (
     ALIGN_MIN_SECONDS,
     ALIGN_PERCENT_PER_SECOND,
     ALIGN_REFUSE_DISTANCE,
+    REPLAY_ALIGNMENT,
     SCURVE_PEAK_FACTOR,
     alignment_frames,
     alignment_refusal,
@@ -65,15 +67,25 @@ def test_alignment_time_is_clamped_at_both_ends():
     assert alignment_seconds(_pose(0, 0, 0, 0, 0, 0), far) == ALIGN_MAX_SECONDS
 
 
-def test_the_refusal_distance_stays_inside_the_time_clamp():
-    """60도 제한과 8초 상한은 서로 묶여 있다.
+def test_the_speed_limit_holds_up_to_the_distance_the_time_clamp_can_carry():
+    """첨두 20°/s가 실제 상한인 구간이 어디까지인지를 여기에 적어 둔다.
 
-    이동 시간이 8초에서 잘리면 그 위로는 속도가 다시 올라간다. 60도 제한이 그 지점보다
-    아래에 있는 동안에만 "초당 20도"가 실제 상한이다. 한쪽만 고치면 여기서 걸린다.
+    이동 시간이 `ALIGN_MAX_SECONDS`에서 잘리면 그 위로는 같은 시간에 더 먼 거리를 가야
+    하므로 속도가 다시 올라간다. 한때는 거절 거리(60도)가 그 지점보다 아래에 있어서
+    "초당 20도"가 어느 자세에서든 참이었다. 거절 거리를 관절 폭(360도)까지 올린 지금은
+    그렇지 않고, 대신 사람이 `/api/replay/preview`에서 거리와 시간을 먼저 읽는다.
+
+    그러니 여기서 지키는 것은 두 가지다 — 상한이 뜻을 갖는 구간의 끝이 어디인지, 그리고
+    그 바깥에서도 속도가 팔이 감당할 수 없는 값으로 튀지는 않는지.
     """
-    longest = ALIGN_REFUSE_DISTANCE * SCURVE_PEAK_FACTOR / ALIGN_DEGREES_PER_SECOND
-    assert longest <= ALIGN_MAX_SECONDS
-    assert ALIGN_REFUSE_DISTANCE * SCURVE_PEAK_FACTOR / ALIGN_PERCENT_PER_SECOND <= ALIGN_MAX_SECONDS
+    assert REPLAY_ALIGNMENT.smooth_distance == pytest.approx(200.0)
+    # 가장 먼 자세(관절 하나가 폭 전체만큼 떨어진 경우)에서도 첨두는 이 값이다.
+    worst = ALIGN_REFUSE_DISTANCE * SCURVE_PEAK_FACTOR / ALIGN_MAX_SECONDS
+    assert worst == pytest.approx(36.0)
+    # 그리고 그 값은 시작 정렬(첨두 40°/s)이 이미 내는 속도보다 느리다. 팔이 한 번도 내
+    # 본 적 없는 속도를 재생이 처음으로 내는 일은 없어야 한다.
+    assert worst <= TELEOP_ALIGNMENT.degrees_per_second
+    assert ALIGN_REFUSE_DISTANCE * SCURVE_PEAK_FACTOR / ALIGN_MAX_SECONDS <= ALIGN_PERCENT_PER_SECOND * 2
 
 
 @pytest.mark.parametrize(
@@ -110,13 +122,23 @@ def test_alignment_lands_exactly_on_the_episodes_first_frame():
     assert max(abs(frames[0][name] - start[name]) for name in goal) < 0.05
 
 
+def test_a_pose_the_arm_can_actually_reach_is_never_refused_for_distance():
+    """95도 떨어진 팔은 이제 시작한다. 한때 이것이 거절이었다.
+
+    통상 흐름에서는 걸리지 않는 값이었지만, 걸리면 빠져나올 길이 없었다 — 토크가 걸린
+    팔은 손으로 옮길 수 없어 텔레옵을 한 번 띄워야 했다. 지금은 걸어서 데려간다.
+    """
+    assert alignment_refusal(_pose(0, 0, 0, 0, 0, 0), _pose(5, -95, 0, 0, 0, 0)) is None
+
+
 def test_alignment_is_refused_and_says_which_joint_is_far():
+    """거리로 거절하는 일은 이제 관절 폭을 넘는 값에서만 일어난다."""
     start = _pose(0, 0, 0, 0, 0, 0)
-    goal = _pose(5, -95, 0, 0, 0, 0)
+    goal = _pose(5, -400, 0, 0, 0, 0)
     refusal = alignment_refusal(start, goal)
     assert refusal is not None
     assert "shoulder_lift" in refusal
-    assert "95.0°" in refusal
+    assert "400.0°" in refusal
     # 통과한 관절은 문구에 끼지 않는다 — 사람이 어디를 보아야 하는지가 흐려진다.
     assert "shoulder_pan" not in refusal
 
@@ -322,9 +344,10 @@ def test_replay_takes_only_the_three_speeds(client, episode, near, started):
     assert started == []
 
 
-def test_replay_refuses_when_the_arm_is_more_than_sixty_degrees_away(
+def test_replay_starts_from_eighty_degrees_away(
     client, episode, started, monkeypatch
 ):
+    """한때 이 자세는 400이었다. 지금은 걸어서 데려간다."""
     from soarm_console import app as app_module
 
     # 팔꿈치가 에피소드의 첫 자세에서 80도 떨어져 있다.
@@ -332,15 +355,11 @@ def test_replay_refuses_when_the_arm_is_more_than_sixty_degrees_away(
         app_module, "present_position", lambda settings: _pose(1.0, 2.0, 83.0, 4.0, 5.0, 6.0)
     )
 
-    response = client.post("/api/replay/start", json=_body())
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "elbow_flex" in detail
-    assert "80.0°" in detail
-    assert started == []
+    assert client.post("/api/replay/start", json=_body()).status_code == 200
+    assert started == [("soarm101_pick", 0, 0.5)]
 
 
+    assert client.post("/api/replay/start", json=_body()).status_code == 200
 def test_replay_starts_at_half_speed_by_default(client, episode, near, started):
     response = client.post("/api/replay/start", json=_body())
     assert response.status_code == 200
@@ -462,11 +481,17 @@ def test_the_loop_aligns_first_and_then_walks_the_episode(loop_runtime, episode,
     assert robot.disconnected is True
 
 
-def test_the_loop_refuses_a_far_arm_before_it_commands_anything(loop_runtime, episode, monkeypatch):
-    """콘솔이 이미 한 검사를 자식도 한 번 더 한다. 여기가 팔이 움직이기 직전의 마지막 자리다."""
+def test_the_loop_refuses_an_arm_it_cannot_measure_before_it_commands_anything(
+    loop_runtime, episode, monkeypatch
+):
+    """콘솔이 이미 한 검사를 자식도 한 번 더 한다. 여기가 팔이 움직이기 직전의 마지막 자리다.
+
+    거리로 거절하는 일은 이제 거의 없지만, **잴 수 없는 값**은 여전히 거절이다. 팔이
+    어디 있는지 모르는 채로 보간을 시작하면 첫 프레임이 어디로 갈지 아무도 모른다.
+    """
     from soarm_console.config import Settings
 
-    robot = _FakeRobot(_pose(0.0, 0.0, 90.0, 0.0, 0.0, 0.0))
+    robot = _FakeRobot(_pose(0.0, 0.0, float("nan"), 0.0, 0.0, 0.0))
     monkeypatch.setattr(replaying, "_connect", lambda settings: robot)
 
     with pytest.raises(replaying.ReplayError):

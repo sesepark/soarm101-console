@@ -119,15 +119,70 @@ GB10은 GPU 전용 메모리가 따로 없고 시스템 RAM 121GB를 공유한�
 | `GET /api/spark` | 도달 여부, GPU, 남은 디스크 |
 | `GET /api/spark/datasets` | Spark에 올라가 있는 데이터셋 목록 |
 | `POST /api/spark/datasets/{name}` | 녹화한 데이터셋 하나를 Spark로 전송 |
-| `GET /api/spark/runs` | 학습 실행별 체크포인트 목록 |
+| `GET /api/spark/runs` | 학습 실행별 체크포인트 **와 진행 상황** |
+| `POST /api/spark/train` | `{dataset, policy}` — 학습을 tmux 안에서 띄운다 |
+| `POST /api/spark/runs/{run}/stop` | 도는 학습에 Ctrl-C를 보낸다 |
 | `POST /api/spark/runs/{run}/{step}` | 체크포인트의 `pretrained_model`을 회수 |
-| `GET /api/spark/train-command` | 사람이 터미널에 붙여 넣을 학습 명령 |
+| `GET /api/spark/train-command` | 사람이 터미널에 붙여 넣을 학습 명령(그대로 남겨 둔다) |
 
-### 콘솔이 학습을 직접 띄우지 않는 이유
+### 콘솔이 학습을 띄우되 품지는 않는다 (2026-09-05)
 
-학습은 몇 시간 돈다. 웹 요청의 수명과 맞지 않고, 콘솔이 재시작되면 학습도 함께 죽는다.
-명령을 만들어 보여 주고 사람이 tmux에서 시작하게 한다. 녹화와 달리 학습은 실패해도
-하드웨어가 위험해지지 않으므로, 콘솔이 소유권을 가질 이유도 없다.
+`POST /api/spark/train`이 학습을 시작한다. 다만 콘솔이 학습 **프로세스**를 갖지는 않는다 —
+원격 tmux 세션 `train-<run>` 안에서 돌므로, 콘솔이 `systemctl --user restart`로 다시
+시작돼도 학습은 그대로 돈다. 콘솔이 하는 일은 띄우는 것과 읽는 것뿐이다.
+
+예전에는 명령 문자열을 만들어 주고 사람이 붙여 넣었다. 그 방식에는 조용한 함정이 있었다:
+`output_dir`이 `outputs/<dataset>`으로 고정이었고, LeRobot은 그 폴더가 이미 있으면
+`FileExistsError`로 거절한다(`configs/train.py`). 즉 **같은 데이터셋의 두 번째 학습은 반드시
+실패**했고, 그 실패는 tmux 안에서 일어나므로 화면에는 "시작했다"만 남았다. 지금은 실행 이름에
+시각이 들어간다 — `<dataset>__<policy>__<YYYYMMDD_HHMM>`.
+
+정책은 둘만 받는다. 이 팔에서 실제로 돌려 본 것이 둘이기 때문이다.
+
+| `policy` | 플래그 | steps | batch_size | save_freq |
+| --- | --- | --- | --- | --- |
+| `act` | `--policy.type=act` | 100,000 | 64 | 20,000 |
+| `smolvla` | `--policy.path=lerobot/smolvla_base` | 20,000 | 32 | 5,000 |
+
+SmolVLA는 이미 배운 것을 옮겨 오므로 스텝이 훨씬 적다. 대신 **첫 실행은 HF에서 기반 모델을
+내려받느라 오래 걸린다** — 진행이 한동안 멈춰 보이는 것은 그 때문이다.
+
+시작 전에 두 가지를 원격에서 한 번의 왕복으로 확인한다. `<root>/<dataset>/meta/info.json`이
+없으면 404 `Dataset is not on the training machine`(먼저 전송해야 한다), 살아 있는 `train-*`
+세션이 하나라도 있으면 409 `Training is already running: <run>`이다. 후자는 GPU가 하나이기
+때문이고, 무엇이 돌고 있는지를 문구에 적어 사람이 멈출지 기다릴지 고를 수 있게 한다.
+
+### 진행은 로그에서 읽는다
+
+시작 직후 `outputs/<run>/soarm_train.json`에 `{dataset, policy, steps, batch_size, started_at}`
+을 남기고, 명령 자체는 `2>&1 | tee outputs/<run>/train.log`로 끝난다. `GET /api/spark/runs`의
+각 실행에 실리는 `training`은 그 둘과 `tmux has-session`을 합친 것이다:
+
+```json
+{"running": true, "step": 20000, "steps": 100000, "loss": 0.187,
+ "policy": "act", "started_at": 1757060000.0, "updated_at": 1757063600.0,
+ "log_tail": ["…"], "error": null}
+```
+
+읽는 쪽에서 조심할 것이 하나 있다. LeRobot은 step을 `format_big_number`로 줄여 찍으므로
+로그에는 `step:20K`로 나온다 — 숫자만 집으면 20이 되고, 화면은 10만 스텝 학습이 0.02%
+진행됐다고 말한다. 접미사를 되돌려 읽는다. `running`이 아닌데 `step < steps`이면 로그에서
+`Traceback`이나 `Error`가 든 마지막 줄을 골라 `error`에 담는다 — 끝나지 않았는데 세션이
+없다는 것은 무언가 죽었다는 뜻이고, 사람이 tmux에 붙지 않고도 이유를 볼 수 있어야 한다.
+
+목록은 `checkpoints/last` 심볼릭 링크를 건너뛴다(`os.path.islink`). 따라가면 같은 체크포인트가
+두 번 나와 화면이 있지도 않은 회수를 센다. 체크포인트가 아직 하나도 없는 실행도 싣는다 —
+ACT의 첫 저장은 2만 스텝 뒤이고, 그때까지 목록에서 사라져 있으면 사람은 학습이 시작됐는지조차
+알 수 없다.
+
+이 전부를 원격 파이썬 스크립트 하나 안에서 한다. 실행마다 ssh를 왕복하면 tailnet 너머에서
+화면이 눈에 띄게 굼떠진다.
+
+### 멈추는 것
+
+`POST /api/spark/runs/{run}/stop`은 `tmux send-keys C-c`를 먼저 보낸다. 사람이 tmux에 붙어
+눌렀을 때와 같은 길이고, LeRobot은 그 신호를 받고 정리한 뒤 나간다. 2초 뒤에도 살아 있으면
+`kill-session`한다. 어느 쪽이든 **이미 디스크에 쓰인 체크포인트는 그대로 남는다.**
 
 ### 전송은 원자적이다
 
@@ -182,25 +237,38 @@ rsync와 ssh는 원인을 첫 줄에 찍고 마지막 줄에는 요약을 남긴
 
 HUB의 `deploy` 공개키가 Spark의 `authorized_keys`에 등록되어 있어야 한다.
 
-## 수동 절차
+## 절차
 
-전송과 회수는 콘솔에서 하고, 학습만 터미널에서 한다.
+전송·학습·회수가 모두 콘솔 API 하나씩이다.
 
 ```bash
-# 1. 데이터셋을 Spark로 (콘솔에서 하거나)
-curl -X POST http://127.0.0.1:8000/api/spark/datasets/<name>
+# 1. 데이터셋을 Spark로
+curl -X POST http://127.0.0.1:8088/api/spark/datasets/<name>
 
-# 2. 학습 명령을 받아
-curl "http://127.0.0.1:8000/api/spark/train-command?name=<name>&batch_size=64"
+# 2. 학습 시작 — 돌려주는 `run`이 이후의 이름이다
+curl -X POST http://127.0.0.1:8088/api/spark/train \
+  -H 'content-type: application/json' \
+  -d '{"dataset": "<name>", "policy": "act"}'
 
-# 3. 받은 명령을 그대로 실행 — tmux 안에서 도므로 SSH가 끊겨도 살아 있다
-ssh <계정>@<학습서버> -t 'tmux new -As train-<name> "..."'
+# 3. 진행 상황 (각 실행의 `training`을 본다)
+curl -s http://127.0.0.1:8088/api/spark/runs | jq '.[].training'
 
-# 4. 진행 상황
-ssh <계정>@<학습서버> 'tmux capture-pane -pt train-<name> | tail -20'
+# 4. 멈추려면
+curl -X POST http://127.0.0.1:8088/api/spark/runs/<run>/stop
 
 # 5. 끝나면 체크포인트 회수
-curl -X POST http://127.0.0.1:8000/api/spark/runs/<name>/<step>
+curl -X POST http://127.0.0.1:8088/api/spark/runs/<run>/<step>
+```
+
+터미널에서 직접 돌리고 싶으면 `GET /api/spark/train-command`가 여전히 명령 문자열을 준다.
+다만 그쪽은 `output_dir`이 데이터셋 이름으로 고정이라 두 번째 학습에서 `FileExistsError`가
+난다 — 그때는 `--output_dir`을 손으로 바꾼다.
+
+원격에서 직접 볼 일이 있으면:
+
+```bash
+ssh <계정>@<학습서버> 'tmux capture-pane -pt train-<run> | tail -20'
+ssh <계정>@<학습서버> 'tail -f outputs/<run>/train.log'
 ```
 
 회수한 것은 `checkpoints/<run>/<step>/`에 놓인다. `training_state`는 가져오지 않는다 —

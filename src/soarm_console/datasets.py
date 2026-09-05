@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -153,29 +154,22 @@ def describe(name: str) -> dict[str, Any]:
     return summary
 
 
-def trajectory(name: str, episode_index: int) -> dict[str, Any]:
-    """Follower state and requested action for one episode, in frame order."""
-    directory = _dataset_dir(name)
-    info = _read_info(directory)
+def _find_episode(directory: Path, episode_index: int) -> dict[str, Any]:
     episode = next(
         (row for row in _episode_rows(directory) if int(row.get("episode_index", -1)) == episode_index),
         None,
     )
     if episode is None:
         raise FileNotFoundError(str(episode_index))
+    return episode
 
-    expected_frames = int(episode.get("length", 0))
-    if expected_frames > TRAJECTORY_FRAME_LIMIT:
-        raise TrajectoryTooLargeError(
-            f"Episode has {expected_frames} frames; limit is {TRAJECTORY_FRAME_LIMIT}"
-        )
 
-    features = info.get("features") or {}
-    state_feature = features.get("observation.state") or {}
-    joints = state_feature.get("names")
-    if not isinstance(joints, list) or not all(isinstance(name, str) for name in joints):
-        raise DatasetError("Dataset does not describe observation.state joint names")
+def _episode_data_table(directory: Path, episode_index: int, episode: dict[str, Any], columns: list[str]):
+    """이 에피소드의 행만, frame 순서대로.
 
+    v3에서는 여러 에피소드가 한 parquet 파일에 이어 붙고 행 순서도 보장되지 않는다.
+    그래서 `episode_index`로 거르고 `frame_index`로 다시 세운다.
+    """
     chunk_index = episode.get("data/chunk_index")
     file_index = episode.get("data/file_index")
     if chunk_index is None or file_index is None:
@@ -191,11 +185,39 @@ def trajectory(name: str, episode_index: int) -> dict[str, Any]:
 
     import pyarrow.parquet as pq
 
-    table = pq.read_table(
+    return pq.read_table(
         path,
-        columns=["episode_index", "frame_index", "observation.state", "action"],
+        columns=columns,
         filters=[("episode_index", "=", episode_index)],
     ).sort_by([("frame_index", "ascending")])
+
+
+def _feature_joint_names(info: dict[str, Any], feature: str) -> list[str]:
+    names = ((info.get("features") or {}).get(feature) or {}).get("names")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise DatasetError(f"Dataset does not describe {feature} joint names")
+    return names
+
+
+def trajectory(name: str, episode_index: int) -> dict[str, Any]:
+    """Follower state and requested action for one episode, in frame order."""
+    directory = _dataset_dir(name)
+    info = _read_info(directory)
+    episode = _find_episode(directory, episode_index)
+
+    expected_frames = int(episode.get("length", 0))
+    if expected_frames > TRAJECTORY_FRAME_LIMIT:
+        raise TrajectoryTooLargeError(
+            f"Episode has {expected_frames} frames; limit is {TRAJECTORY_FRAME_LIMIT}"
+        )
+
+    joints = _feature_joint_names(info, "observation.state")
+    table = _episode_data_table(
+        directory,
+        episode_index,
+        episode,
+        ["episode_index", "frame_index", "observation.state", "action"],
+    )
     frames = table.num_rows
     if frames > TRAJECTORY_FRAME_LIMIT:
         raise TrajectoryTooLargeError(
@@ -214,6 +236,51 @@ def trajectory(name: str, episode_index: int) -> dict[str, Any]:
         "joints": joints,
         "state": table.column("observation.state").to_pylist(),
         "action": table.column("action").to_pylist(),
+    }
+
+
+def episode_actions(name: str, episode_index: int) -> dict[str, Any]:
+    """재생이 팔에 흘려보낼 action만, frame 순서대로.
+
+    `trajectory()`와 두 가지가 다르다. 관측(`observation.state`)을 읽지 않고, 프레임 수
+    상한이 없다. 상한이 없는 이유는 이 값이 화면에 그려지는 것이 아니라 팔에 들어가는
+    것이기 때문이다 — 에피소드가 길다는 이유로 앞부분만 재생하면, 팔은 사람이 본 것과
+    다른 동작을 하다가 중간에 선다.
+    """
+    directory = _dataset_dir(name)
+    info = _read_info(directory)
+    episode = _find_episode(directory, episode_index)
+    joints = _feature_joint_names(info, "action")
+    table = _episode_data_table(
+        directory, episode_index, episode, ["episode_index", "frame_index", "action"]
+    )
+    frames = table.num_rows
+    expected_frames = int(episode.get("length", 0))
+    if frames != expected_frames:
+        raise DatasetError(
+            f"Episode metadata says {expected_frames} frames but parquet contains {frames}"
+        )
+    if frames == 0:
+        raise DatasetError("That episode has no frames to replay")
+    action = table.column("action").to_pylist()
+    if any(len(row) != len(joints) for row in action):
+        # 이름과 값의 개수가 어긋나면 어느 값이 어느 관절인지 알 수 없다. 재생은 그 값을
+        # 팔에 넣는 일이므로, 여기서 멈추는 것이 짝을 잘못 맞춰 보내는 것보다 낫다.
+        raise DatasetError(
+            f"Episode rows do not carry one value per action joint ({len(joints)} expected)"
+        )
+    # NaN/Inf는 여기서 걸러 낸다. `SAFETY.md`의 최소 불변조건이 그것을 실행하지 말라고
+    # 적어 두었고, 정렬 검사는 첫 프레임만 보므로 뒤쪽에 숨은 값을 잡을 자리가 여기뿐이다.
+    # `nan > 60`은 거짓이라, 거르지 않으면 60도 검사를 조용히 통과한다.
+    if any(not isfinite(value) for row in action for value in row):
+        raise DatasetError("Episode contains values that are not finite numbers")
+    return {
+        "fps": info.get("fps", 0),
+        "frames": frames,
+        # Do not sort this list: each column of `action` corresponds to this exact
+        # feature order from meta/info.json.
+        "joints": joints,
+        "action": action,
     }
 
 

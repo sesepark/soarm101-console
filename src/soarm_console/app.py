@@ -14,6 +14,13 @@ from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
 from .datasets import DatasetError, describe, list_datasets, playable_clip
 from .diagnostics import run_hardware_doctor
+from .spark import SparkError
+from .spark import list_datasets as spark_list_datasets
+from .spark import list_runs as spark_list_runs
+from .spark import probe as spark_probe
+from .spark import pull_checkpoint as spark_pull_checkpoint
+from .spark import push_dataset as spark_push_dataset
+from .spark import train_command as spark_train_command
 from .record_manager import RecordManager
 from .teleop import TeleopError, TeleopManager
 from .vleader.api import VirtualLeader, build_router
@@ -330,6 +337,77 @@ def dataset_video(
     except DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/spark")
+def spark_status() -> dict[str, object]:
+    """Reachability, GPU and free disk on the training machine."""
+    return spark_probe(settings)
+
+
+@app.get("/api/spark/datasets")
+def spark_datasets() -> list[dict[str, object]]:
+    """Datasets already synced to the training machine."""
+    try:
+        return spark_list_datasets(settings)
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/spark/datasets/{name}")
+def spark_push(name: str) -> dict[str, object]:
+    """Copy one recorded dataset to the training machine.
+
+    This blocks for as long as the copy takes. That is honest for a dataset of a
+    few episodes over tailnet, and wrong for a large one — if recordings grow past
+    a few minutes of transfer, this should become a background job with a status
+    endpoint, the way recording already is."""
+    try:
+        return spark_push_dataset(settings, name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"No such dataset: {name}") from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/spark/runs")
+def spark_runs() -> list[dict[str, object]]:
+    """Training runs on the training machine, with their checkpoints."""
+    try:
+        return spark_list_runs(settings)
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/spark/runs/{run}/{step}")
+def spark_pull(run: str, step: str) -> dict[str, object]:
+    """Fetch one checkpoint back for local inference."""
+    try:
+        return spark_pull_checkpoint(settings, run, step)
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/spark/train-command")
+def spark_train(
+    name: str, policy: str = "act", steps: int = 100_000, batch_size: int = 64
+) -> dict[str, object]:
+    """The command to start training, for a person to run in a terminal.
+
+    The console does not start training itself: it runs for hours, which does not
+    fit the lifetime of a web request, and a console restart would take the run
+    with it."""
+    try:
+        command = spark_train_command(
+            settings, name, policy=policy, steps=steps, batch_size=batch_size
+        )
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"command": command}
 
 
 @app.post("/api/doctor")

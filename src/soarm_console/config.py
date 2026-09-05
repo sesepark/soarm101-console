@@ -45,6 +45,20 @@ class Settings:
         default_factory=lambda: float(os.getenv("SOARM_MAX_RELATIVE_TARGET", "2"))
     )
 
+    # 학습이 도는 기계. 주소와 계정은 이 저장소가 공개이므로 여기 적지 않고 `config/soarm.env`에
+    # 둔다 — serial 포트나 카메라 경로와 달리 이것은 다른 기계로 가는 길이다.
+    #
+    # tailnet(MagicDNS) 이름을 쓰는 것을 권한다. mDNS의 `*.local`은 같은 LAN에서만 풀리고,
+    # IPv6 링크로컬로 풀려 SSH가 조용히 타임아웃하는 일도 있다.
+    spark_host: str = field(default_factory=lambda: os.getenv("SOARM_SPARK_HOST", ""))
+    spark_user: str = field(default_factory=lambda: os.getenv("SOARM_SPARK_USER", ""))
+    spark_dataset_root: str = field(
+        default_factory=lambda: os.getenv("SOARM_SPARK_DATASET_ROOT", "data/soarm")
+    )
+    spark_output_root: str = field(
+        default_factory=lambda: os.getenv("SOARM_SPARK_OUTPUT_ROOT", "outputs")
+    )
+
     @property
     def calibration_root(self) -> Path:
         configured = os.getenv("HF_LEROBOT_CALIBRATION")

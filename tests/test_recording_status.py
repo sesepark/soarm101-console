@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -233,20 +234,123 @@ def test_a_failed_save_still_reports_what_is_actually_in_the_dataset(tmp_path, m
     assert runtime["episodes_saved"] == 2
 
 
+# MARK: 빈 회차
+
+
+class _WritingDataset:
+    """`writer.episode_buffer["size"]`를 쥔 데이터셋. LeRobot 0.6.1의 모양 그대로다."""
+
+    def __init__(self, size: int, num_episodes: int = 3) -> None:
+        self.writer = SimpleNamespace(episode_buffer={"size": size})
+        self.num_episodes = num_episodes
+        self.cleared = 0
+
+    def clear_episode_buffer(self) -> None:
+        self.cleared += 1
+        self.writer.episode_buffer = {"size": 0}
+
+
+def test_an_empty_episode_is_skipped_instead_of_killing_the_session(tmp_path, monkeypatch):
+    """0프레임 회차를 저장하면 `validate_episode_buffer`가 세션을 통째로 끝낸다.
+
+    `test3_20260905_1413`이 그렇게 죽었다 — 남은 회차 여덟이 그 한 번의 `ValueError`로
+    사라졌다. 회 하나가 비는 것은 회 하나의 문제지 세션의 문제가 아니다.
+    """
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "_empty_episodes_skipped", 0)
+    monkeypatch.setattr(recording, "_episodes_saved", 1)
+
+    def must_not_run(self, *args, **kwargs):
+        raise AssertionError("빈 버퍼를 저장하려 했다")
+
+    monkeypatch.setattr(recording, "_ORIGINAL_SAVE_EPISODE", must_not_run)
+    dataset = _WritingDataset(size=0)
+
+    recording._save_episode_with_status(dataset)
+
+    assert dataset.cleared == 1
+    runtime = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert runtime["empty_episodes_skipped"] == 1
+    # 데이터셋에 들어간 것이 없으니 회차 수는 그대로다.
+    assert runtime["episodes_saved"] == 1
+
+
+def test_an_episode_with_frames_is_saved_as_before(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    saved: list[int] = []
+
+    def fake_save(self, *args, **kwargs):
+        saved.append(self.writer.episode_buffer["size"])
+        self.num_episodes += 1
+
+    monkeypatch.setattr(recording, "_ORIGINAL_SAVE_EPISODE", fake_save)
+
+    recording._save_episode_with_status(_WritingDataset(size=900))
+
+    assert saved == [900]
+
+
+def test_a_buffer_the_wrapper_cannot_read_is_still_saved(tmp_path, monkeypatch):
+    """프레임 수를 셀 수 없으면 저장한다. 모르는 것을 0으로 읽으면 멀쩡한 회를 버린다."""
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    saved: list[object] = []
+    monkeypatch.setattr(
+        recording, "_ORIGINAL_SAVE_EPISODE", lambda self, *a, **k: saved.append(self)
+    )
+
+    # `writer`가 없는 데이터셋 — 옛 LeRobot이든 시험용 이중이든 여기로 온다.
+    recording._save_episode_with_status(SimpleNamespace(num_episodes=2))
+
+    assert len(saved) == 1
+
+
+def test_the_next_save_tells_the_screen_how_long_the_last_one_took(tmp_path, monkeypatch):
+    """`streaming_encoding`을 끄면 저장 대기가 남는다. 그때 화면이 그릴 근거가 이것뿐이다."""
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "_saving_seconds", None)
+    estimates: list[object] = []
+
+    def fake_save(self, *args, **kwargs):
+        runtime = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+        estimates.append(runtime["saving_seconds_estimate"])
+        time.sleep(0.05)
+
+    monkeypatch.setattr(recording, "_ORIGINAL_SAVE_EPISODE", fake_save)
+    dataset = _WritingDataset(size=900)
+
+    recording._save_episode_with_status(dataset)
+    recording._save_episode_with_status(dataset)
+
+    # 첫 저장에는 근거가 없다. 두 번째는 첫 번째가 실제로 쓴 시간을 말한다.
+    assert estimates[0] is None
+    assert estimates[1] >= 0.05
+
+
 # MARK: 조작 — 버리고 끝내기
 
 
-def _control(monkeypatch, tmp_path, key: str) -> dict[str, bool]:
+def _control(monkeypatch, tmp_path, key: str, loop_running: bool = True) -> dict[str, bool]:
     monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
     monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
     monkeypatch.setattr(recording, "CONTROL_PATH", tmp_path / "control.json")
+    flag = threading.Event()
+    if loop_running:
+        flag.set()
+    monkeypatch.setattr(recording, "_loop_running", flag)
     events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
     listener = recording._GuiControlListener(events)
     try:
         (tmp_path / "control.json").write_text(json.dumps({"key": key}), encoding="utf-8")
         deadline = time.time() + 2.0
-        while time.time() < deadline and not any(events.values()):
+        # 무시되는 키는 `events`를 건드리지 않으므로 그것으로는 기다릴 수 없다. 리스너가
+        # 파일을 지웠는지를 본다 — 그 자리가 곧 "이 키를 처리했다"이다.
+        while time.time() < deadline and (tmp_path / "control.json").exists():
             time.sleep(0.01)
+        time.sleep(0.05)
     finally:
         listener.stop()
     return events
@@ -279,6 +383,69 @@ def test_esc_still_keeps_the_episode_it_was_recording(tmp_path, monkeypatch):
 def test_an_unknown_control_touches_nothing(tmp_path, monkeypatch):
     events = _control(monkeypatch, tmp_path, "launch")
     assert not any(events.values())
+
+
+# MARK: 조작 — 루프가 서 있는 동안 온 키
+
+
+@pytest.mark.parametrize("key", ["right", "left"])
+def test_a_key_pressed_between_loops_is_dropped_not_carried_into_the_next_episode(
+    tmp_path, monkeypatch, key
+):
+    """저장 11초 동안 누른 ⏎가 다음 회를 0프레임으로 끝냈다. 그 키는 갈 곳이 없다."""
+    before = time.time()
+    events = _control(monkeypatch, tmp_path, key, loop_running=False)
+
+    assert not any(events.values())
+    runtime = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    ignored = runtime["last_control_ignored"]
+    assert ignored["key"] == key
+    assert ignored["reason"] == "no loop running"
+    assert ignored["at"] >= before
+
+
+@pytest.mark.parametrize("key", ["esc", "abort"])
+def test_stopping_between_loops_ends_the_session_without_emptying_the_next_episode(
+    tmp_path, monkeypatch, key
+):
+    """저장 중에 누른 "끝내기"는 뜻이 분명하다 — 다만 `exit_early`로는 전하지 않는다.
+
+    그것까지 세우면 `record()`는 다음 회를 0프레임으로 한 번 더 연다. `stop_recording`
+    하나면 저장이 끝난 뒤 `while` 조건에서 조용히 나간다.
+    """
+    events = _control(monkeypatch, tmp_path, key, loop_running=False)
+
+    assert events["stop_recording"] is True
+    assert events["exit_early"] is False
+    assert events["rerecord_episode"] is False
+    runtime = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert runtime["last_control"] == key
+
+
+def test_a_loop_clears_a_stuck_exit_early_before_its_first_tick(tmp_path, monkeypatch):
+    """리스너를 거치지 않고 `events`를 만지는 길이 따로 있다 — 가상 리더가 그렇다."""
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    events = {"exit_early": True, "rerecord_episode": False, "stop_recording": False}
+    seen: list[bool] = []
+
+    def fake_record_loop(*args, **kwargs):
+        seen.append(kwargs["events"]["exit_early"])
+        # 루프가 도는 동안에는 문이 열려 있어야 한다 — 그때의 키는 이 회차의 것이다.
+        seen.append(recording._loop_running.is_set())
+
+    monkeypatch.setattr(recording, "_ORIGINAL_RECORD_LOOP", fake_record_loop)
+
+    recording._record_loop_with_status(
+        robot=_Robot(),
+        events=events,
+        dataset=SimpleNamespace(num_episodes=1),
+        control_time_s=30,
+    )
+
+    assert seen == [False, True]
+    # 루프가 끝나면 다시 닫힌다.
+    assert recording._loop_running.is_set() is False
 
 
 # MARK: 시작 정렬

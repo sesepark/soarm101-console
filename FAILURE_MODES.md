@@ -33,6 +33,8 @@
 | 조작 권한 만료 | lease TTL 5s | HOLD | 새 lease + 자세 동기화 | 하트비트는 명령과 별개로 보낸다 |
 | 두 기기가 동시에 조작 시도 | lease가 하나뿐 | 두 번째 요청을 409로 거절 | 앞 기기가 반납하면 | 빼앗기는 없다 |
 | 수집 중 조작면 끊김 | 목표가 5초 이상 낡음 | teleoperator가 에피소드를 끝낸다. 목표는 마지막 값에 고정 | 안 함 | **수집 중에는 접촉·과열 감지가 없다** |
+| 회 사이(저장·정리)에 누른 조작 키 | `record_loop`가 도는지 보는 플래그 | `right`·`left`는 버리고 `last_control_ignored`에 적는다. `esc`·`abort`는 `stop_recording`만 세운다 | 해당 없음 | 적용하면 **다음 회차**가 그 키를 읽어 0프레임으로 끝난다 |
+| 0프레임 회차 | 저장 직전 `writer.episode_buffer["size"]` | 저장을 건너뛰고 버퍼만 비운다. `empty_episodes_skipped`를 올린다 | 다음 회차는 정상 진행 | 저장하면 `validate_episode_buffer`가 `ValueError`로 세션 전체를 끝낸다 |
 
 ## Fault injection 계획
 

@@ -63,6 +63,25 @@ PREVIEW_QUALITY = 75
 #: 상태에 함께 적는다 — 회차가 몇 개 남았는지는 수집이 끝난 뒤에도 화면이 물어보는 것이다.
 _episodes_saved = 0
 
+#: 0프레임이라 저장하지 않고 건너뛴 회차 수. 이것이 0이 아니면 무언가가 회를 시작하기도
+#: 전에 끝냈다는 뜻이고, 그 사실은 데이터셋 어디에도 남지 않으므로 여기서 센다.
+_empty_episodes_skipped = 0
+
+#: 직전 저장에 걸린 초. 다음 저장이 시작될 때 `saving_seconds_estimate`로 내보낸다 —
+#: 화면이 "약 N초"를 그릴 수 있는 유일한 근거는 방금 같은 일이 얼마나 걸렸는가다.
+_saving_seconds: float | None = None
+
+#: `record_loop`가 지금 돌고 있는가.
+#:
+#: 이 플래그가 없으면 회 사이(영상 굽기, 정리 구간 사이의 빈틈)에 도착한 키가
+#: `events["exit_early"]`에 남아 있다가 **다음 회차의 첫 반복**에서 읽힌다. 실제로
+#: `test3_20260905_1413`이 그렇게 죽었다 — 저장 11초 동안 누른 ⏎가 회 1을 0프레임으로
+#: 끝냈고, 그 빈 회를 저장하다 `validate_episode_buffer`가 세션을 죽였다.
+#:
+#: `threading.Event`인 이유는 세우는 쪽이 수집 스레드이고 읽는 쪽이 리스너 스레드이기
+#: 때문이다.
+_loop_running = threading.Event()
+
 #: 이 프로세스가 시작한 epoch. `observation.wall_time`의 기준이고, 그 기준이 무엇이었는지는
 #: `soarm_provenance.json`의 `started_at`에 적힌다. 모듈을 읽는 자리에서 한 번만 잰다 —
 #: 회차마다 다시 재면 회차 사이에서 시계가 뒤로 간다.
@@ -424,9 +443,19 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     forwarded = dict(kwargs)
     forwarded["robot"] = _RateTrackedRobot(robot, monitor, preview, reader)
     monitor.start()
+    # 걸려 있던 `exit_early`를 새 구간으로 들고 들어가지 않는다. LeRobot의 루프는 첫
+    # 반복 맨 앞에서 이 값을 읽으므로, 여기 남은 True 하나가 회차를 0프레임으로 끝낸다.
+    # 리스너가 이미 회 사이의 키를 버리지만, 이것이 마지막 방어다 — teleoperator처럼
+    # 리스너를 거치지 않고 이 표를 만지는 길이 따로 있다.
+    events = kwargs.get("events")
+    if isinstance(events, dict):
+        events["exit_early"] = False
+    # 표를 비운 **뒤에** 문을 연다. 순서가 반대면 그사이에 적용된 키가 곧바로 지워진다.
+    _loop_running.set()
     try:
         return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
     finally:
+        _loop_running.clear()
         monitor.stop()
         preview.stop()
 
@@ -472,22 +501,87 @@ def _build_dataset_frame_with_sensors(
     return frame
 
 
+def _episode_buffer_size(dataset: object, episode_data: object) -> int | None:
+    """이번 저장이 담고 있는 프레임 수. 셀 수 없으면 `None`.
+
+    LeRobot 0.6.1에서 버퍼를 쥔 것은 `LeRobotDataset`이 아니라 그 안의 `DatasetWriter`고,
+    프레임 수는 `writer.episode_buffer["size"]`다 — `add_frame`이 한 프레임마다 하나씩
+    올린다(streaming_encoding을 켜도 마찬가지다. 그림은 인코더로 흘러가지만 `size`는
+    그대로 센다). `save_episode(episode_data=...)`로 버퍼를 직접 넘기는 길도 있어서
+    그쪽을 먼저 본다.
+
+    셀 수 없을 때 `None`을 주는 것이 중요하다. 모르는 것을 0으로 읽으면 멀쩡한 회차를
+    버리게 된다 — 건너뛰기는 확실할 때만 한다.
+    """
+    buffer = episode_data
+    if buffer is None:
+        buffer = getattr(getattr(dataset, "writer", None), "episode_buffer", None)
+    if not isinstance(buffer, dict) or "size" not in buffer:
+        return None
+    try:
+        return int(buffer["size"])
+    except (TypeError, ValueError):
+        return None
+
+
 def _save_episode_with_status(self, *args: object, **kwargs: object) -> object:
     """회차를 저장하는 동안 화면이 그렇다고 말할 수 있게 한다.
 
     정리 구간 15초가 끝난 뒤 인코딩에 8초쯤이 더 든다. 그동안 텔레옵 루프는 서 있고
     화면은 아무 말도 하지 않았다 — 사람은 수집이 죽은 줄 알고 팔을 흔들어 본다.
 
+    빈 회차는 저장하지 않고 건너뛴다. LeRobot의 `validate_episode_buffer`는 0프레임을
+    `ValueError`로 막고, 그 예외는 `record()` 밖까지 나가 세션을 통째로 끝낸다 — 지금까지
+    찍은 회차는 살아남지만 남은 회차는 사라진다. 0프레임 회가 왜 생겼든 그것은 회 하나의
+    문제지 세션의 문제가 아니다.
+
     속도 값은 건드리지 않는다. 여기 남아 있는 `loop_hz`는 방금 저장하는 그 회차가 실제로
     돈 속도이고, `record_manager`가 `soarm_quality.json`에 적는 것도 그 값이다.
     """
-    _write_status(phase="saving", episode_started_at=None, reset_started_at=None)
+    global _saving_seconds
+
+    episode_data = args[0] if args else kwargs.get("episode_data")
+    if _episode_buffer_size(self, episode_data) == 0:
+        return _skip_the_empty_episode(self)
+
+    _write_status(
+        phase="saving",
+        episode_started_at=None,
+        reset_started_at=None,
+        saving_seconds_estimate=_saving_seconds,
+    )
+    started = time.perf_counter()
     try:
         return _ORIGINAL_SAVE_EPISODE(self, *args, **kwargs)
     finally:
+        _saving_seconds = round(time.perf_counter() - started, 2)
         _note_episodes_saved(int(self.num_episodes))
         # `phase`는 여기서 되돌리지 않는다. 다음 `record_loop`가 자기 구간을 적는다.
         _write_status(episodes_saved=_episodes_saved)
+
+
+def _skip_the_empty_episode(dataset: object) -> None:
+    """0프레임 회차를 저장하지 않고 버퍼만 비운다.
+
+    `episodes_saved`는 올리지 않는다 — 데이터셋에 들어간 것이 없기 때문이다. 대신
+    `empty_episodes_skipped`를 올려서, 화면과 로그가 "회차 하나가 통째로 비었다"를
+    말할 수 있게 한다. 조용히 넘어가면 사람은 회차 수가 왜 모자란지 알 수 없다.
+    """
+    global _empty_episodes_skipped
+
+    _empty_episodes_skipped += 1
+    print(
+        "Empty episode buffer (0 frames): skipping save and clearing the buffer "
+        f"(skipped so far: {_empty_episodes_skipped})"
+    )
+    try:
+        dataset.clear_episode_buffer()
+    finally:
+        _write_status(
+            empty_episodes_skipped=_empty_episodes_skipped,
+            episodes_saved=_episodes_saved,
+        )
+    return None
 
 
 def _note_episodes_saved(count: int) -> None:
@@ -508,30 +602,62 @@ class _GuiControlListener:
             try:
                 payload = json.loads(CONTROL_PATH.read_text(encoding="utf-8"))
                 CONTROL_PATH.unlink(missing_ok=True)
-                key = str(payload.get("key", ""))
-                if key in {"right", "left", "esc"}:
-                    apply_recording_control(key, self.events)
-                    _write_status(last_control=key)
-                elif key == "abort":
-                    # 찍던 회를 **버리고** 끝낸다.
-                    #
-                    # `esc`(= stop_recording + exit_early)는 루프를 빠져나온 뒤
-                    # `save_episode()`를 그대로 돌아 찍다 만 회를 저장한다. 실제로
-                    # `soarm101_20260905_092024`의 2회차가 그렇게 남았다 — 82프레임,
-                    # 2.7초짜리 조각이 데이터셋 안에서 온전한 시연인 척한다.
-                    #
-                    # LeRobot 0.6.1의 `record()` 루프는 이 셋을 함께 세우면
-                    # `clear_episode_buffer()`를 지나 `while` 조건(`stop_recording`)에서
-                    # 빠져나온다 — 버리는 길과 끝내는 길이 그 한 바퀴 안에서 만난다.
-                    self.events["rerecord_episode"] = True
-                    self.events["stop_recording"] = True
-                    self.events["exit_early"] = True
-                    _write_status(last_control=key)
+                self._apply(str(payload.get("key", "")))
             except FileNotFoundError:
                 pass
             except (json.JSONDecodeError, OSError):
                 CONTROL_PATH.unlink(missing_ok=True)
             self.stopped.wait(0.05)
+
+    def _apply(self, key: str) -> None:
+        if key not in {"right", "left", "esc", "abort"}:
+            return
+        if not _loop_running.is_set():
+            self._apply_between_loops(key)
+            return
+        if key == "abort":
+            # 찍던 회를 **버리고** 끝낸다.
+            #
+            # `esc`(= stop_recording + exit_early)는 루프를 빠져나온 뒤
+            # `save_episode()`를 그대로 돌아 찍다 만 회를 저장한다. 실제로
+            # `soarm101_20260905_092024`의 2회차가 그렇게 남았다 — 82프레임,
+            # 2.7초짜리 조각이 데이터셋 안에서 온전한 시연인 척한다.
+            #
+            # LeRobot 0.6.1의 `record()` 루프는 이 셋을 함께 세우면
+            # `clear_episode_buffer()`를 지나 `while` 조건(`stop_recording`)에서
+            # 빠져나온다 — 버리는 길과 끝내는 길이 그 한 바퀴 안에서 만난다.
+            self.events["rerecord_episode"] = True
+            self.events["stop_recording"] = True
+            self.events["exit_early"] = True
+        else:
+            apply_recording_control(key, self.events)
+        _write_status(last_control=key)
+
+    def _apply_between_loops(self, key: str) -> None:
+        """루프가 서 있는 동안 온 키. 회 사이에서는 조작할 것이 없다.
+
+        영상 굽기와 정리 구간 사이의 몇 초는 화면에서 수집이 도는 것과 구별되지 않아서,
+        사람은 그동안에도 ⏎를 누른다. 그 키를 `events`에 적으면 **다음 회차**가 그것을
+        읽어 0프레임으로 끝난다 — 사람은 회 하나를 넘기려던 것이지 다음 회를 지우려던
+        것이 아니다. 그래서 적용하지 않고, 버렸다는 사실만 상태에 남긴다.
+
+        `esc`와 `abort`는 예외다. 저장 중에 "끝내기"를 눌렀으면 그것은 다음 회차에
+        관한 뜻이 맞고, 그 뜻은 `stop_recording` 하나로 온전히 전해진다 — 저장이 끝난
+        뒤 `record()`의 `while` 조건에서 조용히 나간다. `exit_early`는 세우지 않는다.
+        그것까지 세우면 세션은 다음 회를 0프레임으로 한 번 더 열고 끝난다.
+        """
+        if key in {"esc", "abort"}:
+            self.events["stop_recording"] = True
+            _write_status(last_control=key)
+            return
+        print(f"Control '{key}' arrived between loops: ignored.")
+        _write_status(
+            last_control_ignored={
+                "key": key,
+                "reason": "no loop running",
+                "at": time.time(),
+            }
+        )
 
     def stop(self) -> None:
         self.stopped.set()
@@ -612,6 +738,16 @@ def build_record_config(
         push_to_hub=False,
         tags=["so101", "teleoperation", "local"],
         no_stamp=True,
+        # 회 사이의 대기를 없앤다. 이것을 끄면 LeRobot은 프레임마다 PNG를 쓰고
+        # `save_episode()`에서 그것을 통째로 인코딩한다 — 30초짜리 회차 하나에 11초가
+        # 걸렸고, 그 11초 동안 루프가 서 있어서 사람이 누른 키가 갈 곳을 잃었다.
+        # 켜면 프레임이 들어오는 즉시 별 스레드가 굽고 `save_episode()`는 거의 바로
+        # 끝난다.
+        streaming_encoding=True,
+        # 인코더 하나가 쓰는 스레드 수. 카메라가 둘이니 인코더도 둘이고, 이 기계는
+        # 12스레드라 넷을 내주어도 30Hz 루프가 쓸 몫이 남는다. `loop_hz`가 떨어지면
+        # 여기를 1로 낮추는 것이 첫 번째 손잡이다.
+        encoder_threads=2,
     )
     return RecordConfig(
         robot=robot,
@@ -758,7 +894,10 @@ def main() -> None:
             reset_started_at=None,
             reset_seconds=int(config.dataset.reset_time_s),
             episodes_saved=_episodes_saved,
+            empty_episodes_skipped=_empty_episodes_skipped,
+            saving_seconds_estimate=None,
             last_control=None,
+            last_control_ignored=None,
             started_at=_started_at,
             provenance=_provenance(settings, config),
             **_idle_rate_fields(),

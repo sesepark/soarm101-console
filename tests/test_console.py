@@ -88,6 +88,14 @@ def test_record_config_is_local_and_uses_stable_camera_paths():
     assert config.robot.disable_torque_on_disconnect is False
 
 
+def test_frames_are_encoded_as_they_arrive_so_saving_does_not_block_the_next_episode():
+    """PNG를 쌓았다 굽던 때는 `save_episode()`가 11초를 썼고, 그 11초 동안 루프가 서서
+    사람이 누른 키가 다음 회차로 흘러 들어갔다. 인코딩을 수집과 겹치면 그 틈이 없다."""
+    config = build_record_config(Settings(), "Pick and place", "test_session")
+    assert config.dataset.streaming_encoding is True
+    assert config.dataset.encoder_threads == 2
+
+
 def test_record_manager_is_gated_before_calibration():
     problems = RecordManager(Settings(motion_enabled=False)).preflight()
     assert "SOARM_ENABLE_MOTION=1 is not set" in problems

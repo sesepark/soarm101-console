@@ -30,6 +30,27 @@ class CameraProfile:
 RECORDING_PROFILE = CameraProfile(width=640, height=480, fps=30)
 
 
+def next_send_time(now: float, scheduled: float, interval: float) -> float | None:
+    """`now`에 도착한 프레임을 내보낼지, 내보낸다면 다음 예정 시각은 언제인지.
+
+    `None`은 아직 이르다는 뜻이고, 그 프레임은 버린다.
+
+    예정 시각을 `now`로 다시 맞추지 않고 `interval`을 **더한다**. 다시 맞추면 요청한 fps가
+    장치가 실제로 내주는 속도와 가까울 때 프레임의 3분의 1을 버린다 — 지터로 조금 일찍 온
+    프레임이 문턱에 걸려 버려지고, 그러면 다음 프레임을 한 주기 더 기다리게 되기 때문이다
+    (640×480 두 대, 장치가 26.8fps를 주는데 30fps를 요청하면 17.5장만 나갔다). 더하면
+    조금 일찍 온 프레임도 예정 시각을 이미 지났으므로 통과하고, 누적 평균은 목표 fps가
+    된다. 목표가 장치보다 한참 낮은 2fps·8fps에서는 원래 이 일이 나지 않았다.
+
+    `max(now, ...)`는 오래 멈췄다 재개할 때 밀린 예정 시각을 몰아서 내보내지 않기 위한
+    것이다. 스트림이 잠깐 끊겼다 붙으면 예정 시각이 과거에 한참 남아 있는데, 그것을 그대로
+    더하면 밀린 간격을 다 메울 때까지 문턱이 없는 것처럼 동작한다.
+    """
+    if now < scheduled:
+        return None
+    return max(now, scheduled + interval)
+
+
 class CameraWorker:
     """One capture thread per camera so every camera has exactly one owner."""
 
@@ -240,7 +261,7 @@ class CameraWorker:
             # 장치는 30fps만 내주므로, 그보다 낮은 값은 여기서 솎아 낸다. 읽기는 계속 해야
             # 드라이버 버퍼가 밀리지 않으므로, 버리는 것은 인코딩과 전달뿐이다.
             interval = 1 / profile.fps if profile.fps > 0 else 0
-            last_sent = 0.0
+            next_send = 0.0
             consecutive_failures = 0
             while not self._stop.is_set() and not self._reconfigure.is_set():
                 ok, image = capture.read()
@@ -255,9 +276,10 @@ class CameraWorker:
                     continue
                 consecutive_failures = 0
                 now = time.monotonic()
-                if now - last_sent < interval:
+                scheduled = next_send_time(now, next_send, interval)
+                if scheduled is None:
                     continue
-                last_sent = now
+                next_send = scheduled
                 ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
                 if ok:
                     with self._condition:

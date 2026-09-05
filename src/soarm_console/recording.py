@@ -7,12 +7,13 @@ import threading
 import time
 from collections import deque
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.configs.dataset import DatasetRecordConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.scripts import lerobot_record
 from lerobot.scripts.lerobot_record import RecordConfig
@@ -21,7 +22,13 @@ from lerobot.utils.keyboard_input import apply_recording_control
 
 from .calibration import validate_calibration
 from .config import Settings
+from .follower_start import (
+    align_follower_to_leader,
+    install_safe_follower_start,
+    install_safe_leader_start,
+)
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
+from .record_manager import preview_path
 from .vleader import teleoperator as teleoperator_module
 from .vleader.teleoperator import SOArmVirtualLeaderConfig
 
@@ -31,11 +38,29 @@ CONTROL_PATH = RUNTIME_DIR / "control.json"
 STATUS_PATH = RUNTIME_DIR / "status.json"
 _STATUS_LOCK = threading.Lock()
 _ORIGINAL_RECORD_LOOP = lerobot_record.record_loop
+_ORIGINAL_SAVE_EPISODE = LeRobotDataset.save_episode
+DATA_ROOT = Path(__file__).parents[2] / "data"
+NAME_PATTERN = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\Z")
 
 # A few seconds is long enough to smooth camera jitter, while still making a
 # sustained slowdown visible to the operator before the episode is over.
 LOOP_HZ_WINDOW_S = 3.0
 LOOP_HZ_PUBLISH_S = 1.0
+
+#: 스냅숏을 다시 쓰는 최대 빈도. 화면이 보여 주는 것은 사람이 보는 장면이지 데이터가
+#: 아니므로 5Hz면 충분하고, 그 위로 올리면 30Hz 루프에서 치르는 값만 커진다.
+PREVIEW_HZ = 5.0
+#: JPEG 품질. 이 그림은 "카메라가 무엇을 보고 있나"를 답하는 용도다.
+PREVIEW_QUALITY = 75
+
+#: 이 실행이 데이터셋에 넣은 회차 수. `save_episode` wrapper가 갱신하고, 끝나는 자리에서
+#: 상태에 함께 적는다 — 회차가 몇 개 남았는지는 수집이 끝난 뒤에도 화면이 물어보는 것이다.
+_episodes_saved = 0
+
+#: 시작 정렬을 할 것인가. 가상 리더로 찍을 때는 하지 않는다 —
+#: `vleader.start_relay`가 이미 팔로워의 지금 자세에서 목표를 이어 준다.
+_align_on_start = False
+_aligned = False
 
 
 def _idle_rate_fields() -> dict[str, object]:
@@ -142,12 +167,86 @@ class _LoopRateMonitor:
         self._publish()
 
 
+class _PreviewWriter:
+    """수집 중인 카메라 그림을 파일 하나로 계속 갈아 끼운다.
+
+    수집이 도는 동안 콘솔의 MJPEG 프리뷰는 꺼져 있다 — 장치를 쥔 것은 record 자식이고
+    카메라 하나를 두 프로세스가 열 수는 없다. 그래서 찍는 쪽이 보고 있는 바로 그 프레임을
+    내보낸다. 화면이 "지금 무엇을 찍고 있나"를 물을 곳이 여기뿐이다.
+
+    **인코딩은 별 스레드에서 한다.** `cv2.imencode`는 640x480 한 장에 수 밀리초가 들고,
+    30Hz 루프의 예산은 한 틱에 33ms다. 두 대를 루프 안에서 인코딩하면 그 자체가 데이터의
+    시간축을 늘린다 — 그리고 그 늘어남은 `timestamp`가 합성값이라 데이터에 남지도 않는다.
+    루프가 하는 일은 버퍼를 한 장 복사해 놓아 두는 것까지고, 그 복사는 100µs 아래다.
+
+    복사하는 이유는 `read_latest()`가 돌려주는 버퍼를 카메라 스레드가 다시 채우기
+    때문이다. 그대로 넘기면 인코더가 반쯤 덮어쓰인 그림을 읽는다.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self._pending: dict[str, np.ndarray] = {}
+        self._condition = threading.Condition()
+        self._done = False
+        self._last_offered: dict[str, float] = {}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def offer(self, role: str, frame: np.ndarray) -> None:
+        now = time.perf_counter()
+        if now - self._last_offered.get(role, -1e9) < 1.0 / PREVIEW_HZ:
+            return
+        self._last_offered[role] = now
+        copy = frame.copy()
+        with self._condition:
+            # 아직 인코딩하지 못한 그림이 있으면 그것을 버리고 새 것을 둔다. 프리뷰에서
+            # 늦은 그림은 값이 없다.
+            self._pending[role] = copy
+            self._condition.notify()
+
+    def stop(self) -> None:
+        with self._condition:
+            self._done = True
+            self._condition.notify()
+        self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        import cv2
+
+        while True:
+            with self._condition:
+                while not self._pending and not self._done:
+                    self._condition.wait()
+                if not self._pending and self._done:
+                    return
+                role, frame = self._pending.popitem()
+            try:
+                ok, encoded = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), PREVIEW_QUALITY]
+                )
+                if not ok:
+                    continue
+                target = preview_path(self.directory, role)
+                temporary = target.with_suffix(".tmp")
+                temporary.write_bytes(encoded.tobytes())
+                # 반쯤 쓰인 파일을 읽는 요청이 없도록 자리를 통째로 바꾼다.
+                os.replace(temporary, target)
+            except Exception:  # noqa: BLE001 - 프리뷰가 수집을 멈추게 하지 않는다
+                continue
+
+
 class _RateTrackedRobot:
     """Count loop entries while leaving the LeRobot robot object untouched."""
 
-    def __init__(self, robot: object, monitor: _LoopRateMonitor) -> None:
+    def __init__(
+        self,
+        robot: object,
+        monitor: _LoopRateMonitor,
+        preview: _PreviewWriter | None = None,
+    ) -> None:
         self._robot = robot
         self._monitor = monitor
+        self._preview = preview
         self._last_frames: dict[str, np.ndarray] = {}
 
     def __getattr__(self, name: str) -> object:
@@ -158,7 +257,17 @@ class _RateTrackedRobot:
         observation = self._robot.get_observation()
         # 관찰값은 읽기만 한다. 이 proxy는 LeRobot에게 투명해야 한다.
         self._monitor.observe_cameras(self._camera_freshness(observation))
+        self._offer_previews(observation)
         return observation
+
+    def _offer_previews(self, observation: object) -> None:
+        if self._preview is None or not isinstance(observation, dict):
+            return
+        for key, value in observation.items():
+            if isinstance(value, np.ndarray) and value.ndim == 3:
+                # 키의 마지막 마디가 역할이다. `scene`으로도 `observation.images.scene`
+                # 으로도 올 수 있고, 화면이 부르는 이름은 어느 쪽에서든 뒤쪽이다.
+                self._preview.offer(str(key).rsplit(".", 1)[-1], value)
 
     def _camera_freshness(self, observation: object) -> dict[str, bool]:
         """카메라마다, 이번 틱이 직전 틱과 다른 프레임을 받았는지.
@@ -186,6 +295,34 @@ class _RateTrackedRobot:
         return fresh
 
 
+def _align_before_the_first_episode(robot: object, teleop: object) -> None:
+    """첫 회차 앞에서 팔로워를 리더의 지금 자세까지 걸어간다. 한 번만 한다.
+
+    LeRobot의 첫 틱은 리더 자세를 그대로 팔로워에 보낸다. 두 팔이 다른 자세로 서 있으면
+    팔로워는 그 차이만큼 **한 번에** 뛴다 — `SOARM_MAX_RELATIVE_TARGET`이 걸릴 수 없는
+    값이라 잘리지도 않는다.
+
+    두 번째 회차부터는 필요 없다. 그때 팔로워는 이미 리더를 따라온 자리에 있다.
+    """
+    global _aligned
+
+    if _aligned or not _align_on_start or teleop is None:
+        return
+    _aligned = True
+    _write_status(
+        phase="aligning",
+        episode_started_at=None,
+        reset_started_at=None,
+        **_idle_rate_fields(),
+    )
+    align_follower_to_leader(
+        robot,
+        teleop,
+        publish=lambda seconds_left: _write_status(aligning_seconds_left=seconds_left),
+        log=print,
+    )
+
+
 def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     """Wrap LeRobot's loop and expose episode boundaries plus its real rate.
 
@@ -197,25 +334,63 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     dataset = kwargs.get("dataset")
     control_time_s = kwargs["control_time_s"]
     monitor = _LoopRateMonitor()
+    preview = _PreviewWriter(RUNTIME_DIR)
 
     if dataset is None:
-        _write_status(phase="resetting", episode_started_at=None, **_idle_rate_fields())
+        # 회 사이의 정리 구간이다. 화면이 남은 시간을 셀 수 있도록 시작 시각과 길이를
+        # 함께 적는다 — 여기가 조용하면 사람은 수집이 멈춘 것인지 기다리는 것인지 모른다.
+        _write_status(
+            phase="resetting",
+            episode_started_at=None,
+            reset_started_at=time.time(),
+            reset_seconds=int(control_time_s),
+            **_idle_rate_fields(),
+        )
     else:
+        _align_before_the_first_episode(robot, kwargs.get("teleop"))
         _write_status(
             phase="recording",
             episode_started_at=time.time(),
             episode_seconds=int(control_time_s),
             episode_index=int(dataset.num_episodes),
+            # 지난 정리 구간의 시작 시각이 남아 있으면 화면은 기록 중에도 정리 시계를
+            # 센다. 구간이 바뀌는 자리에서 지운다.
+            reset_started_at=None,
             **_idle_rate_fields(),
         )
 
     forwarded = dict(kwargs)
-    forwarded["robot"] = _RateTrackedRobot(robot, monitor)
+    forwarded["robot"] = _RateTrackedRobot(robot, monitor, preview)
     monitor.start()
     try:
         return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
     finally:
         monitor.stop()
+        preview.stop()
+
+
+def _save_episode_with_status(self, *args: object, **kwargs: object) -> object:
+    """회차를 저장하는 동안 화면이 그렇다고 말할 수 있게 한다.
+
+    정리 구간 15초가 끝난 뒤 인코딩에 8초쯤이 더 든다. 그동안 텔레옵 루프는 서 있고
+    화면은 아무 말도 하지 않았다 — 사람은 수집이 죽은 줄 알고 팔을 흔들어 본다.
+
+    속도 값은 건드리지 않는다. 여기 남아 있는 `loop_hz`는 방금 저장하는 그 회차가 실제로
+    돈 속도이고, `record_manager`가 `soarm_quality.json`에 적는 것도 그 값이다.
+    """
+    _write_status(phase="saving", episode_started_at=None, reset_started_at=None)
+    try:
+        return _ORIGINAL_SAVE_EPISODE(self, *args, **kwargs)
+    finally:
+        _note_episodes_saved(int(self.num_episodes))
+        # `phase`는 여기서 되돌리지 않는다. 다음 `record_loop`가 자기 구간을 적는다.
+        _write_status(episodes_saved=_episodes_saved)
+
+
+def _note_episodes_saved(count: int) -> None:
+    global _episodes_saved
+
+    _episodes_saved = int(count)
 
 
 class _GuiControlListener:
@@ -233,6 +408,21 @@ class _GuiControlListener:
                 key = str(payload.get("key", ""))
                 if key in {"right", "left", "esc"}:
                     apply_recording_control(key, self.events)
+                    _write_status(last_control=key)
+                elif key == "abort":
+                    # 찍던 회를 **버리고** 끝낸다.
+                    #
+                    # `esc`(= stop_recording + exit_early)는 루프를 빠져나온 뒤
+                    # `save_episode()`를 그대로 돌아 찍다 만 회를 저장한다. 실제로
+                    # `soarm101_20260905_092024`의 2회차가 그렇게 남았다 — 82프레임,
+                    # 2.7초짜리 조각이 데이터셋 안에서 온전한 시연인 척한다.
+                    #
+                    # LeRobot 0.6.1의 `record()` 루프는 이 셋을 함께 세우면
+                    # `clear_episode_buffer()`를 지나 `while` 조건(`stop_recording`)에서
+                    # 빠져나온다 — 버리는 길과 끝내는 길이 그 한 바퀴 안에서 만난다.
+                    self.events["rerecord_episode"] = True
+                    self.events["stop_recording"] = True
+                    self.events["exit_early"] = True
                     _write_status(last_control=key)
             except FileNotFoundError:
                 pass
@@ -253,8 +443,31 @@ def _init_gui_listener():
     return _GuiControlListener(events), events
 
 
+def default_dataset_name(task: str, now: datetime | None = None) -> str:
+    """새 데이터셋 이름. **로컬 시각**으로 짓는다.
+
+    UTC로 짓던 때는 저녁 6시 20분에 찍은 것이 `..._092024`로 적혔다. 사람이 데이터셋을
+    고르는 유일한 단서가 이름인데, 그 이름이 아홉 시간 어긋난 시각을 말하고 있었다.
+
+    과제를 ASCII로 적었으면 그것을 앞에 둔다 — `soarm101_...`이 열 줄이면 목록에서
+    무엇이 무엇인지 알 수 없다. 한글로 적었으면 로마자로 옮기지 않고 시각만 쓴다.
+    옮겨 적은 이름은 원래 과제로도 읽히지 않고 데이터셋 이름으로도 읽히지 않는다.
+    """
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M")
+    slug = re.sub(r"[\s_]+", "_", task.strip().lower())
+    if re.fullmatch(r"[a-z0-9_-]+", slug):
+        slug = slug[:40].strip("-_")
+        if slug and slug[0].isalnum():
+            return f"{slug}_{stamp}"
+    return "soarm101_" + (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+
+
 def build_record_config(
-    settings: Settings, task: str, dataset_name: str, teleop_source: str = "leader"
+    settings: Settings,
+    task: str,
+    dataset_name: str,
+    teleop_source: str = "leader",
+    resume: bool = False,
 ) -> RecordConfig:
     if not task.strip():
         raise ValueError("SOARM_TASK must describe one task")
@@ -303,10 +516,32 @@ def build_record_config(
         dataset=dataset,
         display_data=False,
         play_sounds=False,
+        # `record()`의 `if cfg.resume:` 갈래다. 새로 만드는 대신
+        # `LeRobotDataset.resume(...)`으로 열고, 로봇·fps·feature가 맞는지
+        # `sanity_check_dataset_robot_compatibility`가 본다.
+        resume=resume,
     )
 
 
+def _existing_episode_count(dataset_name: str) -> int:
+    """이어 찍기 전에 이미 들어 있는 회차 수.
+
+    `save_episode` wrapper는 저장할 때만 돌므로, 이어 찍기가 한 회도 저장하지 못하고
+    끝나면 `episodes_saved`가 0이 된다. 그 데이터셋에 여덟 회가 들어 있는데도 화면이
+    0이라고 말하는 일은 없어야 한다.
+    """
+    try:
+        info = json.loads(
+            (DATA_ROOT / dataset_name / "meta/info.json").read_text(encoding="utf-8")
+        )
+        return int(info.get("total_episodes", 0))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return 0
+
+
 def main() -> None:
+    global _align_on_start
+
     settings = Settings()
     if not settings.camera_roles_confirmed:
         raise SystemExit("Refusing record: SOARM_CAMERA_ROLES_CONFIRMED=1 is required")
@@ -329,8 +564,16 @@ def main() -> None:
     if missing:
         raise SystemExit(f"Refusing to record: missing calibration files: {missing}")
     task = os.getenv("SOARM_TASK", "")
-    default_name = "soarm101_" + datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    dataset_name = os.getenv("SOARM_DATASET_NAME", default_name)
+    resume = os.getenv("SOARM_RESUME", "0") == "1"
+    dataset_name = os.getenv("SOARM_DATASET_NAME", "")
+    if not dataset_name:
+        dataset_name = default_dataset_name(task)
+        if (DATA_ROOT / dataset_name).exists():
+            # 같은 분 안에 같은 과제를 두 번 시작했다. 초까지 적은 이름으로 물러난다 —
+            # 기존 폴더에 조용히 섞이는 것보다 이름이 덜 예쁜 편이 낫다.
+            dataset_name = "soarm101_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    if resume:
+        _note_episodes_saved(_existing_episode_count(dataset_name))
     try:
         devices = [settings.follower_port, settings.scene_camera, settings.wrist_camera]
         if teleop_source == "leader":
@@ -346,25 +589,44 @@ def main() -> None:
     with lock_context:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         CONTROL_PATH.unlink(missing_ok=True)
-        config = build_record_config(settings, task, dataset_name, teleop_source=teleop_source)
+        config = build_record_config(
+            settings, task, dataset_name, teleop_source=teleop_source, resume=resume
+        )
         _write_status(
             phase="starting",
             dataset_name=dataset_name,
             task=task,
             teleop=teleop_source,
+            resumed=resume,
             episode_started_at=None,
             episode_seconds=int(config.dataset.episode_time_s),
             episode_index=0,
+            reset_started_at=None,
+            reset_seconds=int(config.dataset.reset_time_s),
+            episodes_saved=_episodes_saved,
+            last_control=None,
             **_idle_rate_fields(),
         )
+        # 물리 리더로 찍을 때만 정렬한다. 가상 리더는 `vleader.start_relay`가 팔로워의
+        # 지금 자세에서 목표를 이어 주므로 첫 틱에 뛸 자리가 없다.
+        _align_on_start = teleop_source == "leader"
+        install_safe_follower_start()
+        install_safe_leader_start()
         lerobot_record.init_keyboard_listener = _init_gui_listener
         lerobot_record.record_loop = _record_loop_with_status
+        LeRobotDataset.save_episode = _save_episode_with_status
         try:
-            _write_status(phase="recording")
+            # 여기서 `phase="recording"`을 쓰지 않는다. 모터와 카메라를 여는 데 몇 초가
+            # 걸리고, 그 몇 초 동안 화면이 "기록 중"이라고 말하면 사람은 이미 시연을
+            # 시작한다. 구간은 `record()`가 부르는 첫 `record_loop`가 적는다.
             lerobot_record.record(config)
-            _write_status(phase="complete", episode_started_at=None)
+            _write_status(
+                phase="complete", episode_started_at=None, episodes_saved=_episodes_saved
+            )
         except BaseException:
-            _write_status(phase="error", episode_started_at=None)
+            _write_status(
+                phase="error", episode_started_at=None, episodes_saved=_episodes_saved
+            )
             raise
 
 

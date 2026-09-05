@@ -633,11 +633,37 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
     data.mkdir(parents=True)
     manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=2)
 
-    manager._write_quality(data, {"loop_hz": 28.6, "camera_stale_pct": {"wrist": 9.0}})
+    manager._write_quality(
+        data,
+        {
+            "loop_hz": 28.6,
+            # 창 값. `soarm_quality.json`은 이것을 쓰지 않는다.
+            "camera_stale_pct": {"wrist": 0.0},
+            "session_quality": {
+                "total_frames": 1104,
+                "camera_stale_frames": {"scene": 28, "wrist": 32},
+                "camera_stale_pct": {"scene": 2.54, "wrist": 2.90},
+                "sensor_read_failures": 3,
+                "sensor_implausible": {"temperature": 5, "voltage": 1},
+                "sensor_implausible_thresholds": {"temperature": {"min": 0.0, "max": 100.0}},
+                "sensor_block_read_ms_p50": 2.17,
+                "sensor_block_read_ms_p99": 2.38,
+            },
+        },
+    )
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
     assert quality["loop_hz"] == 28.6
-    assert quality["camera_stale_pct"] == {"wrist": 9.0}
+    # 창 값이 아니라 세션 전체다. 3초 창은 회차가 끝나는 순간만 말한다.
+    assert quality["camera_stale_frames"] == {"scene": 28, "wrist": 32}
+    assert quality["total_frames"] == 1104
+    assert quality["camera_stale_pct"]["scene"] == pytest.approx(100.0 * 28 / 1104)
+    assert quality["camera_stale_pct"]["wrist"] == pytest.approx(100.0 * 32 / 1104)
+    assert quality["sensor_read_failures"] == 3
+    assert quality["sensor_implausible"] == {"temperature": 5, "voltage": 1}
+    # 무슨 기준으로 세었는지가 함께 있어야 나중에 다른 기준으로 다시 셀 수 있다.
+    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 100.0
+    assert quality["sensor_block_read_ms_p50"] == 2.17
     assert quality["slow_loop_warnings"] == 2
     assert quality["recorded_at"] > 0
 
@@ -689,3 +715,60 @@ def test_resuming_adds_this_runs_warnings_to_the_ones_already_counted(tmp_path, 
     assert quality["slow_loop_warnings"] == 8
     # 속도는 이번 실행의 값으로 바뀐다 — 더할 수 있는 것이 아니다.
     assert quality["loop_hz"] == 29.9
+
+
+def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, monkeypatch):
+    """세는 값은 더하고, 비율은 합쳐진 수에서 다시 계산한다.
+
+    비율의 합은 비율이 아니다. 회차마다 프레임 수가 다르면 두 비율의 평균도 답이 아니다.
+    """
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    (data / "soarm_quality.json").write_text(
+        json.dumps({
+            "slow_loop_warnings": 0,
+            "total_frames": 600,
+            "camera_stale_frames": {"scene": 30, "wrist": 0},
+            "camera_stale_pct": {"scene": 5.0, "wrist": 0.0},
+            "sensor_read_failures": 2,
+            "sensor_implausible": {"temperature": 4, "voltage": 0},
+        }),
+        encoding="utf-8",
+    )
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=True, warnings=0)
+
+    manager._write_quality(data, {"loop_hz": 29.9, "session_quality": {
+        "total_frames": 400,
+        "camera_stale_frames": {"scene": 10, "wrist": 8},
+        "camera_stale_pct": {"scene": 2.5, "wrist": 2.0},
+        "sensor_read_failures": 1,
+        "sensor_implausible": {"temperature": 1, "voltage": 3},
+    }})
+
+    quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
+    assert quality["total_frames"] == 1000
+    assert quality["camera_stale_frames"] == {"scene": 40, "wrist": 8}
+    assert quality["sensor_read_failures"] == 3
+    assert quality["sensor_implausible"] == {"temperature": 5, "voltage": 3}
+    # 5.0%와 2.5%의 평균(3.75)이 아니라 40/1000이다.
+    assert quality["camera_stale_pct"]["scene"] == pytest.approx(4.0)
+    assert quality["camera_stale_pct"]["wrist"] == pytest.approx(0.8)
+
+
+def test_a_fresh_run_does_not_inherit_the_previous_datasets_counts(tmp_path, monkeypatch):
+    """이어 찍기가 아니면 같은 이름의 옛 파일이 남아 있어도 그것을 더하지 않는다."""
+    data = tmp_path / "data" / "soarm101_pick"
+    data.mkdir(parents=True)
+    (data / "soarm_quality.json").write_text(
+        json.dumps({"total_frames": 900, "sensor_read_failures": 7}), encoding="utf-8"
+    )
+    manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=0)
+
+    manager._write_quality(data, {"session_quality": {
+        "total_frames": 100, "sensor_read_failures": 0,
+        "camera_stale_frames": {"scene": 1}, "sensor_implausible": {},
+    }})
+
+    quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
+    assert quality["total_frames"] == 100
+    assert quality["sensor_read_failures"] == 0

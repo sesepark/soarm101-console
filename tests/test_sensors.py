@@ -124,7 +124,7 @@ def _bus(rows: dict[int, list[int]], comm: int = 0):
 # MARK: 열의 모양
 
 
-def test_the_nine_columns_are_named_and_shaped_exactly_as_the_contract_says():
+def test_the_ten_columns_are_named_and_shaped_exactly_as_the_contract_says():
     features = sensors.extra_features()
 
     assert list(features) == [
@@ -137,6 +137,7 @@ def test_the_nine_columns_are_named_and_shaped_exactly_as_the_contract_says():
         "observation.current",
         "observation.wall_time",
         "observation.camera_fresh",
+        "observation.sensor_read_ok",
     ]
     assert features["observation.load"] == {
         "dtype": "float32",
@@ -153,6 +154,8 @@ def test_the_nine_columns_are_named_and_shaped_exactly_as_the_contract_says():
     assert features["observation.wall_time"]["names"] == ["since_start"]
     assert features["observation.camera_fresh"]["shape"] == (2,)
     assert features["observation.camera_fresh"]["names"] == ["scene", "wrist"]
+    assert features["observation.sensor_read_ok"]["shape"] == (1,)
+    assert features["observation.sensor_read_ok"]["names"] == ["read_ok"]
     assert all(feature["dtype"] == "float32" for feature in features.values())
     assert all(
         len(feature["shape"]) == 1 and feature["shape"][0] == len(feature["names"])
@@ -258,6 +261,87 @@ def test_a_dropped_packet_repeats_the_last_values_instead_of_stopping_the_episod
     assert reader.reads == 2
     # 시각은 판독값이 아니다. 읽기가 실패해도 이 프레임이 언제였는지는 안다.
     assert repeated["since_start"] == 1.0
+
+
+def test_the_read_ok_column_says_which_rows_are_a_fresh_reading():
+    """값은 되풀이하되, 되풀이했다는 사실을 숨기지 않는다.
+
+    `SensorReader`가 실패한 틱에 직전 값을 다시 쓰는 것 자체는 옳다 — 프레임을 통째로
+    버리는 것이 더 나쁘다. 문제는 그 사실이 데이터셋 어디에도 남지 않아, 나중에 읽는
+    쪽이 어떤 행이 진짜 판독인지 물어볼 곳이 없었다는 것이다.
+    """
+    from scservo_sdk import COMM_RX_FAIL
+
+    rows = {motor_id: _block(load=42, temperature=36) for motor_id in MOTOR_IDS}
+    bus = _bus(rows)
+    reader = sensors.SensorReader(bus, started_at=0.0)
+
+    good = reader.observation_extras(0.0, {})
+    bus.sync_reader.comm = COMM_RX_FAIL
+    repeated = reader.observation_extras(1.0, {})
+    bus.sync_reader.comm = 0
+    recovered = reader.observation_extras(2.0, {})
+
+    assert good[sensors.SENSOR_READ_OK_NAME] == 1.0
+    assert repeated[sensors.SENSOR_READ_OK_NAME] == 0.0
+    assert recovered[sensors.SENSOR_READ_OK_NAME] == 1.0
+    # 값 자체는 그대로 되풀이된다. 이 열은 값을 바꾸지 않고 값에 **대해** 말한다.
+    assert repeated["gripper.load"] == 42.0
+    assert repeated["gripper.temp"] == 36.0
+
+
+def test_without_a_bus_every_row_says_it_is_not_a_fresh_reading():
+    reader = sensors.SensorReader(None, started_at=0.0)
+
+    assert reader.observation_extras(0.0, {})[sensors.SENSOR_READ_OK_NAME] == 0.0
+
+
+@pytest.mark.parametrize(
+    "field, raw, expected",
+    [
+        ("temperature", 150, 150.0),
+        ("temperature", 0, 0.0),
+        ("voltage", 3, 0.3),
+        ("voltage", 250, 25.0),
+    ],
+)
+def test_an_impossible_reading_is_stored_exactly_as_it_arrived(field, raw, expected):
+    """**값은 고치지 않는다.** clamp도, 이웃 값으로 대신하기도, 보간도 없다.
+
+    여기서 걸리는 값은 온도계의 잡음이 아니라 모터가 전류를 쓰는 동안 serial 판독이 한
+    바이트 어긋난 것이다(팔을 세워 둔 채 5,400 판독에서 0건, 움직이며 찍은 6,624 판독에서
+    6건, 그 6건은 부하·속도가 평균보다 높은 프레임에 몰렸다). 같은 손상이 부하나 속도
+    바이트에 나면 그럴듯한 값이 되어 어떤 문턱으로도 잡히지 않으므로, 온도와 전압만
+    고치면 그 두 열만 깨끗해 보이고 정작 연구가 쓸 열의 손상은 감춰진다.
+    """
+    suffix = {"temperature": "temp", "voltage": "volt"}[field]
+    rows = {motor_id: _block(**{field: raw}) for motor_id in MOTOR_IDS}
+    reader = sensors.SensorReader(_bus(rows), started_at=0.0)
+
+    extras = reader.observation_extras(0.0, {})
+
+    assert extras[f"elbow_flex.{suffix}"] == pytest.approx(expected)
+    # 읽기는 성공했다. 값이 이상한 것과 읽기가 실패한 것은 다른 사실이다.
+    assert extras[sensors.SENSOR_READ_OK_NAME] == 1.0
+
+
+def test_the_thresholds_are_for_counting_and_travel_with_the_count():
+    thresholds = sensors.plausibility_thresholds()
+
+    assert thresholds["temperature"] == {
+        "min": 0.0,
+        "max": 100.0,
+        "min_inclusive": False,
+        "unit": "C",
+    }
+    assert thresholds["voltage"]["min"] == 5.0
+    assert thresholds["voltage"]["min_inclusive"] is True
+    # `test4_20260905_1459`의 frame 297 elbow_flex.
+    temperature = next(e for e in sensors.PLAUSIBLE_RANGES if e.key == "temperature")
+    assert temperature.holds(36.0) is True
+    assert temperature.holds(150.0) is False
+    # 토크가 꺼진 모터만 0을 낸다(RUNBOOK 1.0). 수집 중에 나오면 세어 둘 값이다.
+    assert temperature.holds(0.0) is False
 
 
 def test_a_bus_that_raises_never_reaches_the_record_loop():
@@ -429,7 +513,7 @@ def data_root(tmp_path, monkeypatch):
     return root
 
 
-def _record_synthetic_episode(root, name: str, frames: int = 4):
+def _record_synthetic_episode(root, name: str, frames: int = 4, fail_frames: tuple[int, ...] = ()):
     """LeRobot이 실제로 쓰는 길로 한 회차를 만든다. 팔도 카메라도 없이.
 
     파케이를 손으로 짜 넣지 않는 이유가 있다. 확인하려는 것은 우리가 적은 모양이 아니라
@@ -459,11 +543,14 @@ def _record_synthetic_episode(root, name: str, frames: int = 4):
         f"local/{name}", 30, root=root / name, robot_type="so101_follower",
         features=features, use_videos=True,
     )
-    reader = sensors.SensorReader(
-        _bus({motor_id: _block(load=10 * motor_id, velocity=-motor_id) for motor_id in MOTOR_IDS}),
-        started_at=1000.0,
-    )
+    from scservo_sdk import COMM_RX_FAIL
+
+    bus = _bus({motor_id: _block(load=10 * motor_id, velocity=-motor_id) for motor_id in MOTOR_IDS})
+    reader = sensors.SensorReader(bus, started_at=1000.0)
     for index in range(frames):
+        # 이 프레임에서는 버스가 답하지 않는다. 값은 직전 것이 되풀이되고, 그 사실이
+        # `observation.sensor_read_ok`에 0.0으로 남아야 한다.
+        bus.sync_reader.comm = COMM_RX_FAIL if index in fail_frames else 0
         observation = {f"{m}.pos": float(index) for m in sensors.MOTORS}
         observation.update(
             reader.observation_extras(
@@ -506,6 +593,28 @@ def test_the_columns_reach_the_parquet_with_their_values(data_root):
     assert trajectory["camera_fresh"][1] == [1.0, 0.0]
     assert trajectory["wall_time"][0] == pytest.approx([0.0])
     assert trajectory["wall_time"][3] == pytest.approx([3 / 30.0], abs=1e-6)
+    assert trajectory["sensor_read_ok"] == [[1.0], [1.0], [1.0], [1.0]]
+
+
+def test_a_repeated_row_is_marked_in_the_parquet_but_keeps_its_values(data_root):
+    """읽기가 실패한 프레임은 직전 값을 그대로 나르되, 그렇다고 말한다.
+
+    이것이 "불가능한 값을 이웃 값으로 대신하자"의 대안이다. 값을 고치면 온도와 전압만
+    깨끗해 보이고, 같은 손상이 부하나 속도 바이트에 났을 때는 그럴듯한 값이 되어 아무도
+    알아채지 못한다. 값은 그대로 두고 **그 행이 새 판독인지**만 적는다.
+    """
+    from soarm_console import datasets
+
+    _record_synthetic_episode(data_root, "soarm101_pick", frames=4, fail_frames=(2,))
+
+    trajectory = datasets.trajectory("soarm101_pick", 0)
+
+    assert trajectory["sensor_read_ok"] == [[1.0], [1.0], [0.0], [1.0]]
+    # 값은 손대지 않는다. 되풀이된 행도 직전 행과 같은 값을 그대로 담고 있다.
+    assert trajectory["load"][2] == pytest.approx(trajectory["load"][1])
+    assert trajectory["load"][2] == pytest.approx([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    # 시각은 판독값이 아니다. 읽기가 실패해도 이 프레임이 언제였는지는 안다.
+    assert trajectory["wall_time"][2] == pytest.approx([2 / 30.0], abs=1e-6)
 
 
 def test_a_dataset_without_the_columns_still_answers_with_a_trajectory(data_root):

@@ -71,6 +71,23 @@ _empty_episodes_skipped = 0
 #: 화면이 "약 N초"를 그릴 수 있는 유일한 근거는 방금 같은 일이 얼마나 걸렸는가다.
 _saving_seconds: float | None = None
 
+#: 이 세션이 데이터셋에 실제로 넣은 프레임 수와, 그 프레임들에서 센 것들.
+#:
+#: **파케이에 들어가는 바로 그 행에서 센다**(`_build_dataset_frame_with_sensors`).
+#: `_LoopRateMonitor`의 값은 최근 3초 창이라 회차가 끝나는 순간의 상태만 말한다 —
+#: 실제로 `test4_20260905_1459`의 `soarm_quality.json`은 `camera_stale_pct` 0.0을
+#: 적었는데, 같은 데이터셋의 `observation.camera_fresh`를 세면 scene 2.54%·wrist
+#: 2.90%였다. 화면이 지금 어떤지를 묻는 값과 이 데이터가 어떻게 찍혔는지를 묻는 값은
+#: 서로 다른 값이고, `soarm_quality.json`이 답해야 하는 것은 뒤쪽이다.
+_total_frames = 0
+_camera_stale_frames: dict[str, int] = {key: 0 for key in sensors.CAMERA_KEYS}
+#: 블록 읽기가 실패해 직전 값이 되풀이된 프레임 수(`observation.sensor_read_ok` == 0).
+_sensor_read_failures = 0
+#: 물리적으로 말이 되지 않는 판독의 수. **세기만 한다** — 값은 그대로 저장된다.
+_sensor_implausible: dict[str, int] = {entry.key: 0 for entry in sensors.PLAUSIBLE_RANGES}
+#: 블록 읽기에 든 시간(초). 회차가 끝날 때마다 `SensorReader`에서 걷어 온다.
+_sensor_durations: list[float] = []
+
 #: `record_loop`가 지금 돌고 있는가.
 #:
 #: 이 플래그가 없으면 회 사이(영상 굽기, 정리 구간 사이의 빈틈)에 도착한 키가
@@ -458,6 +475,11 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
         _loop_running.clear()
         monitor.stop()
         preview.stop()
+        if reader is not None:
+            # 읽기 시간은 회차마다 새로 만든 reader 안에 쌓인다. 세션 값을 내려면 회차가
+            # 끝나는 이 자리에서 걷어 와야 한다.
+            _sensor_durations.extend(reader.durations)
+            _write_status(session_quality=_sensor_quality_fields())
 
 
 def _combine_feature_dicts_with_sensors(*dicts: dict) -> dict:
@@ -498,7 +520,80 @@ def _build_dataset_frame_with_sensors(
     frame = _ORIGINAL_BUILD_DATASET_FRAME(remaining, values, prefix)
     for key in handled:
         frame[key] = np.asarray(values[key], dtype=np.float32)
+    _count_recorded_frame(frame)
     return frame
+
+
+def _count_recorded_frame(frame: dict[str, object]) -> None:
+    """이 프레임에서 셀 것을 센다. **값은 건드리지 않는다.**
+
+    여기가 세는 자리인 이유. 이 함수가 만든 dict가 그대로 `add_frame`으로 가서 파케이의
+    한 행이 된다. 그러니 여기서 센 수는 나중에 파케이를 다시 세어 얻는 수와 반드시 같다 —
+    `soarm_quality.json`이 데이터와 다른 말을 하는 일이 없다. 관측 프레임에서만 불린다
+    (`observation.camera_fresh`는 `prefix`가 관측일 때만 `handled`에 든다), 그래서 한
+    프레임이 두 번 세어지지 않는다.
+
+    걸린 값을 고치지 않는다. 여기서 걸리는 것은 온도계의 잡음이 아니라 모터가 전류를 쓰는
+    동안 serial 판독이 한 바이트 어긋난 것이고, 같은 손상이 부하나 속도 바이트에 나면
+    그럴듯한 값이 되어 어떤 문턱으로도 잡히지 않는다. 온도와 전압만 고치면 그 두 열만
+    깨끗해 보이고 정작 연구가 쓸 열의 손상은 감춰진다. 세어 두고, 무슨 기준으로 세었는지도
+    함께 적고, 거르는 것은 원본이 그대로 남아 있는 분석 단계에서 한다.
+    """
+    global _total_frames, _sensor_read_failures
+
+    _total_frames += 1
+
+    fresh = frame.get(sensors.CAMERA_FRESH_COLUMN)
+    if fresh is not None:
+        for key, value in zip(sensors.CAMERA_KEYS, np.asarray(fresh).reshape(-1), strict=False):
+            if not float(value):
+                _camera_stale_frames[key] += 1
+
+    read_ok = frame.get(sensors.SENSOR_READ_OK_COLUMN)
+    if read_ok is not None and not float(np.asarray(read_ok).reshape(-1)[0]):
+        _sensor_read_failures += 1
+
+    for entry in sensors.PLAUSIBLE_RANGES:
+        column = frame.get(entry.column)
+        if column is None:
+            continue
+        for value in np.asarray(column).reshape(-1):
+            if not entry.holds(float(value)):
+                _sensor_implausible[entry.key] += 1
+
+
+def _percentile(samples: list[float], fraction: float) -> float | None:
+    """가장 가까운 순위. 표본이 없으면 `None`.
+
+    `numpy.percentile`의 보간을 쓰지 않는다 — 이 값은 "실제로 이만큼 걸린 읽기가 있었다"를
+    말해야 하고, 보간한 값은 한 번도 일어나지 않은 시간이다.
+    """
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def _sensor_quality_fields() -> dict[str, object]:
+    """`soarm_quality.json`이 실을, 이 세션에서 실제로 센 값들."""
+    return {
+        "total_frames": _total_frames,
+        "camera_stale_frames": dict(_camera_stale_frames),
+        "camera_stale_pct": {
+            key: (100.0 * count / _total_frames) if _total_frames else 0.0
+            for key, count in _camera_stale_frames.items()
+        },
+        "sensor_read_failures": _sensor_read_failures,
+        "sensor_implausible": dict(_sensor_implausible),
+        "sensor_implausible_thresholds": sensors.plausibility_thresholds(),
+        "sensor_block_read_ms_p50": _read_ms(_percentile(_sensor_durations, 0.50)),
+        "sensor_block_read_ms_p99": _read_ms(_percentile(_sensor_durations, 0.99)),
+    }
+
+
+def _read_ms(seconds: float | None) -> float | None:
+    return None if seconds is None else round(1000.0 * seconds, 3)
 
 
 def _episode_buffer_size(dataset: object, episode_data: object) -> int | None:
@@ -896,6 +991,7 @@ def main() -> None:
             episodes_saved=_episodes_saved,
             empty_episodes_skipped=_empty_episodes_skipped,
             saving_seconds_estimate=None,
+            session_quality=_sensor_quality_fields(),
             last_control=None,
             last_control_ignored=None,
             started_at=_started_at,

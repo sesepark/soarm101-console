@@ -43,7 +43,9 @@ CAMERA_KEYS = ("scene", "wrist")
 
 #: 이 열들의 뜻이 바뀌면 올린다. `soarm_provenance.json`에 함께 적히므로, 나중에 읽는
 #: 쪽이 "이 데이터의 load는 어떤 단위였나"를 파일 하나로 답할 수 있다.
-EXTRAS_SCHEMA = 1
+#:
+#: 2 — `observation.sensor_read_ok`를 더했다(2026-09-05).
+EXTRAS_SCHEMA = 2
 
 #: 한 번에 읽는 구간. 56(Present_Position)에서 70(Present_Current의 둘째 바이트)까지다.
 #: 위치도 구간 안에 들지만 쓰지는 않는다 — `observation.state`는 LeRobot이 자기 읽기로
@@ -122,9 +124,73 @@ CAMERA_FRESH_KEY = CAMERA_FRESH_COLUMN
 #: 이름으로 모을 수 없어 따로 채우는 열들.
 SIDE_CHANNEL_COLUMNS = (CAMERA_FRESH_COLUMN,)
 
+#: 이번 틱의 블록 읽기가 실제로 성공했는가. 1.0이면 이 행의 서보 값들은 이 프레임에서
+#: 새로 읽은 것이고, 0.0이면 읽기가 실패해 **직전 값을 그대로 다시 쓴** 행이다.
+#:
+#: 왜 필요한가. `SensorReader`는 읽기가 실패해도 마지막 값을 한 번 더 쓴다(그것이 옳다 —
+#: 버스 패킷 하나가 깨졌다고 30초짜리 시연을 버릴 수는 없고, `validate_frame`은 모든 열이
+#: 프레임에 있기를 요구한다). 그런데 그 사실이 데이터셋 어디에도 남지 않아서, 나중에 읽는
+#: 쪽은 어떤 행이 진짜 판독이고 어떤 행이 되풀이인지 물어볼 곳이 없었다. 값을 고치는 대신
+#: **값이 무엇인지에 대한 사실**을 한 열로 적는다.
+SENSOR_READ_OK_COLUMN = "observation.sensor_read_ok"
+SENSOR_READ_OK_NAME = "read_ok"
+
+
+@dataclass(frozen=True)
+class PlausibleRange:
+    """한 열의 값이 물리적으로 말이 되는 범위.
+
+    **이 표로 값을 고치지 않는다.** 거르지도, 자르지도, 이웃 값으로 대신하지도 않는다.
+    세는 데만 쓰고, 센 결과와 함께 이 문턱값 자체를 `soarm_quality.json`에 적는다 —
+    나중에 다른 기준으로 다시 세고 싶으면 원본이 그대로 남아 있어야 한다.
+
+    고치지 않는 이유. 여기서 걸리는 값은 온도계의 잡음이 아니라 모터가 전류를 쓰는 동안
+    serial 판독이 한 바이트 어긋난 것이다(팔을 세워 둔 채 5,400 판독에서는 0건, 움직이며
+    찍은 6,624 판독에서는 6건이었고 그 6건은 부하·속도가 평균보다 높은 프레임에 몰렸다).
+    같은 손상이 부하나 속도 바이트에 나면 그럴듯한 값이 되어 어떤 문턱으로도 잡히지
+    않는다. 온도와 전압만 고치면 그 두 열만 깨끗해 보이고, 정작 연구가 쓸 열의 손상은
+    그대로 남은 채 감춰진다.
+    """
+
+    column: str
+    #: 보고에 쓰는 짧은 이름(`soarm_quality.json`의 키).
+    key: str
+    low: float
+    high: float
+    #: `low` 자체가 말이 되는 값인가. 온도는 아니다 — 토크가 꺼진 모터만 0을 내주므로
+    #: (`RUNBOOK.md` 1.0), 수집 중에 올라온 0은 그 모터가 힘을 쓰지 않았다는 뜻이거나
+    #: 판독이 어긋난 것이다. 어느 쪽이든 세어 둘 값이다.
+    low_inclusive: bool
+    unit: str
+
+    def holds(self, value: float) -> bool:
+        low_ok = value >= self.low if self.low_inclusive else value > self.low
+        return low_ok and value <= self.high
+
+    def describe(self) -> dict[str, Any]:
+        """`soarm_quality.json`에 함께 적는 기준. 사람도 읽고 기계도 읽는다."""
+        return {
+            "min": self.low,
+            "max": self.high,
+            "min_inclusive": self.low_inclusive,
+            "unit": self.unit,
+        }
+
+
+#: 세기만 하는 열들. 나머지 열에는 기준이 없다 — 부하·속도·전류는 어긋난 바이트도
+#: 그럴듯한 값이 되므로 문턱을 두는 것이 오히려 "이 열은 검사했다"는 잘못된 인상을 준다.
+PLAUSIBLE_RANGES = (
+    PlausibleRange("observation.temperature", "temperature", 0.0, 100.0, False, "C"),
+    PlausibleRange("observation.voltage", "voltage", 5.0, 15.0, True, "V"),
+)
+
+
+def plausibility_thresholds() -> dict[str, dict[str, Any]]:
+    return {entry.key: entry.describe() for entry in PLAUSIBLE_RANGES}
+
 
 def extra_features() -> dict[str, dict[str, Any]]:
-    """데이터셋 features에 더할 아홉 열.
+    """데이터셋 features에 더할 열 열 개.
 
     `dtype`이 `float32`이고 `shape`이 1차원이면 `build_dataset_frame`이 `names`를 키로
     값을 모아 채운다. 그래서 여기 적힌 이름이 곧 관측 dict에 넣어야 할 키다.
@@ -145,6 +211,11 @@ def extra_features() -> dict[str, dict[str, Any]]:
         "dtype": "float32",
         "shape": (len(CAMERA_KEYS),),
         "names": list(CAMERA_KEYS),
+    }
+    features[SENSOR_READ_OK_COLUMN] = {
+        "dtype": "float32",
+        "shape": (1,),
+        "names": [SENSOR_READ_OK_NAME],
     }
     return features
 
@@ -190,7 +261,14 @@ class SensorReader:
         }
         self.read_failures = 0
         self.reads = 0
+        #: 직전 `_refresh()`가 새 값을 읽어 냈는가. `observation.sensor_read_ok`가 되고,
+        #: 첫 틱 전에는 아직 아무것도 읽지 않았으므로 False다.
+        self.last_read_ok = False
         self._durations: deque[float] = deque(maxlen=self._SAMPLE_LIMIT)
+        #: 이 회차의 블록 읽기 시간 전부(초). 창이 아니라 전부인 이유는 회차가 끝날 때
+        #: p50·p99를 내야 하기 때문이다 — 창 값은 마지막 4초만 말한다. 30Hz로 한 시간을
+        #: 찍어도 10만 개 남짓이라 담아 두는 값이 문제가 되지 않는다.
+        self.durations: list[float] = []
 
     @property
     def enabled(self) -> bool:
@@ -225,18 +303,26 @@ class SensorReader:
         extras[CAMERA_FRESH_KEY] = [
             1.0 if _camera_is_fresh(camera_fresh, key) else 0.0 for key in CAMERA_KEYS
         ]
+        # 값은 그대로 두고, 그 값이 이 프레임에서 새로 읽힌 것인지만 적는다.
+        extras[SENSOR_READ_OK_NAME] = 1.0 if self.last_read_ok else 0.0
         return extras
 
     def _refresh(self) -> None:
         if not self.enabled:
+            # 읽을 버스가 없다. 실려 나가는 값은 마지막 값(처음에는 0)이고, 그것은 이
+            # 프레임에서 새로 읽은 값이 아니다 — 그 사실을 그대로 적는다.
+            self.last_read_ok = False
             return
         started = time.perf_counter()
         try:
             ok = self._read_block()
         except Exception:  # noqa: BLE001 - 서보 읽기가 수집을 죽이는 일은 없다
             ok = False
-        self._durations.append(time.perf_counter() - started)
+        elapsed = time.perf_counter() - started
+        self._durations.append(elapsed)
+        self.durations.append(elapsed)
         self.reads += 1
+        self.last_read_ok = ok
         if not ok:
             self.read_failures += 1
 

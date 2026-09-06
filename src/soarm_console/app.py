@@ -7,7 +7,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -743,7 +743,7 @@ PREVIEW_MAX_AGE_S = 3.0
 
 
 @app.get("/api/recording/preview/{role}.jpg")
-def recording_preview(role: str) -> FileResponse:
+def recording_preview(role: str) -> Response:
     """수집 중인 카메라가 방금 본 것. 한 장짜리 JPEG.
 
     수집이 도는 동안 콘솔의 MJPEG 스트림은 꺼져 있다 — 카메라를 쥔 것은 record 자식이고
@@ -764,8 +764,12 @@ def recording_preview(role: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="No preview yet") from exc
     if age > PREVIEW_MAX_AGE_S:
         raise HTTPException(status_code=404, detail="No preview yet")
-    return FileResponse(
-        path,
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="No preview yet") from exc
+    return Response(
+        content=content,
         media_type="image/jpeg",
         # 이 파일은 자리를 지키고 내용만 바뀐다. 캐시에 한 장이 남으면 화면은 그 한 장을
         # 계속 보여 주면서 갱신되고 있다고 믿는다.

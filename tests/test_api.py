@@ -533,6 +533,7 @@ def test_a_stale_snapshot_is_not_served_at_all(tmp_path, monkeypatch):
     # 자리를 지키고 내용만 바뀌는 파일이다. 캐시에 한 장이 남으면 화면은 그것을 계속 본다.
     assert fresh.headers["cache-control"] == "no-store"
     assert fresh.content == b"jpeg-bytes"
+    assert len(fresh.content) == int(fresh.headers["content-length"])
 
     old = time.time() - 10
     os.utime(snapshot, (old, old))

@@ -147,6 +147,132 @@ def test_observation_without_cameras_publishes_no_camera_rates(tmp_path, monkeyp
     assert runtime["loop_hz"] > 0.0
 
 
+class _RecoverableBus:
+    def __init__(self, fail_clear: bool = False) -> None:
+        self.clears = 0
+        self.fail_clear = fail_clear
+        self.port_handler = self
+
+    def clearPort(self) -> None:
+        self.clears += 1
+        if self.fail_clear:
+            raise RuntimeError("clear failed")
+
+
+def test_connection_error_discards_only_the_current_episode(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "BUS_RECOVERY_DELAY_S", 0.0)
+    monkeypatch.setattr(recording, "_episodes_aborted", 0)
+    monkeypatch.setattr(recording, "_consecutive_connection_failures", 0)
+    monkeypatch.setattr(
+        recording,
+        "_ORIGINAL_RECORD_LOOP",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("bad\npacket")),
+    )
+    robot = _Robot()
+    robot.bus = _RecoverableBus()
+    teleop = SimpleNamespace(bus=_RecoverableBus(fail_clear=True))
+    events = {"exit_early": True, "rerecord_episode": False}
+
+    recording._record_loop_with_status(
+        robot=robot,
+        teleop=teleop,
+        events=events,
+        dataset=SimpleNamespace(num_episodes=4),
+        control_time_s=10,
+    )
+
+    assert events["rerecord_episode"] is True
+    assert events["exit_early"] is False
+    assert robot.bus.clears == 1
+    assert teleop.bus.clears == 1
+    runtime = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert runtime["episodes_aborted"] == 1
+    assert runtime["last_abort_reason"] == "bad packet"
+    assert runtime["session_quality"]["episodes_aborted"] == 1
+
+
+def test_the_third_consecutive_connection_error_ends_the_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "BUS_RECOVERY_DELAY_S", 0.0)
+    monkeypatch.setattr(recording, "_episodes_aborted", 0)
+    monkeypatch.setattr(recording, "_consecutive_connection_failures", 0)
+    monkeypatch.setattr(
+        recording,
+        "_ORIGINAL_RECORD_LOOP",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("bus unavailable")),
+    )
+    kwargs = {
+        "robot": _Robot(),
+        "events": {"exit_early": False, "rerecord_episode": False},
+        "dataset": SimpleNamespace(num_episodes=4),
+        "control_time_s": 10,
+    }
+
+    recording._record_loop_with_status(**kwargs)
+    recording._record_loop_with_status(**kwargs)
+    with pytest.raises(ConnectionError, match="bus unavailable"):
+        recording._record_loop_with_status(**kwargs)
+
+
+def test_a_reset_connection_error_does_not_discard_an_episode(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "BUS_RECOVERY_DELAY_S", 0.0)
+    monkeypatch.setattr(recording, "_episodes_aborted", 0)
+    monkeypatch.setattr(recording, "_consecutive_connection_failures", 0)
+    monkeypatch.setattr(
+        recording,
+        "_ORIGINAL_RECORD_LOOP",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("reset read failed")),
+    )
+    events = {"exit_early": False, "rerecord_episode": False}
+
+    recording._record_loop_with_status(
+        robot=_Robot(), events=events, dataset=None, control_time_s=5
+    )
+
+    assert events["rerecord_episode"] is False
+    assert recording._episodes_aborted == 0
+
+
+def test_a_non_connection_error_is_not_hidden_as_an_episode_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(
+        recording,
+        "_ORIGINAL_RECORD_LOOP",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("software bug")),
+    )
+    events = {"exit_early": False, "rerecord_episode": False}
+
+    with pytest.raises(RuntimeError, match="software bug"):
+        recording._record_loop_with_status(
+            robot=_Robot(),
+            events=events,
+            dataset=SimpleNamespace(num_episodes=4),
+            control_time_s=10,
+        )
+
+    assert events["rerecord_episode"] is False
+
+
+def test_a_successful_save_resets_the_connection_failure_streak(tmp_path, monkeypatch):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "_consecutive_connection_failures", 2)
+
+    def fake_save(dataset):
+        dataset.num_episodes += 1
+
+    monkeypatch.setattr(recording, "_ORIGINAL_SAVE_EPISODE", fake_save)
+    recording._save_episode_with_status(SimpleNamespace(num_episodes=2))
+
+    assert recording._consecutive_connection_failures == 0
+
+
 def test_camera_frames_reach_the_loop_unchanged(tmp_path, monkeypatch):
     """The proxy consumes observations; it must not substitute or copy them."""
     monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
@@ -341,6 +467,7 @@ def counters(monkeypatch):
     monkeypatch.setattr(recording, "_camera_stale_frames", {"scene": 0, "wrist": 0})
     monkeypatch.setattr(recording, "_sensor_implausible", {"temperature": 0, "voltage": 0})
     monkeypatch.setattr(recording, "_sensor_durations", [])
+    monkeypatch.setattr(recording, "_episodes_aborted", 0)
 
 
 def _frame(scene=1.0, wrist=1.0, read_ok=1.0, temperature=36.0, voltage=12.1):

@@ -641,6 +641,7 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
             "camera_stale_pct": {"wrist": 0.0},
             "session_quality": {
                 "total_frames": 1104,
+                "episodes_aborted": 2,
                 "camera_stale_frames": {"scene": 28, "wrist": 32},
                 "camera_stale_pct": {"scene": 2.54, "wrist": 2.90},
                 "sensor_read_failures": 3,
@@ -657,6 +658,7 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
     # 창 값이 아니라 세션 전체다. 3초 창은 회차가 끝나는 순간만 말한다.
     assert quality["camera_stale_frames"] == {"scene": 28, "wrist": 32}
     assert quality["total_frames"] == 1104
+    assert quality["episodes_aborted"] == 2
     assert quality["camera_stale_pct"]["scene"] == pytest.approx(100.0 * 28 / 1104)
     assert quality["camera_stale_pct"]["wrist"] == pytest.approx(100.0 * 32 / 1104)
     assert quality["sensor_read_failures"] == 3
@@ -728,6 +730,7 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
         json.dumps({
             "slow_loop_warnings": 0,
             "total_frames": 600,
+            "episodes_aborted": 2,
             "camera_stale_frames": {"scene": 30, "wrist": 0},
             "camera_stale_pct": {"scene": 5.0, "wrist": 0.0},
             "sensor_read_failures": 2,
@@ -739,6 +742,7 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
 
     manager._write_quality(data, {"loop_hz": 29.9, "session_quality": {
         "total_frames": 400,
+        "episodes_aborted": 1,
         "camera_stale_frames": {"scene": 10, "wrist": 8},
         "camera_stale_pct": {"scene": 2.5, "wrist": 2.0},
         "sensor_read_failures": 1,
@@ -747,6 +751,7 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
     assert quality["total_frames"] == 1000
+    assert quality["episodes_aborted"] == 3
     assert quality["camera_stale_frames"] == {"scene": 40, "wrist": 8}
     assert quality["sensor_read_failures"] == 3
     assert quality["sensor_implausible"] == {"temperature": 5, "voltage": 3}

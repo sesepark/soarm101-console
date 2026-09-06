@@ -36,6 +36,7 @@
 | 회 사이(저장·정리)에 누른 조작 키 | `record_loop`가 도는지 보는 플래그 | `right`·`left`는 버리고 `last_control_ignored`에 적는다. `esc`·`abort`는 `stop_recording`만 세운다 | 해당 없음 | 적용하면 **다음 회차**가 그 키를 읽어 0프레임으로 끝난다 |
 | 서보 판독 한 바이트 손상 | `soarm_quality.json`의 `sensor_implausible`(문턱값을 함께 적는다) | **고치지 않는다.** 값은 원본 그대로 저장하고 세기만 한다 | 해당 없음 | 모터가 전류를 쓰는 동안 난다. 같은 손상이 부하·속도 바이트에 나면 그럴듯한 값이 되어 잡히지 않으므로, 온도·전압만 고치면 나머지 열의 손상이 감춰진다 |
 | 서보 블록 읽기 실패 | `observation.sensor_read_ok` == 0 | 직전 값을 그대로 다시 쓰고 그 행에 표시한다 | 다음 틱에 저절로 | 프레임을 버리면 회차 전체가 막힌다(`validate_frame`). 되풀이한 행인지는 이 열로만 알 수 있다 |
+| 위치 동기 읽기 연결 오류 | `record_loop`의 `ConnectionError` | 현재 회차를 버리고 양쪽 버스 입력을 비운 뒤 같은 번호로 다시 찍는다 | 저장 성공 전 2회까지 | `episodes_aborted`와 `last_abort_reason`을 남기며, 3회 연속 실패하면 죽은 버스의 무한 재시도를 막기 위해 세션을 끝낸다. 토크와 연결 상태는 건드리지 않는다 |
 | 0프레임 회차 | 저장 직전 `writer.episode_buffer["size"]` | 저장을 건너뛰고 버퍼만 비운다. `empty_episodes_skipped`를 올린다 | 다음 회차는 정상 진행 | 저장하면 `validate_episode_buffer`가 `ValueError`로 세션 전체를 끝낸다 |
 
 수집 화면의 `preview-<role>.jpg`는 LeRobot 카메라가 내놓은 RGB 관측을 표시용 BGR로

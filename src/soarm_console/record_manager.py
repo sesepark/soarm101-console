@@ -36,7 +36,7 @@ CONTROLS = ("right", "left", "esc", "abort")
 
 #: `soarm_quality.json`에서 이어 찍기 때 **더해야** 하는 세는 값들. 비율은 여기 없다 —
 #: 비율은 더하는 것이 아니라 합쳐진 세는 값에서 다시 계산한다.
-_COUNTED_QUALITY_KEYS = ("total_frames", "sensor_read_failures")
+_COUNTED_QUALITY_KEYS = ("total_frames", "sensor_read_failures", "episodes_aborted")
 _COUNTED_QUALITY_MAPS = ("camera_stale_frames", "sensor_implausible")
 
 

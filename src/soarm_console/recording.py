@@ -52,6 +52,8 @@ NAME_PATTERN = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\Z")
 # sustained slowdown visible to the operator before the episode is over.
 LOOP_HZ_WINDOW_S = 3.0
 LOOP_HZ_PUBLISH_S = 1.0
+MAX_CONSECUTIVE_CONNECTION_FAILURES = 3
+BUS_RECOVERY_DELAY_S = 0.1
 
 #: 스냅숏을 다시 쓰는 최대 빈도. 화면이 보여 주는 것은 사람이 보는 장면이지 데이터가
 #: 아니므로 5Hz면 충분하고, 그 위로 올리면 30Hz 루프에서 치르는 값만 커진다.
@@ -66,6 +68,11 @@ _episodes_saved = 0
 #: 0프레임이라 저장하지 않고 건너뛴 회차 수. 이것이 0이 아니면 무언가가 회를 시작하기도
 #: 전에 끝냈다는 뜻이고, 그 사실은 데이터셋 어디에도 남지 않으므로 여기서 센다.
 _empty_episodes_skipped = 0
+
+#: 버스 연결 오류로 버린 회차 수와, 저장 성공 없이 이어진 연결 오류 수. 첫 값은 화면과
+#: 품질 파일에 남기고, 둘째 값은 죽은 버스를 무한히 재시도하지 않기 위한 문턱에만 쓴다.
+_episodes_aborted = 0
+_consecutive_connection_failures = 0
 
 #: 직전 저장에 걸린 초. 다음 저장이 시작될 때 `saving_seconds_estimate`로 내보낸다 —
 #: 화면이 "약 N초"를 그릴 수 있는 유일한 근거는 방금 같은 일이 얼마나 걸렸는가다.
@@ -424,6 +431,8 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     fields we consume and forwarding every argument unchanged (apart from the
     transparent robot proxy) makes an upstream signature change fail loudly.
     """
+    global _consecutive_connection_failures, _episodes_aborted
+
     robot = kwargs["robot"]
     dataset = kwargs.get("dataset")
     control_time_s = kwargs["control_time_s"]
@@ -473,7 +482,25 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     # 표를 비운 **뒤에** 문을 연다. 순서가 반대면 그사이에 적용된 키가 곧바로 지워진다.
     _loop_running.set()
     try:
-        return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
+        try:
+            return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
+        except ConnectionError as exc:
+            _consecutive_connection_failures += 1
+            reason = " ".join(str(exc).splitlines())
+            if dataset is not None:
+                _episodes_aborted += 1
+                if isinstance(events, dict):
+                    # LeRobot이 사람이 ←를 누른 때와 같은 정리·버퍼 폐기 경로를 탄다.
+                    events["rerecord_episode"] = True
+                    events["exit_early"] = False
+            _write_status(
+                episodes_aborted=_episodes_aborted,
+                last_abort_reason=reason,
+            )
+            _recover_bus_ports(robot, kwargs.get("teleop"))
+            if _consecutive_connection_failures >= MAX_CONSECUTIVE_CONNECTION_FAILURES:
+                raise
+            return None
     finally:
         _loop_running.clear()
         monitor.stop()
@@ -483,6 +510,19 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
             # 끝나는 이 자리에서 걷어 와야 한다.
             _sensor_durations.extend(reader.durations)
             _write_status(session_quality=_sensor_quality_fields())
+
+
+def _recover_bus_ports(robot: object, teleop: object) -> None:
+    """버스의 남은 패킷만 버린다. 토크와 연결 상태는 절대 바꾸지 않는다."""
+    for device in (robot, teleop):
+        try:
+            bus = getattr(device, "bus", None)
+            port_handler = getattr(bus, "port_handler", None)
+            if port_handler is not None:
+                port_handler.clearPort()
+        except Exception:  # noqa: BLE001 - 회복 시도가 원래 회복 경로를 막으면 안 된다
+            pass
+    time.sleep(BUS_RECOVERY_DELAY_S)
 
 
 def _combine_feature_dicts_with_sensors(*dicts: dict) -> dict:
@@ -582,6 +622,7 @@ def _sensor_quality_fields() -> dict[str, object]:
     """`soarm_quality.json`이 실을, 이 세션에서 실제로 센 값들."""
     return {
         "total_frames": _total_frames,
+        "episodes_aborted": _episodes_aborted,
         "camera_stale_frames": dict(_camera_stale_frames),
         "camera_stale_pct": {
             key: (100.0 * count / _total_frames) if _total_frames else 0.0
@@ -636,7 +677,7 @@ def _save_episode_with_status(self, *args: object, **kwargs: object) -> object:
     속도 값은 건드리지 않는다. 여기 남아 있는 `loop_hz`는 방금 저장하는 그 회차가 실제로
     돈 속도이고, `record_manager`가 `soarm_quality.json`에 적는 것도 그 값이다.
     """
-    global _saving_seconds
+    global _consecutive_connection_failures, _saving_seconds
 
     episode_data = args[0] if args else kwargs.get("episode_data")
     if _episode_buffer_size(self, episode_data) == 0:
@@ -649,11 +690,16 @@ def _save_episode_with_status(self, *args: object, **kwargs: object) -> object:
         saving_seconds_estimate=_saving_seconds,
     )
     started = time.perf_counter()
+    save_succeeded = False
     try:
-        return _ORIGINAL_SAVE_EPISODE(self, *args, **kwargs)
+        result = _ORIGINAL_SAVE_EPISODE(self, *args, **kwargs)
+        save_succeeded = True
+        return result
     finally:
         _saving_seconds = round(time.perf_counter() - started, 2)
         _note_episodes_saved(int(self.num_episodes))
+        if save_succeeded:
+            _consecutive_connection_failures = 0
         # `phase`는 여기서 되돌리지 않는다. 다음 `record_loop`가 자기 구간을 적는다.
         _write_status(episodes_saved=_episodes_saved)
 
@@ -993,6 +1039,8 @@ def main() -> None:
             reset_seconds=int(config.dataset.reset_time_s),
             episodes_saved=_episodes_saved,
             empty_episodes_skipped=_empty_episodes_skipped,
+            episodes_aborted=_episodes_aborted,
+            last_abort_reason=None,
             saving_seconds_estimate=None,
             session_quality=_sensor_quality_fields(),
             last_control=None,

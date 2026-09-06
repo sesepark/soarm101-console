@@ -555,6 +555,7 @@ def test_status_names_every_capability_the_app_looks_for():
         "replay_preview",
         "soft_start",
         "sensor_extras",
+        "policy_home",
     ]
 
 

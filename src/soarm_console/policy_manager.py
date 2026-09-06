@@ -40,6 +40,8 @@ class PolicyManager:
         self._chunk_seconds: float | None = None
         self._chunks: int | None = None
         self._camera_map: dict[str, str] = {}
+        self._home: dict[str, float] = {}
+        self._phase = "running"
         self.other_mode_problem: Callable[[], str | None] | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/policy"
         self.log_path = self.runtime_dir / "policy.log"
@@ -80,7 +82,15 @@ class PolicyManager:
                 problems.extend(str(problem) for problem in model["problems"])
         return problems
 
-    def start(self, run: str, step: str, task: str, fps: float, max_seconds: float) -> None:
+    def start(
+        self,
+        run: str,
+        step: str,
+        task: str,
+        fps: float,
+        max_seconds: float,
+        home: dict[str, float] | None = None,
+    ) -> None:
         if not task.strip():
             raise TeleopError("A task description is required")
         if not 1 <= fps <= 60:
@@ -105,6 +115,8 @@ class PolicyManager:
             self._started_at, self._expires_at = now, now + max_seconds
             self._fps_target = fps
             self._camera_map = dict(model["camera_map"])
+            self._home = dict(home or {})
+            self._phase = "aligning" if home is not None else "running"
             env = os.environ.copy()
             env.update(
                 {
@@ -113,6 +125,7 @@ class PolicyManager:
                     "SOARM_POLICY_TASK": task.strip(),
                     "SOARM_POLICY_FPS": f"{fps:g}",
                     "SOARM_POLICY_MAX_SECONDS": f"{max_seconds:g}",
+                    "SOARM_POLICY_HOME": json.dumps(home) if home is not None else "",
                 }
             )
             devices = [
@@ -174,6 +187,9 @@ class PolicyManager:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
         error = runtime.get("error")
+        runtime_phase = runtime.get("phase")
+        if runtime_phase in {"aligning", "running"}:
+            self._phase = str(runtime_phase)
         if error is None and process is not None and process.poll() not in (None, 0):
             error = self._logs[-1] if self._logs else f"Policy process exited with code {process.poll()}"
         return {
@@ -188,6 +204,8 @@ class PolicyManager:
             "chunk_seconds": self._chunk_seconds,
             "chunks": self._chunks,
             "camera_map": dict(self._camera_map),
+            "home": dict(self._home),
+            "phase": self._phase,
             "max_relative_target": self.settings.policy_max_relative_target,
             "inference": "rtc",
             "log_tail": list(self._logs)[-100:],

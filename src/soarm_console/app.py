@@ -51,6 +51,7 @@ from .replaying import (
     present_position,
     unit_of,
 )
+from .policying import validate_home
 from .teleop import TeleopError, TeleopManager
 from .torque import TorqueError
 from .torque import release as release_torque_on
@@ -199,6 +200,8 @@ CAPABILITIES = [
     # 수집이 서보의 나머지 판독값(부하·속도·온도·전압·상태·이동·전류)과 프레임 시각,
     # 카메라 새 프레임 여부를 별도 열로 함께 남긴다.
     "sensor_extras",
+    # 정책 rollout 전에 재생과 같은 느린 정렬로 지정 자세까지 간다.
+    "policy_home",
 ]
 
 
@@ -225,6 +228,7 @@ class PolicyRequest(BaseModel):
     task: str
     fps: float = 30
     max_seconds: float = 120
+    home: dict[str, float] | None = None
 
 
 class CameraSettingsRequest(BaseModel):
@@ -1007,6 +1011,10 @@ def stop_replay() -> dict[str, object]:
 def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
     """Run a local model through LeRobot rollout after every motion gate passes."""
     _authorise_motion(_token_from(request))
+    try:
+        home = validate_home(settings, body.home)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not body.task.strip():
         raise HTTPException(status_code=400, detail="A task description is required")
     if not 1 <= body.fps <= 60:
@@ -1032,7 +1040,7 @@ def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
     for worker in cameras.values():
         worker.stop()
     try:
-        policy_manager.start(body.run, body.step, body.task, body.fps, body.max_seconds)
+        policy_manager.start(body.run, body.step, body.task, body.fps, body.max_seconds, home)
     except TeleopError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return policy_manager.status()

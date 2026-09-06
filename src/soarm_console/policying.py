@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import signal
+import threading
 import time
 from math import isfinite
 from pathlib import Path
@@ -11,10 +13,89 @@ from .config import Settings
 from .calibration import validate_calibration
 from .models import describe_model, model_dir
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
+from .replaying import REPLAY_ALIGNMENT, _connect, align
+from .vleader.spec import JOINT_ORDER, SpecError, load_joint_specs
 
 
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/policy"
 STATUS_PATH = RUNTIME_DIR / "status.json"
+
+
+def validate_home(settings: Settings, home: dict[str, float] | None) -> dict[str, float] | None:
+    """요청 자세를 팔로워 calibration의 좌표계와 절대 범위에 맞춰 검증한다."""
+    if home is None:
+        return None
+    expected = set(JOINT_ORDER)
+    received = set(home)
+    if received != expected:
+        unknown = sorted(received - expected)
+        missing = sorted(expected - received)
+        details = []
+        if unknown:
+            details.append(f"unknown joints: {unknown}")
+        if missing:
+            details.append(f"missing joints: {missing}")
+        raise ValueError("home joints do not match the follower (" + "; ".join(details) + ")")
+    try:
+        specs = load_joint_specs(settings.follower_calibration)
+    except SpecError as exc:
+        raise ValueError(str(exc)) from exc
+    result: dict[str, float] = {}
+    for spec in specs:
+        value = float(home[spec.name])
+        if not isfinite(value):
+            raise ValueError(f"home {spec.name} must be a finite number (received {value})")
+        if not spec.contains(value):
+            unit = "%" if spec.unit == "percent" else "°"
+            raise ValueError(
+                f"home {spec.name} {value:g}{unit} is outside calibration range "
+                f"{spec.minimum:.1f}~{spec.maximum:.1f}{unit}"
+            )
+        result[spec.name] = value
+    return result
+
+
+def align_home(
+    settings: Settings,
+    home: dict[str, float] | None,
+    stop_requested: threading.Event,
+) -> bool:
+    """정책 시작 자세로 재생과 똑같이 정렬한다. 자세가 없으면 팔에 연결하지 않는다."""
+    if home is None:
+        return False
+    robot = _connect(settings)
+    try:
+        start = {
+            name: float(value)
+            for name, value in robot.bus.sync_read("Present_Position", num_retry=2).items()
+        }
+
+        published = 0.0
+
+        def publish(index: int, total: int, seconds_left: float) -> None:
+            nonlocal published
+            now = time.perf_counter()
+            if index == 0 or now - published >= 0.1 or index == total:
+                published = now
+                _write_status(
+                    phase="aligning",
+                    home=home,
+                    frame=index,
+                    total_frames=total,
+                    aligning_seconds_left=seconds_left,
+                    error=None,
+                )
+
+        return align(
+            robot,
+            start,
+            home,
+            should_stop=stop_requested.is_set,
+            limits=REPLAY_ALIGNMENT,
+            progress=publish,
+        )
+    finally:
+        robot.disconnect()
 
 
 def _write_status(**values: object) -> None:
@@ -86,6 +167,7 @@ def main() -> None:
     run = os.getenv("SOARM_POLICY_RUN", "")
     step = os.getenv("SOARM_POLICY_STEP", "")
     task = os.getenv("SOARM_POLICY_TASK", "")
+    raw_home = os.getenv("SOARM_POLICY_HOME", "")
     try:
         fps = float(os.getenv("SOARM_POLICY_FPS", "30"))
         max_seconds = float(os.getenv("SOARM_POLICY_MAX_SECONDS", "120"))
@@ -105,6 +187,13 @@ def main() -> None:
         raise SystemExit(
             "Refusing policy rollout: SOARM_POLICY_MAX_RELATIVE_TARGET must be positive and finite"
         )
+    try:
+        decoded_home = json.loads(raw_home) if raw_home else None
+        if decoded_home is not None and not isinstance(decoded_home, dict):
+            raise ValueError("home is not an object")
+        home = validate_home(settings, decoded_home)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Refusing policy rollout: invalid home: {exc}") from exc
     devices = [settings.follower_port, settings.scene_camera, settings.wrist_camera]
     try:
         lock_context = (
@@ -119,14 +208,38 @@ def main() -> None:
     from lerobot.scripts import lerobot_rollout
 
     with lock_context or nullcontext():
-        config = build_rollout_config(settings, run, step, task, fps, max_seconds)
-        _write_status(phase="starting", run=run, step=step, task=task)
+        stop_requested = threading.Event()
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: stop_requested.set())
+        phase = "aligning" if home is not None else "running"
+        _write_status(
+            phase=phase, home=home or {}, run=run, step=step, task=task, error=None
+        )
         try:
+            stopped = align_home(settings, home, stop_requested)
+            if stopped:
+                _write_status(phase="aligning", home=home or {}, run=run, step=step, task=task)
+                return
+            # rollout은 자신의 SIGTERM teardown으로 시작 자세에 돌아간다. 정렬용 핸들러를
+            # 여기까지 끌고 가면 그 정상 종료 신호를 삼키므로 반드시 원래 처리로 되돌린다.
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            config = build_rollout_config(settings, run, step, task, fps, max_seconds)
+            phase = "running"
+            _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
             lerobot_rollout.rollout(config)
-            _write_status(phase="complete", run=run, step=step, task=task)
+            _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
         except BaseException as exc:
-            _write_status(phase="error", run=run, step=step, task=task, error=str(exc))
+            _write_status(
+                phase=phase,
+                home=home or {},
+                run=run,
+                step=step,
+                task=task,
+                error=str(exc),
+            )
             raise
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

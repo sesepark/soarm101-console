@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,10 +13,39 @@ from soarm_console import models, policying, spark
 from soarm_console.config import Settings
 from soarm_console.datasets import DatasetError
 from soarm_console.policy_manager import PolicyManager
+from soarm_console.replaying import REPLAY_ALIGNMENT
 
 
 RUN = "soarm101_pick__smolvla__e315"
 STEP = "020000"
+HOME = {
+    "shoulder_pan": 1.2,
+    "shoulder_lift": -30.0,
+    "elbow_flex": 40.0,
+    "wrist_flex": 10.0,
+    "wrist_roll": 0.0,
+    "gripper": 8.0,
+}
+CALIBRATION = {
+    "shoulder_pan": {
+        "id": 1, "drive_mode": 0, "homing_offset": 0, "range_min": 758, "range_max": 3447
+    },
+    "shoulder_lift": {
+        "id": 2, "drive_mode": 0, "homing_offset": 0, "range_min": 1360, "range_max": 3746
+    },
+    "elbow_flex": {
+        "id": 3, "drive_mode": 0, "homing_offset": 0, "range_min": 996, "range_max": 3200
+    },
+    "wrist_flex": {
+        "id": 4, "drive_mode": 0, "homing_offset": 0, "range_min": 577, "range_max": 2913
+    },
+    "wrist_roll": {
+        "id": 5, "drive_mode": 0, "homing_offset": 0, "range_min": 0, "range_max": 4095
+    },
+    "gripper": {
+        "id": 6, "drive_mode": 0, "homing_offset": 0, "range_min": 1656, "range_max": 3100
+    },
+}
 
 
 @pytest.fixture
@@ -66,6 +96,16 @@ def _settings(**overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+@pytest.fixture
+def policy_settings(tmp_path, monkeypatch):
+    root = tmp_path / "calibration"
+    path = root / "robots/so_follower/soarm101_follower.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(CALIBRATION), encoding="utf-8")
+    monkeypatch.setenv("HF_LEROBOT_CALIBRATION", str(root))
+    return _settings()
 
 
 def test_manifest_is_derived_from_the_two_received_configs(model_root):
@@ -187,6 +227,53 @@ def test_rollout_config_uses_rtc_duration_camera_rename_and_policy_limit(model_r
     }
 
 
+def test_policy_home_is_validated_in_follower_units_and_calibration(policy_settings):
+    assert policying.validate_home(policy_settings, HOME) == HOME
+
+    with pytest.raises(ValueError, match=r"unknown joints.*mystery"):
+        policying.validate_home(policy_settings, {**HOME, "mystery": 1.0})
+    with pytest.raises(ValueError, match=r"elbow_flex 400.*outside calibration range"):
+        policying.validate_home(policy_settings, {**HOME, "elbow_flex": 400.0})
+
+
+def test_policy_home_alignment_uses_replay_s_curve_and_exact_goal(policy_settings, monkeypatch):
+    class Bus:
+        def sync_read(self, register, num_retry=0):
+            assert register == "Present_Position"
+            return {name: 0.0 for name in HOME}
+
+    class Robot:
+        bus = Bus()
+
+        def disconnect(self):
+            pass
+
+    received = {}
+    monkeypatch.setattr(policying, "_connect", lambda settings: Robot())
+
+    def fake_align(robot, start, goal, *, should_stop, limits, progress):
+        received.update(start=start, goal=goal, limits=limits)
+        progress(0, 1, 2.0)
+        return False
+
+    monkeypatch.setattr(policying, "align", fake_align)
+    monkeypatch.setattr(policying, "_write_status", lambda **values: None)
+
+    assert policying.align_home(policy_settings, HOME, threading.Event()) is False
+    assert received["goal"] == HOME
+    assert received["limits"] is REPLAY_ALIGNMENT
+
+
+def test_policy_without_home_skips_alignment_and_hardware(policy_settings, monkeypatch):
+    monkeypatch.setattr(
+        policying,
+        "_connect",
+        lambda settings: pytest.fail("home 없는 정책은 정렬용 팔 연결을 열면 안 된다"),
+    )
+
+    assert policying.align_home(policy_settings, None, threading.Event()) is False
+
+
 @pytest.fixture
 def client(model_root, monkeypatch):
     from soarm_console import app as app_module
@@ -207,6 +294,42 @@ def _policy_body(**overrides):
 def test_policy_start_requires_the_motion_token_before_model_lookup(client):
     response = client.post("/api/policy/start", json=_policy_body())
     assert response.status_code == 401
+
+
+def test_policy_start_rejects_unknown_home_joint_as_400(client):
+    response = client.post(
+        "/api/policy/start",
+        json=_policy_body(home={**HOME, "mystery": 1.0}),
+        headers={"X-SOARM-Motion-Token": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert "mystery" in response.json()["detail"]
+
+
+def test_policy_start_rejects_home_outside_calibration_as_400(client, policy_settings):
+    response = client.post(
+        "/api/policy/start",
+        json=_policy_body(home={**HOME, "elbow_flex": 400.0}),
+        headers={"X-SOARM-Motion-Token": "secret"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "elbow_flex" in detail
+    assert "400" in detail
+    assert "outside calibration range" in detail
+
+
+def test_policy_status_exposes_used_home_and_phase():
+    manager = PolicyManager(_settings())
+    manager._home = dict(HOME)
+    manager._phase = "aligning"
+
+    result = manager.status()
+
+    assert result["home"] == HOME
+    assert result["phase"] == "aligning"
 
 
 def test_policy_start_refuses_a_missing_model(client):

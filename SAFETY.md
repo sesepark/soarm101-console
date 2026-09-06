@@ -94,6 +94,9 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 
 중지는 서브프로세스에 SIGTERM을 보내 LeRobot의 `ProcessSignalHandler`와 teardown을 지나게
 한다. `return_to_initial_position=true`이므로 정상 teardown은 팔을 시작 자세로 되돌린다.
+정책 요청에 `home`이 있으면 rollout을 열기 전에 재생과 같은 느린 s-curve(첨두 20°/s)로
+그 자세까지 옮긴다. 따라서 LeRobot이 기억하는 시작 자세가 곧 `home`이고, 종료 복귀는 기존
+`return_to_initial_position=true` 하나만 맡는다. 별도의 두 번째 복귀 동작은 만들지 않는다.
 SIGKILL은 SIGTERM 뒤 20초에도 자식이 남는 마지막 수단뿐이다. `/api/mode/stop`은 정책을 가장
 먼저 세운다. 이 경로도 충돌 회피나 독립 전원 차단을 제공하지 않으며, 실물 검증은 현장 관찰자와
 전원 차단 수단이 있을 때 별도로 해야 한다.

@@ -127,13 +127,17 @@ Hardware ownership은 command lease와 별개다.
 | `GET` | `/api/models` | 로컬 모델 명세, `camera_map`, `runnable`, 문장형 `problems` |
 | `POST` | `/api/models/{run}/{step}` | Spark 체크포인트를 `models/`로 회수하고 명세 생성 |
 | `DELETE` | `/api/models/{run}/{step}` | 로컬 사본 삭제, `{run, step, freed_bytes}` 반환 |
-| `POST` | `/api/policy/start` | `{run, step, task, fps, max_seconds}`로 rollout 시작 |
+| `POST` | `/api/policy/start` | `{run, step, task, fps, max_seconds, home?}`로 rollout 시작 |
 | `POST` | `/api/policy/stop` | SIGTERM으로 rollout teardown 시작 |
 
 `POST /api/policy/start`는 `X-SOARM-Motion-Token`을 요구한다. `max_seconds`는 기본 120,
+`home`은 선택적인 관절 자세 객체다. 관절은 도, `gripper`는 퍼센트이며, 주어지면 재생과
+같은 s-curve/20°/s 첨두 속도로 먼저 그 자세에 정렬한 뒤 rollout을 시작한다. 이름은 팔로워의
+여섯 관절과 정확히 같아야 하고 calibration 범위 밖 값은 400으로 거절한다. `/api/status`의
+`policy.home`은 실제 사용한 자세(없으면 `{}`), `policy.phase`는 `aligning` 또는 `running`이다.
 허용 범위 1–600초이고 LeRobot `RolloutConfig.duration`에 그대로 들어간다. `/api/status`와
 시작·중지 응답의 `policy` 상태에는 `run`, `step`, `task`, `started_at`, `expires_at`,
-`fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `max_relative_target`,
+`fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `home`, `phase`, `max_relative_target`,
 `inference`, `log_tail`, `error`가 실린다. 측정할 수 없는 성능 값은 `null`이다.
 
 Spark의 실행 목록은 sparkq `GET /api/runs`가 소유한다. 따라서 콘솔의

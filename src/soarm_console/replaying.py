@@ -8,6 +8,7 @@ from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from typing import Callable
 
 from .calibration import validate_calibration
 from .config import WIDEST_JOINT_SPAN, Settings
@@ -400,29 +401,62 @@ class _StopListener:
         self.thread.join(timeout=0.5)
 
 
-def _align(robot, start: dict[str, float], goal: dict[str, float], listener: _StopListener) -> bool:
-    """지금 자세에서 에피소드의 첫 action까지 천천히 간다. 멈춰서 끝났으면 참."""
+def align(
+    robot,
+    start: dict[str, float],
+    goal: dict[str, float],
+    *,
+    should_stop: Callable[[], bool],
+    limits: AlignmentLimits = REPLAY_ALIGNMENT,
+    progress: Callable[[int, int, float], None] | None = None,
+) -> bool:
+    """같은 s-curve로 ``goal``까지 간다. 중간에 멈췄으면 참.
+
+    재생과 정책의 시작 자세 정렬이 이 한 루프를 함께 쓴다. ``progress``는 상태 파일만
+    각 모드의 것으로 나눠 쓰게 하는 경계다. 움직임을 만드는 프레임, 속도표, 틱 간격은
+    이 함수 안에 하나만 남는다.
+    """
     from lerobot.utils.robot_utils import precise_sleep
 
     # 두 값이 같은 곳에서 나와야 한다. 보간이 만든 프레임 수와 틱 간격이 어긋나면
     # 정렬은 계획한 시간이 아니라 다른 시간에 걸쳐 도착한다.
-    frames = alignment_frames(start, goal, ALIGN_HZ, REPLAY_ALIGNMENT)
+    frames = alignment_frames(start, goal, ALIGN_HZ, limits)
     period = 1.0 / ALIGN_HZ
     total = len(frames)
-    _write_status(phase="aligning", frame=0, aligning_seconds_left=round(total * period, 2))
-    published = 0.0
+    if progress is not None:
+        progress(0, total, round(total * period, 2))
     for index, frame in enumerate(frames, start=1):
-        if listener.stopped:
+        if should_stop():
             return True
         tick = time.perf_counter()
         robot.send_action({f"{name}.pos": value for name, value in frame.items()})
-        now = time.perf_counter()
-        if now - published >= STATUS_PUBLISH_S:
-            published = now
-            _write_status(aligning_seconds_left=round((total - index) * period, 2))
+        if progress is not None:
+            progress(index, total, round((total - index) * period, 2))
         precise_sleep(max(period - (time.perf_counter() - tick), 0.0))
-    _write_status(aligning_seconds_left=0.0)
     return False
+
+
+def _align(robot, start: dict[str, float], goal: dict[str, float], listener: _StopListener) -> bool:
+    """지금 자세에서 에피소드의 첫 action까지 천천히 간다. 멈춰서 끝났으면 참."""
+    published = 0.0
+
+    def publish(index: int, total: int, seconds_left: float) -> None:
+        nonlocal published
+        now = time.perf_counter()
+        if index == 0:
+            _write_status(phase="aligning", frame=0, aligning_seconds_left=seconds_left)
+        elif now - published >= STATUS_PUBLISH_S or index == total:
+            published = now
+            _write_status(aligning_seconds_left=seconds_left)
+
+    return align(
+        robot,
+        start,
+        goal,
+        should_stop=lambda: listener.stopped,
+        limits=REPLAY_ALIGNMENT,
+        progress=publish,
+    )
 
 
 def _replay(

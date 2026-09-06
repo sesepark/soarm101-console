@@ -41,6 +41,11 @@ ALIGN_PERCENT_PER_SECOND = 25.0
 ALIGN_MIN_SECONDS = 2.0
 ALIGN_MAX_SECONDS = 15.0
 
+# 정책 정렬이 도착 오차와 실제로 가지 못한 동작을 가르는 경계. 가상 리더의 정상 프로필과
+# config/soarm.env의 SOARM_VL_FOLLOW_ERROR_DEG/PERCENT가 쓰는 값과 같다.
+ALIGN_FOLLOW_ERROR_DEG = 8.0
+ALIGN_FOLLOW_ERROR_PERCENT = 8.0
+
 #: 이만큼 떨어져 있으면 **시작하지 않는다.**
 #:
 #: 한때 60도였다. 통상 흐름에서는 걸리지 않는 값이었지만, 걸리면 빠져나올 길이 없었다 —

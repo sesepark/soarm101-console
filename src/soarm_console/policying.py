@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import signal
 import threading
@@ -13,15 +14,53 @@ from .config import Settings
 from .calibration import validate_calibration
 from .models import describe_model, model_dir
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
-from .replaying import REPLAY_ALIGNMENT, ReplayError, _connect, align, present_position
+from .replaying import (
+    ALIGN_FOLLOW_ERROR_DEG,
+    ALIGN_FOLLOW_ERROR_PERCENT,
+    REPLAY_ALIGNMENT,
+    ReplayError,
+    _connect,
+    align,
+    present_position,
+)
 from .vleader.spec import JOINT_ORDER, SpecError, load_joint_specs
 
 
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/policy"
 STATUS_PATH = RUNTIME_DIR / "status.json"
 ALIGNMENT_ARRIVAL_TIMEOUT_S = 30.0
-ALIGNMENT_TOLERANCE_DEG = 1.0
-ALIGNMENT_TOLERANCE_PERCENT = 2.0
+ALIGNMENT_SETTLE_S = 2.0
+# 이 팔에서 잰 정상상태 오차 최대 1.06도의 약 3배이며, 8도 follow-error 경계보다
+# 충분히 안쪽이다. 집게도 같은 여유를 주어 도착 판정 단위를 일관되게 유지한다.
+ALIGNMENT_TOLERANCE_DEG = 3.0
+ALIGNMENT_TOLERANCE_PERCENT = 3.0
+ALIGNMENT_SETTLE_POLL_S = 0.1
+
+logger = logging.getLogger(__name__)
+
+
+def _alignment_distances(
+    current: dict[str, float], home: dict[str, float]
+) -> dict[str, float]:
+    return {name: abs(home[name] - current[name]) for name in home}
+
+
+def _outside_arrival_tolerance(distances: dict[str, float]) -> dict[str, float]:
+    return {
+        name: distance
+        for name, distance in distances.items()
+        if distance
+        > (ALIGNMENT_TOLERANCE_PERCENT if name == "gripper" else ALIGNMENT_TOLERANCE_DEG)
+    }
+
+
+def _outside_follow_error(distances: dict[str, float]) -> dict[str, float]:
+    return {
+        name: distance
+        for name, distance in distances.items()
+        if distance
+        > (ALIGN_FOLLOW_ERROR_PERCENT if name == "gripper" else ALIGN_FOLLOW_ERROR_DEG)
+    }
 
 
 def validate_home(settings: Settings, home: dict[str, float] | None) -> dict[str, float] | None:
@@ -109,15 +148,81 @@ def align_home(
                 name: float(value)
                 for name, value in robot.bus.sync_read("Present_Position", num_retry=2).items()
             }
-            outside = {
-                name: abs(home[name] - current[name])
-                for name in home
-                if abs(home[name] - current[name])
-                > (ALIGNMENT_TOLERANCE_PERCENT if name == "gripper" else ALIGNMENT_TOLERANCE_DEG)
-            }
+            if stop_requested.is_set():
+                return True
+            outside = _outside_arrival_tolerance(_alignment_distances(current, home))
+            if stopped:
+                if not outside:
+                    _write_status(alignment_residual={})
+                    return False
+                detail = ", ".join(
+                    f"{name} {distance:.1f}" for name, distance in sorted(outside.items())
+                )
+                raise ReplayError(
+                    f"Policy {phase} did not reach its target within "
+                    f"{ALIGNMENT_ARRIVAL_TIMEOUT_S:g}s (remaining: {detail})"
+                )
+
+            if time.monotonic() >= deadline:
+                if not outside:
+                    _write_status(alignment_residual={})
+                    return False
+                detail = ", ".join(
+                    f"{name} {distance:.1f}" for name, distance in sorted(outside.items())
+                )
+                raise ReplayError(
+                    f"Policy {phase} did not reach its target within "
+                    f"{ALIGNMENT_ARRIVAL_TIMEOUT_S:g}s (remaining: {detail})"
+                )
+
+            # align()의 마지막 프레임이 반환 직전에 목표를 보냈더라도, 목표를 다시 고정한
+            # 뒤 서보가 실제로 정착할 시간을 준다. send_action이 없는 최소 Robot 대역은
+            # 목표를 고정할 수 없으므로 종전처럼 측정 위치에서 다시 align한다.
+            send_action = getattr(robot, "send_action", None)
+            if send_action is None:
+                if not outside:
+                    _write_status(alignment_residual={})
+                    return False
+                continue
+            send_action({f"{name}.pos": value for name, value in home.items()})
+
+            settle_deadline = min(deadline, time.monotonic() + ALIGNMENT_SETTLE_S)
+            while True:
+                outside = _outside_arrival_tolerance(_alignment_distances(current, home))
+                if not outside:
+                    _write_status(alignment_residual={})
+                    return False
+                if stop_requested.is_set():
+                    return True
+                now = time.monotonic()
+                if now >= settle_deadline:
+                    break
+                if stop_requested.wait(min(ALIGNMENT_SETTLE_POLL_S, settle_deadline - now)):
+                    return True
+                current = {
+                    name: float(value)
+                    for name, value in robot.bus.sync_read("Present_Position", num_retry=2).items()
+                }
+
+            distances = _alignment_distances(current, home)
+            outside = _outside_arrival_tolerance(distances)
             if not outside:
+                _write_status(alignment_residual={})
                 return False
-            if stopped or time.monotonic() >= deadline:
+            too_far = _outside_follow_error(distances)
+            if not too_far:
+                residual = {name: round(distance, 3) for name, distance in sorted(outside.items())}
+                _write_status(alignment_residual=residual)
+                logger.warning(
+                    "Policy %s continuing with settled alignment residual: %s",
+                    phase,
+                    ", ".join(f"{name} {distance:.1f}" for name, distance in residual.items()),
+                )
+                return False
+
+            # 8도/8%를 넘는 실패만 재접근한다. 이는 도착 허용치의 두 배보다도 커서,
+            # 정착으로 해결할 작은 오차에 2초짜리 최소 s-curve를 다시 만들지 않는다.
+            if time.monotonic() >= deadline:
                 detail = ", ".join(
                     f"{name} {distance:.1f}" for name, distance in sorted(outside.items())
                 )
@@ -131,8 +236,14 @@ def align_home(
 
 def _write_status(**values: object) -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    current: dict[str, object] = {}
+    try:
+        current = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
     temporary = STATUS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps({**values, "updated_at": time.time()}), encoding="utf-8")
+    current.update(values, updated_at=time.time())
+    temporary.write_text(json.dumps(current), encoding="utf-8")
     os.replace(temporary, STATUS_PATH)
 
 
@@ -244,7 +355,13 @@ def main() -> None:
         signal.signal(signal.SIGTERM, lambda _signum, _frame: stop_requested.set())
         phase = "aligning" if home is not None else "running"
         _write_status(
-            phase=phase, home=home or {}, run=run, step=step, task=task, error=None
+            phase=phase,
+            home=home or {},
+            run=run,
+            step=step,
+            task=task,
+            error=None,
+            alignment_residual={},
         )
         try:
             stopped = align_home(settings, home, stop_requested, phase="aligning")
@@ -272,7 +389,14 @@ def main() -> None:
                     signal.SIGTERM,
                     lambda _signum, _frame: return_stop_requested.set(),
                 )
-                _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
+                _write_status(
+                    phase=phase,
+                    home=home or {},
+                    run=run,
+                    step=step,
+                    task=task,
+                    alignment_residual={},
+                )
                 try:
                     align_home(
                         settings,

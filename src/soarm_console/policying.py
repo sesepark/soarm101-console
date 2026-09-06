@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -247,6 +248,49 @@ def _write_status(**values: object) -> None:
     os.replace(temporary, STATUS_PATH)
 
 
+#: RTC가 새 청크를 앞 계획에 이어 붙이도록 유도하는 구간의 길이(프레임).
+#:
+#: 기본값 10으로 두면 팔이 **0.73초마다 툭툭 끊긴다.** 두 숫자가 어긋나기 때문이다.
+#: 큐(`ActionQueue._replace_actions_queue`)는 새 청크의 앞 `real_delay`개를 버리는데,
+#: 이 기계에서 잰 `real_delay`는 **19프레임(0.63초)**다(2026-09-06 13:14 rollout에서
+#: 병합 52회의 중앙값). 유도가 앞 10개에만 걸리면 그 10개는 버려지는 19개 안에 통째로
+#: 들어가고, **실제로 실행되는 부분(19번째부터)에는 연속성 제약이 하나도 남지 않는다.**
+#: 그래서 0.73초마다 지금 하던 동작과 무관한 계획으로 갈아타게 되고, 위치 제어 서보에서
+#: 위치의 불연속은 곧 충격이다.
+#:
+#: 25를 고른 것은 두 값 사이여서다: **19 < 25 < 30**.
+#: - 19보다 커야 버려지는 구간을 덮어서 이음매가 유도 안으로 들어온다.
+#: - 30(`RTCInferenceConfig.queue_threshold`)보다는 작아야 한다. 추론은 큐가 30개 밑으로
+#:   내려갈 때 시작하면서 그때 남은 것을 앞 계획으로 넘기는데, 그것이 이 값보다 짧으면
+#:   `_normalize_prev_actions_length`가 **0으로 채운다.** 정규화된 공간에서 0은 "움직이지
+#:   않음"이 아니라 데이터셋의 평균 자세라, 엉뚱한 자리로 유도하게 된다.
+RTC_EXECUTION_HORIZON = 25
+
+
+def _inference_config(policy_type: str):
+    """이 정책에 맞는 추론 방식.
+
+    RTC는 아무 정책이나 쓸 수 있는 것이 아니다. `predict_action_chunk`가 `inference_delay`와
+    `prev_chunk_left_over`를 받아야 하고(SmolVLA·pi0 계열은 받고 **ACT는 받지 않는다**),
+    받지 않는 정책에 RTC를 걸면 lerobot이 rollout을 시작하기도 전에 `ValueError`를 낸다.
+    콘솔은 지금까지 정책 종류와 무관하게 RTC를 걸고 있었으므로, ACT 체크포인트를 팔에
+    올리는 길은 **반드시 실패했을 것이다.** 종류를 보고 고른다.
+    """
+    from lerobot.rollout.inference import RTCInferenceConfig, SyncInferenceConfig
+
+    try:
+        from lerobot.policies.factory import get_policy_class
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+        chunk = get_policy_class(policy_type).predict_action_chunk
+        inspect.signature(chunk).bind(
+            object(), object(), inference_delay=0, prev_chunk_left_over=None
+        )
+    except (TypeError, ValueError, KeyError, ImportError, AttributeError):
+        return SyncInferenceConfig()
+    return RTCInferenceConfig(rtc=RTCConfig(execution_horizon=RTC_EXECUTION_HORIZON))
+
+
 def build_rollout_config(
     settings: Settings,
     run: str,
@@ -260,7 +304,6 @@ def build_rollout_config(
     from lerobot.configs import PreTrainedConfig
     from lerobot.robots.so_follower import SO101FollowerConfig
     from lerobot.rollout.configs import BaseStrategyConfig, RolloutConfig
-    from lerobot.rollout.inference import RTCInferenceConfig
 
     model = describe_model(run, step)
     if not model["runnable"]:
@@ -293,7 +336,7 @@ def build_rollout_config(
         robot=robot,
         policy=policy,
         strategy=BaseStrategyConfig(),
-        inference=RTCInferenceConfig(),
+        inference=_inference_config(policy_type),
         fps=fps,
         duration=max_seconds,
         task=task.strip(),

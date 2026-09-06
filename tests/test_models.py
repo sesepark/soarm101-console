@@ -423,6 +423,20 @@ def test_policy_status_exposes_used_home_and_phase(tmp_path):
     assert returning["running"] is True
 
 
+def test_policy_status_exposes_alignment_residual_or_empty_object(tmp_path):
+    manager = PolicyManager(_settings())
+    manager.runtime_dir = tmp_path
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"alignment_residual": {"elbow_flex": 5.0}}), encoding="utf-8"
+    )
+
+    assert manager.status()["alignment_residual"] == {"elbow_flex": 5.0}
+
+    status_path.unlink()
+    assert manager.status()["alignment_residual"] == {}
+
+
 @pytest.mark.parametrize("requested_home", [HOME, None])
 def test_policy_main_returns_to_requested_or_captured_home(
     policy_settings, monkeypatch, requested_home

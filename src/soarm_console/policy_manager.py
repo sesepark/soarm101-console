@@ -187,6 +187,7 @@ class PolicyManager:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
         error = runtime.get("error")
+        alignment_residual = runtime.get("alignment_residual", {})
         runtime_phase = runtime.get("phase")
         if runtime_phase in {"aligning", "running", "returning"}:
             self._phase = str(runtime_phase)
@@ -210,6 +211,7 @@ class PolicyManager:
             "inference": "rtc",
             "log_tail": list(self._logs)[-100:],
             "error": error,
+            "alignment_residual": alignment_residual,
         }
 
     def _collect_logs(self) -> None:

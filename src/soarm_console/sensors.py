@@ -180,7 +180,7 @@ class PlausibleRange:
 #: 세기만 하는 열들. 나머지 열에는 기준이 없다 — 부하·속도·전류는 어긋난 바이트도
 #: 그럴듯한 값이 되므로 문턱을 두는 것이 오히려 "이 열은 검사했다"는 잘못된 인상을 준다.
 PLAUSIBLE_RANGES = (
-    PlausibleRange("observation.temperature", "temperature", 0.0, 100.0, False, "C"),
+    PlausibleRange("observation.temperature", "temperature", 0.0, 70.0, False, "C"),
     PlausibleRange("observation.voltage", "voltage", 5.0, 15.0, True, "V"),
 )
 

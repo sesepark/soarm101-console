@@ -541,7 +541,7 @@ def test_implausible_readings_are_counted_per_field_and_never_clamped(counters):
     # 관절 여섯이 모두 그 값이므로 여섯씩이다 — 세는 단위는 프레임이 아니라 판독이다.
     assert quality["sensor_implausible"] == {"temperature": 6, "voltage": 6}
     # 무슨 기준으로 세었는지가 함께 나간다. 원본이 그대로이므로 다시 셀 수 있다.
-    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 100.0
+    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 70.0
     assert quality["sensor_implausible_thresholds"]["voltage"]["min"] == 5.0
 
 

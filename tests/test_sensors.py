@@ -330,7 +330,7 @@ def test_the_thresholds_are_for_counting_and_travel_with_the_count():
 
     assert thresholds["temperature"] == {
         "min": 0.0,
-        "max": 100.0,
+        "max": 70.0,
         "min_inclusive": False,
         "unit": "C",
     }
@@ -339,6 +339,8 @@ def test_the_thresholds_are_for_counting_and_travel_with_the_count():
     # `test4_20260905_1459`의 frame 297 elbow_flex.
     temperature = next(e for e in sensors.PLAUSIBLE_RANGES if e.key == "temperature")
     assert temperature.holds(36.0) is True
+    assert temperature.holds(70.0) is True
+    assert temperature.holds(71.0) is False
     assert temperature.holds(150.0) is False
     # 토크가 꺼진 모터만 0을 낸다(RUNBOOK 1.0). 수집 중에 나오면 세어 둘 값이다.
     assert temperature.holds(0.0) is False

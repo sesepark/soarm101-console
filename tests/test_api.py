@@ -664,7 +664,7 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
                 "camera_stale_pct": {"scene": 2.54, "wrist": 2.90},
                 "sensor_read_failures": 3,
                 "sensor_implausible": {"temperature": 5, "voltage": 1},
-                "sensor_implausible_thresholds": {"temperature": {"min": 0.0, "max": 100.0}},
+                "sensor_implausible_thresholds": {"temperature": {"min": 0.0, "max": 70.0}},
                 "sensor_block_read_ms_p50": 2.17,
                 "sensor_block_read_ms_p99": 2.38,
             },
@@ -683,7 +683,7 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
     assert quality["sensor_read_failures"] == 3
     assert quality["sensor_implausible"] == {"temperature": 5, "voltage": 1}
     # 무슨 기준으로 세었는지가 함께 있어야 나중에 다른 기준으로 다시 셀 수 있다.
-    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 100.0
+    assert quality["sensor_implausible_thresholds"]["temperature"]["max"] == 70.0
     assert quality["sensor_block_read_ms_p50"] == 2.17
     assert quality["slow_loop_warnings"] == 2
     assert quality["recorded_at"] > 0

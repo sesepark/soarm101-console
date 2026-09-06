@@ -23,6 +23,7 @@ from .v4l2_controls import apply_recording_controls
 #: 영상에는 흔적이 남지 않는다. 시간축이 조용히 늘어난 데이터가 스스로 30Hz라고 말하게
 #: 되는데, 그 사실을 알려 주는 것은 이 경고뿐이다.
 SLOW_LOOP_MARKER = "Record loop is running slower"
+RECORDING_EPISODE_MARKER = re.compile(r"\bRecording episode \d+\b")
 
 #: `recording.py`가 데이터셋 이름에 허용하는 것과 같은 모양. 상태 파일에서 읽은 이름을
 #: 경로로 쓰기 전에 다시 본다.
@@ -117,6 +118,7 @@ class RecordManager:
         self._owner_locks: DeviceLockSet | None = None
         self._camera_controls: dict[str, dict[str, object]] = {}
         self._slow_loop_warnings = 0
+        self._ignore_first_slow_loop_warning = False
         self._resumed = False
         #: 이 회를 시작하기 직전의 하드웨어 진단. `app`이 넘겨 준다 — 가상 리더로 찍을
         #: 때는 진단을 돌리지 않으므로 `None`이다. `soarm_provenance.json`에 함께 적힌다.
@@ -184,6 +186,7 @@ class RecordManager:
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             self._logs.clear()
             self._slow_loop_warnings = 0
+            self._ignore_first_slow_loop_warning = False
             env = os.environ.copy()
             env.update(
                 {
@@ -330,14 +333,24 @@ class RecordManager:
             for line in process.stdout:
                 text = line.rstrip()
                 self._logs.append(text)
-                if SLOW_LOOP_MARKER in text:
-                    self._slow_loop_warnings += 1
+                self._observe_log_line(text)
                 if handle is not None:
                     # 곧바로 흘려 보낸다. 수집이 중간에 죽어도 그때까지의 경고는 남는다.
                     print(text, file=handle, flush=True)
         finally:
             if handle is not None:
                 handle.close()
+
+    def _observe_log_line(self, text: str) -> None:
+        """Count genuine slow ticks, excluding LeRobot's episode-transition tick."""
+        if RECORDING_EPISODE_MARKER.search(text):
+            self._ignore_first_slow_loop_warning = True
+        if SLOW_LOOP_MARKER not in text:
+            return
+        if self._ignore_first_slow_loop_warning:
+            self._ignore_first_slow_loop_warning = False
+            return
+        self._slow_loop_warnings += 1
 
     def _archive_log(self) -> None:
         """끝난 로그와 이번 실행의 품질 요약을 데이터셋 폴더 안에 남긴다.

@@ -604,6 +604,22 @@ def test_nothing_is_deleted_while_the_arm_is_using_the_data(deletable, monkeypat
 # MARK: 품질 — 데이터셋이 스스로 말하지 못하는 것
 
 
+def test_first_slow_tick_after_each_episode_banner_is_not_a_warning():
+    from soarm_console.config import Settings
+    from soarm_console.record_manager import RecordManager
+
+    manager = RecordManager(Settings())
+    for episode in range(3):
+        manager._observe_log_line(f"Recording episode {episode}")
+        manager._observe_log_line("Record loop is running slower than requested")
+
+    assert manager._slow_loop_warnings == 0
+
+    manager._observe_log_line("Record loop is running slower than requested")
+    manager._observe_log_line("Record loop is running slower than requested")
+    assert manager._slow_loop_warnings == 2
+
+
 def _finished_recording(tmp_path, monkeypatch, name: str, *, resumed: bool, warnings: int):
     from soarm_console.config import Settings
     from soarm_console.record_manager import RecordManager

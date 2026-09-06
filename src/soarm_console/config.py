@@ -58,6 +58,9 @@ class Settings:
     max_relative_target: float = field(
         default_factory=lambda: float(os.getenv("SOARM_MAX_RELATIVE_TARGET", "2"))
     )
+    policy_max_relative_target: float = field(
+        default_factory=lambda: float(os.getenv("SOARM_POLICY_MAX_RELATIVE_TARGET", "3.0"))
+    )
 
     # 학습이 도는 기계. 주소와 계정은 이 저장소가 공개이므로 여기 적지 않고 `config/soarm.env`에
     # 둔다 — serial 포트나 카메라 경로와 달리 이것은 다른 기계로 가는 길이다.

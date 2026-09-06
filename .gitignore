@@ -4,6 +4,7 @@ __pycache__/
 .serena/
 *.py[cod]
 runtime/
+models/
 config/soarm.env
 data/*
 !data/README.md

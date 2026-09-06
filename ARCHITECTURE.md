@@ -9,7 +9,8 @@
 >
 > 장치별 owner lock은 프로젝트가 제어하는 경로에 구현되어 있다(ADR 0003). advisory lock을
 > 무시하는 임의의 upstream 프로세스까지 차단하지는 않는다. 아직 구현되지 않은 것은 ROS 2
-> Bridge, VLA worker, 수집 중 health 감지, 독립 power cutoff다.
+> Bridge, 수집 중 health 감지, 독립 power cutoff다. 로컬 학습 정책 실행은
+> `PolicyManager` + `policying`이 LeRobot rollout을 감싸는 네 번째 모드로 구현되어 있다.
 > 물리 리더 텔레옵 경로(`soarm_console.teleoperating`)에는 lease도 watchdog도 없다 —
 > 리더 팔에서 읽은 값을 그대로 흘려보내는 구조라 끼어들 자리가 없다. 2026-09-05에
 > `lerobot-teleoperate` 바이너리에서 우리 모듈로 옮겼는데, 그것은 lease를 들이기 위해서가
@@ -48,6 +49,7 @@ Server PC
 │   ├── Follower adapter
 │   └── Cameras
 ├── Recorder
+├── Policy Manager (`lerobot-rollout`, base + RTC)
 ├── ROS 2 Bridge (향후)
 └── Existing cookierunhub services (분리)
 ```
@@ -67,6 +69,10 @@ Compute worker는 MacBook에 한정되지 않는다. 동일한 protocol을 구�
 - 현재 owner가 누구인지 상태와 로그에서 확인 가능해야 한다.
 
 현재 기본 owner는 LeRobot 기반 서버 Hardware Runtime이다. 이것은 영구 고정이 아니다. 향후 `ros2_control`이나 다른 runtime이 owner가 될 수 있지만, 전환 중 두 owner가 겹치면 안 된다.
+
+현재 실행 모드는 텔레옵, 수집, 재생, 정책 넷이다. 정책 모드는 follower와 scene/wrist 카메라를
+한 owner로 잡고, 다른 세 모드와 양방향으로 409 충돌 검사를 한다. 공통 정지는 예측 불가능한
+정책을 가장 먼저 SIGTERM으로 세운다.
 
 ### Command authority
 

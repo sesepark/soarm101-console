@@ -163,10 +163,11 @@ lerobot 버전, calibration `sha256`, 카메라 컨트롤, 시작 진단, fps). 
 | `GET /api/spark` | 도달 여부, GPU, 남은 디스크 |
 | `GET /api/spark/datasets` | Spark에 올라가 있는 데이터셋 목록 |
 | `POST /api/spark/datasets/{name}` | 녹화한 데이터셋 하나를 Spark로 전송 |
-| `GET /api/spark/runs` | 학습 실행별 체크포인트 **와 진행 상황** |
 | `POST /api/spark/train` | `{dataset, policy}` — 학습을 tmux 안에서 띄운다(앱은 부르지 않는다, 바로 아래) |
 | `POST /api/spark/runs/{run}/stop` | 도는 학습에 Ctrl-C를 보낸다 |
-| `POST /api/spark/runs/{run}/{step}` | 체크포인트의 `pretrained_model`을 회수 |
+| `GET /api/models` | HUB의 `models/`에 회수한 모델과 실행 가능 여부 |
+| `POST /api/models/{run}/{step}` | 체크포인트의 `pretrained_model`을 HUB로 회수 |
+| `DELETE /api/models/{run}/{step}` | HUB의 로컬 사본만 삭제 |
 | `GET /api/spark/train-command` | 사람이 터미널에 붙여 넣을 학습 명령(그대로 남겨 둔다) |
 
 ### 학습을 거는 문은 sparkq 큐다 (2026-09-06)
@@ -227,44 +228,9 @@ SmolVLA는 이미 배운 것을 옮겨 오므로 스텝이 훨씬 적다. 대신
 
 `.runs`는 점으로 시작하므로 `<output_root>`를 훑는 목록에서 실행 이름으로 읽히지 않는다.
 
-**LeRobot은 `output_dir`을 늦게 만든다.** 실측(2026-09-05): 학습이 90스텝을 돈 시점에도
-`outputs/<run>/`은 아직 없고 `.runs/<run>/`만 있었다. 그래서 목록은 두 자리의 **합집합**이다
-— `<run>/checkpoints`가 있는 실행과 `.runs/<run>/soarm_train.json`이 있는 실행. 어느
-한쪽만 훑으면 방금 시작한 학습이 안 보이거나(진행을 못 그린다), 손으로 돌린 옛 학습이
-안 보인다(회수할 것을 못 찾는다). 두 자리 다 그 표시를 요구하므로 남은 빈 폴더가 실행
-하나로 세어지지도 않는다.
-
-### 진행은 로그에서 읽는다
-
-시작 직후 `.runs/<run>/soarm_train.json`에 `{dataset, policy, steps, batch_size, started_at}`
-을 남기고, 명령 자체는 `2>&1 | tee <output_root>/.runs/<run>/train.log`로 끝난다.
-`GET /api/spark/runs`의 각 실행에 실리는 `training`은 그 둘과 `tmux has-session`을 합친 것이다:
-
-```json
-{"running": true, "step": 20000, "steps": 100000, "loss": 0.187,
- "policy": "act", "started_at": 1757060000.0, "updated_at": 1757063600.0,
- "log_tail": ["…"], "error": null}
-```
-
-`step`은 두 곳에서 온다. LeRobot의 metric 줄(`step:20K`)과 tqdm의 진행 막대
-(`| 20147/100000 [11:00<…`)이고, 둘 중 큰 값을 쓴다.
-
-**metric 줄만 보면 처음 몇 분이 비어 있다.** 그 줄은 `log_freq`(기본 200)마다 나오는데
-이 팔의 ACT 학습은 스텝당 2.1초이므로 첫 줄이 **7분 뒤**다. 실제로 학습을 띄우고 30초를
-지켜보는 동안 `step`이 계속 `null`이었다. tqdm은 매 스텝 갱신하므로 그것을 읽으면 30초
-안에 75 → 83으로 올라가는 것이 보인다. `loss`는 tqdm이 나르지 않으므로 metric 줄에서만
-온다.
-
-숫자를 읽을 때 접미사를 되돌려야 한다 — `step:20K`에서 숫자만 집으면 20이 되고, 화면은
-10만 스텝 학습이 0.02% 진행됐다고 말한다. `running`이 아닌데 `step < steps`이면 로그에서
-`Traceback`이나 `Error`가 든 마지막 줄을 골라 `error`에 담는다 — 끝나지 않았는데 세션이
-없다는 것은 무언가 죽었다는 뜻이고, 사람이 tmux에 붙지 않고도 이유를 볼 수 있어야 한다.
-
-목록은 `checkpoints/last` 심볼릭 링크를 건너뛴다(`os.path.islink`). 따라가면 같은 체크포인트가
-두 번 나와 화면이 있지도 않은 회수를 센다.
-
-이 전부를 원격 파이썬 스크립트 하나 안에서 한다. 실행마다 ssh를 왕복하면 tailnet 너머에서
-화면이 눈에 띄게 굼떠진다.
+학습 실행·진행·체크포인트 목록은 Spark의 `sparkq`가 `GET /api/runs`로 직접 답한다. 콘솔은
+그 목록을 SSH로 다시 만들지 않는다. 실행 목록의 소유자를 하나로 두어 체크포인트 크기와
+`in_use` 같은 새 필드가 한쪽에만 생기는 일을 막는다.
 
 ### 멈추는 것
 
@@ -331,7 +297,7 @@ HUB의 `deploy` 공개키가 Spark의 `authorized_keys`에 등록되어 있어�
 
 ## 절차
 
-전송·학습·회수가 모두 콘솔 API 하나씩이다.
+데이터셋 전송과 모델 회수는 콘솔 API이고, 실행 목록과 정상 학습 시작은 sparkq가 맡는다.
 
 ```bash
 # 1. 데이터셋을 Spark로
@@ -344,14 +310,13 @@ curl -X POST http://127.0.0.1:8088/api/spark/train \
   -H 'content-type: application/json' \
   -d '{"dataset": "<name>", "policy": "act"}'
 
-# 3. 진행 상황 (각 실행의 `training`을 본다)
-curl -s http://127.0.0.1:8088/api/spark/runs | jq '.[].training'
+# 3. 진행 상황과 체크포인트는 Spark의 sparkq `GET /api/runs`에서 본다.
 
 # 4. 멈추려면
 curl -X POST http://127.0.0.1:8088/api/spark/runs/<run>/stop
 
 # 5. 끝나면 체크포인트 회수
-curl -X POST http://127.0.0.1:8088/api/spark/runs/<run>/<step>
+curl -X POST http://127.0.0.1:8088/api/models/<run>/<step>
 ```
 
 터미널에서 직접 돌리고 싶으면 `GET /api/spark/train-command`가 여전히 명령 문자열을 준다.
@@ -365,8 +330,11 @@ ssh <계정>@<학습서버> 'tmux capture-pane -pt train-<run> | tail -20'
 ssh <계정>@<학습서버> 'tail -f outputs/.runs/<run>/train.log'
 ```
 
-회수한 것은 `checkpoints/<run>/<step>/`에 놓인다. `training_state`는 가져오지 않는다 —
-추론에 쓰이지 않는데 optimizer 상태까지 있어 훨씬 크고, 재개는 Spark에서 하는 것이 맞다.
+회수한 것은 `models/<run>/<step>/pretrained_model/`에 놓이고, 같은 단계에
+`soarm_model.json`이 생긴다. 명세는 받은 `config.json`과 `train_config.json`만 읽어 정책,
+데이터셋, 학습 스텝, 청크 크기, state/action 차원과 image feature를 기록한다. `models/`는
+`.gitignore` 대상이다. `training_state`는 추론에 쓰이지 않으며 재개는 Spark에서 하므로
+가져오지 않는다.
 
 ## 알려진 제약
 

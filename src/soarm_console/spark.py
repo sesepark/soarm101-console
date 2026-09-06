@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import Settings
 from .datasets import NAME_PATTERN, DatasetError, data_root
+from .models import model_dir
 
 
 class SparkError(RuntimeError):
@@ -66,159 +67,6 @@ if os.path.isdir(root):
             "size_bytes": size,
             "synced_at": os.path.getmtime(info),
         })
-print(json.dumps(out))
-"""
-
-# 학습 산출물은 `<output_root>/<run>/checkpoints/<step>/pretrained_model`에 쌓인다.
-# 추론에 필요한 것은 `pretrained_model` 하나뿐이고 `training_state`는 재개용이라
-# 목록에서 크기를 따로 알려 준다 — 회수할 때 무엇을 가져올지 화면에서 고르게 하려는 것이다.
-# 진행 상황은 `train.log`와 `soarm_train.json`이 말한다. 셋을 한 스크립트 안에서 읽는
-# 이유는 ssh 왕복 때문이다 — 실행이 열 개면 왕복도 열 번이 되고, tailnet 너머에서 그것은
-# 화면이 눈에 띄게 굼떠지는 값이다.
-_LIST_RUNS = r"""
-import json, os, re, subprocess, sys
-root = os.path.expanduser(sys.argv[1])
-side_root = os.path.join(root, sys.argv[2])
-
-# LeRobot은 step을 `format_big_number`로 줄여 찍는다 — `step:20K`. 숫자만 집으면 20이
-# 되므로 접미사를 되돌려야 한다.
-SUFFIX = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12, "Q": 10**15}
-STEP = re.compile(r"step:([0-9.]+)([KMBTQ]?)")
-LOSS = re.compile(r"loss:([0-9.eE+-]+)")
-
-# tqdm의 진행 막대 — `Training:   0%|   | 10/100000 [00:35<95:45:43,  3.45s/step]`.
-#
-# `step:N` 줄만 보면 안 되는 이유가 있다. LeRobot은 그 줄을 `log_freq`(기본 200)마다
-# 찍는데, 이 팔의 ACT 학습은 스텝당 2초가 넘으므로 **첫 줄이 8분 뒤에 나온다.** 그동안
-# 화면은 학습이 도는 것은 아는데 어디까지 갔는지는 모른다. tqdm은 매 스텝 갱신한다.
-#
-# 그래서 둘 중 큰 값을 쓴다. 같은 것을 세는 두 계량이고 tqdm 쪽이 늘 더 최근이다.
-# `loss`는 tqdm이 나르지 않으므로 `step:N` 줄에서만 온다.
-TQDM = re.compile(r"(\d+)/(\d+) \[")
-
-
-def as_number(text, suffix):
-    try:
-        return int(round(float(text) * SUFFIX.get(suffix, 1)))
-    except ValueError:
-        return None
-
-
-def session_alive(name):
-    try:
-        return subprocess.run(
-            ["tmux", "has-session", "-t", name], capture_output=True
-        ).returncode == 0
-    except OSError:
-        return False
-
-
-def training(run, directory):
-    try:
-        with open(os.path.join(directory, "soarm_train.json"), encoding="utf-8") as handle:
-            meta = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    log = os.path.join(directory, "train.log")
-    try:
-        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
-        updated_at = os.path.getmtime(log)
-    except OSError:
-        lines, updated_at = [], None
-    step = loss = None
-    for line in reversed(lines):
-        found = STEP.search(line)
-        if found:
-            step = as_number(found.group(1), found.group(2))
-            hit = LOSS.search(line)
-            if hit:
-                try:
-                    loss = float(hit.group(1))
-                except ValueError:
-                    loss = None
-            break
-    for line in reversed(lines):
-        bar = TQDM.search(line)
-        if bar:
-            counted = int(bar.group(1))
-            step = counted if step is None else max(step, counted)
-            break
-    running = session_alive("train-" + run)
-    steps = meta.get("steps")
-    error = None
-    if not running and isinstance(steps, int) and (step or 0) < steps:
-        # 끝나지 않았는데 세션이 없다. 로그가 왜 멈췄는지 말할 수 있는 줄을 찾는다.
-        for line in reversed(lines):
-            if "Traceback" in line or "Error" in line:
-                error = line.strip()
-                break
-    return {
-        "running": running,
-        "step": step,
-        "steps": steps,
-        "loss": loss,
-        "policy": meta.get("policy"),
-        "started_at": meta.get("started_at"),
-        "updated_at": updated_at,
-        "log_tail": lines[-5:],
-        "error": error,
-    }
-
-
-def checkpoints(directory):
-    ckpt_root = os.path.join(directory, "checkpoints")
-    found = []
-    for step in sorted(os.listdir(ckpt_root)) if os.path.isdir(ckpt_root) else []:
-        # `checkpoints/last`는 가장 최근 체크포인트를 가리키는 심볼릭 링크다. 따라가면
-        # 같은 체크포인트가 목록에 두 번 나오고, 화면은 있지도 않은 회수를 센다.
-        if os.path.islink(os.path.join(ckpt_root, step)):
-            continue
-        model = os.path.join(ckpt_root, step, "pretrained_model")
-        if not os.path.isdir(model):
-            continue
-        size = 0
-        for base, _dirs, files in os.walk(model):
-            for name in files:
-                try:
-                    size += os.path.getsize(os.path.join(base, name))
-                except OSError:
-                    pass
-        found.append({
-            "step": step,
-            "size_bytes": size,
-            "finished_at": os.path.getmtime(model),
-        })
-    return found
-
-
-# `<directory>/<이름>/<marker>`가 있는 이름들. 점으로 시작하는 것은 실행이 아니다.
-# (이 스크립트 자체가 삼중 따옴표 문자열이므로 여기서는 docstring을 쓸 수 없다.)
-def names_in(directory, marker):
-    try:
-        entries = os.listdir(directory)
-    except OSError:
-        return set()
-    return {
-        name for name in entries
-        if not name.startswith(".") and os.path.exists(os.path.join(directory, name, marker))
-    }
-
-
-# 실행 하나는 두 자리에 걸쳐 있다. LeRobot이 만드는 `<root>/<run>/`(체크포인트)과 우리가
-# 만드는 `<root>/.runs/<run>/`(로그와 메타)이고, **어느 쪽만 있을 수도 있다.**
-#
-# 방금 시작한 학습은 옆자리만 있다 — ACT의 첫 체크포인트는 2만 스텝 뒤이고, 그때까지
-# 목록에서 사라져 있으면 앱이 진행을 그릴 수 없다. 반대로 손으로 돌린 옛 학습은
-# 체크포인트만 있고, 그것이 목록에서 빠지면 회수할 것을 못 찾는다. 그래서 합집합이다.
-#
-# 두 자리 다 표시를 요구한다 — 남아 있는 빈 폴더 하나가 실행 하나로 세어지면 안 된다.
-out = []
-for run in sorted(names_in(root, "checkpoints") | names_in(side_root, "soarm_train.json")):
-    out.append({
-        "run": run,
-        "checkpoints": checkpoints(os.path.join(root, run)),
-        "training": training(run, os.path.join(side_root, run)),
-    })
 print(json.dumps(out))
 """
 
@@ -391,13 +239,6 @@ def probe(settings: Settings) -> dict[str, Any]:
 def list_datasets(settings: Settings) -> list[dict[str, Any]]:
     """Spark에 올라가 있는 데이터셋 목록."""
     return _remote_python(settings, _LIST_DATASETS, _remote_dataset_root(settings), timeout=45)
-
-
-def list_runs(settings: Settings) -> list[dict[str, Any]]:
-    """Spark의 학습 실행별 체크포인트와 진행 상황."""
-    return _remote_python(
-        settings, _LIST_RUNS, settings.spark_output_root, RUN_SIDE_DIR, timeout=60
-    )
 
 
 # `lerobot-train`이 이 콘솔에서 띄울 수 있는 정책과 그 값들.
@@ -647,7 +488,9 @@ def pull_checkpoint(
     """
     if not NAME_PATTERN.match(run) or not NAME_PATTERN.match(step):
         raise DatasetError("Unknown run or step")
-    destination = data_root().parent / "checkpoints" / run / step
+    destination = model_dir(run, step) / "pretrained_model"
+    if destination.is_symlink():
+        raise DatasetError("Model paths may not be symbolic links")
     destination.mkdir(parents=True, exist_ok=True)
     remote = (
         f"{_target(settings)}:{settings.spark_output_root}/{run}"

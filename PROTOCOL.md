@@ -6,7 +6,8 @@
 > 단위, 추가된 거절 코드 — 는 맥 앱 저장소의 `docs/원격_텔레옵_프로토콜.md`에 한 벌로 적혀
 > 있고, 맥·폰·서버 세 구현이 그것을 읽는다.
 >
-> owner lock 파일은 여전히 없다. 상호배타는 프로세스 상태 검사와 409로 하고 있다.
+> 장치별 `flock` owner lock이 구현되어 있고, 프로세스 상태 검사와 409도 사용자에게 모드
+> 충돌 이유를 먼저 설명한다.
 
 ## 목적
 
@@ -113,7 +114,31 @@ Hardware ownership은 command lease와 별개다.
 - Stale lock은 process/device 상태를 확인한 뒤 명시적으로 복구한다.
 - Lock 파일만 삭제하여 강제로 ownership을 빼앗지 않는다.
 
-현재 owner lock 구현은 아직 없다. 구현 전에는 `fuser`, process 상태, 실제 device open 여부를 수동으로 함께 확인한다.
+현재 콘솔이 시작하는 teleop, recording, replay, policy 프로세스는 장치별 owner lock을
+부모에서 잡고 자식에 file descriptor를 물려준다. advisory lock을 무시하는 외부 프로세스는
+별도 운영 점검 대상이다.
+
+## 모델과 정책 실행 REST 계약
+
+경로와 JSON 필드 이름은 맥 앱과 공유하는 계약이다.
+
+| 메서드 | 경로 | 의미 |
+| --- | --- | --- |
+| `GET` | `/api/models` | 로컬 모델 명세, `camera_map`, `runnable`, 문장형 `problems` |
+| `POST` | `/api/models/{run}/{step}` | Spark 체크포인트를 `models/`로 회수하고 명세 생성 |
+| `DELETE` | `/api/models/{run}/{step}` | 로컬 사본 삭제, `{run, step, freed_bytes}` 반환 |
+| `POST` | `/api/policy/start` | `{run, step, task, fps, max_seconds}`로 rollout 시작 |
+| `POST` | `/api/policy/stop` | SIGTERM으로 rollout teardown 시작 |
+
+`POST /api/policy/start`는 `X-SOARM-Motion-Token`을 요구한다. `max_seconds`는 기본 120,
+허용 범위 1–600초이고 LeRobot `RolloutConfig.duration`에 그대로 들어간다. `/api/status`와
+시작·중지 응답의 `policy` 상태에는 `run`, `step`, `task`, `started_at`, `expires_at`,
+`fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `max_relative_target`,
+`inference`, `log_tail`, `error`가 실린다. 측정할 수 없는 성능 값은 `null`이다.
+
+Spark의 실행 목록은 sparkq `GET /api/runs`가 소유한다. 따라서 콘솔의
+`GET /api/spark/runs`와 예전 회수 경로 `POST /api/spark/runs/{run}/{step}`은 없다.
+`POST /api/spark/train`과 `POST /api/spark/runs/{run}/stop`은 유지한다.
 
 ## 오류와 호환성
 

@@ -29,9 +29,10 @@ from .datasets import (
     trajectory,
 )
 from .diagnostics import doctor_failure, run_hardware_doctor
+from .models import ModelNotFound, build_manifest, delete_model, describe_model, list_models
+from .policy_manager import PolicyManager
 from .spark import SparkBusy, SparkError, SparkNotFound
 from .spark import list_datasets as spark_list_datasets
-from .spark import list_runs as spark_list_runs
 from .spark import probe as spark_probe
 from .spark import pull_checkpoint as spark_pull_checkpoint
 from .spark import push_dataset as spark_push_dataset
@@ -67,11 +68,22 @@ settings = Settings()
 teleop = TeleopManager(settings)
 recorder = RecordManager(settings)
 replayer = ReplayManager(settings)
+policy_manager = PolicyManager(settings)
 cameras = {
     "scene": CameraWorker(settings.scene_camera),
     "wrist": CameraWorker(settings.wrist_camera),
 }
 vleader = VirtualLeader(settings)
+policy_manager.other_mode_problem = lambda: (
+    "Stop the running mode before starting a policy"
+    if recorder.running or teleop.running or replayer.running or vleader.running
+    else None
+)
+vleader.external_mode_problem = lambda: (
+    "Stop the policy before starting the virtual leader: the follower has one owner"
+    if policy_manager.running
+    else None
+)
 last_doctor: dict[str, object] | None = None
 static_dir = Path(__file__).with_name("static")
 
@@ -79,6 +91,10 @@ static_dir = Path(__file__).with_name("static")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
+    # 정책은 예측한 목표로 혼자 움직이는 모드다. 서버 종료에서도 가장 먼저 세워 rollout
+    # teardown이 시작 자세로 돌아갈 기회를 준다.
+    with suppress(TeleopError):
+        policy_manager.stop()
     for worker in cameras.values():
         worker.stop()
     # 가상 리더가 팔로워 serial을 쥐고 있으면 여기서 놓는다. `force=True`인 이유는
@@ -86,7 +102,7 @@ async def lifespan(_: FastAPI):
     # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
     with suppress(Exception):
         vleader.stop(force=True)
-    # 재생은 팔을 움직이는 중일 수 있다. 서버가 내려가면서 그것을 두고 가면 아무도
+    # 재생도 팔을 움직이는 중일 수 있다. 서버가 내려가면서 그것을 두고 가면 아무도
     # 멈출 수 없는 팔이 남는다. 멈추기만 하고 토크는 그대로 둔다.
     with suppress(TeleopError):
         replayer.stop()
@@ -201,6 +217,14 @@ class ReplayRequest(BaseModel):
     episode: int = 0
     #: 0.25 / 0.5 / 1.0. 기본은 절반이다 — 처음 보는 재생은 느린 편이 낫다.
     speed: float = DEFAULT_SPEED
+
+
+class PolicyRequest(BaseModel):
+    run: str
+    step: str
+    task: str
+    fps: float = 30
+    max_seconds: float = 120
 
 
 class CameraSettingsRequest(BaseModel):
@@ -334,6 +358,8 @@ def status() -> dict[str, object]:
         "recording": recorder.status(),
         "replay": replayer.status(),
         "replay_preflight": replayer.preflight(),
+        "policy": policy_manager.status(),
+        "policy_preflight": policy_manager.preflight(),
         "virtual_leader": vleader.status(),
         "doctor": last_doctor,
     }
@@ -483,15 +509,6 @@ def spark_push(name: str) -> dict[str, object]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.get("/api/spark/runs")
-def spark_runs() -> list[dict[str, object]]:
-    """Training runs on the training machine, with their checkpoints."""
-    try:
-        return spark_list_runs(settings)
-    except SparkError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @app.post("/api/spark/train")
 def spark_train_start(request: TrainRequest) -> dict[str, object]:
     """학습 서버에서 학습을 띄운다. tmux 안에서 돌고, 콘솔은 그 뒤로 진행만 읽는다.
@@ -527,15 +544,35 @@ def spark_train_stop(run: str) -> dict[str, object]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.post("/api/spark/runs/{run}/{step}")
-def spark_pull(run: str, step: str) -> dict[str, object]:
-    """Fetch one checkpoint back for local inference."""
+@app.get("/api/models")
+def models() -> list[dict[str, object]]:
+    return list_models()
+
+
+@app.post("/api/models/{run}/{step}")
+def pull_model(run: str, step: str) -> dict[str, object]:
+    """Fetch one checkpoint and describe the received files for local rollout."""
     try:
-        return spark_pull_checkpoint(settings, run, step)
+        spark_pull_checkpoint(settings, run, step)
+        build_manifest(settings, run, step)
+        return describe_model(run, step)
     except DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except SparkError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.delete("/api/models/{run}/{step}")
+def remove_model(run: str, step: str) -> dict[str, object]:
+    policy = policy_manager.status()
+    if policy_manager.running and policy.get("run") == run and policy.get("step") == step:
+        raise HTTPException(status_code=409, detail="Stop the policy before deleting its model")
+    try:
+        return delete_model(run, step)
+    except ModelNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/spark/train-command")
@@ -559,7 +596,7 @@ def spark_train(
 @app.post("/api/doctor")
 def doctor() -> dict[str, object]:
     global last_doctor
-    if teleop.running or recorder.running or vleader.running:
+    if teleop.running or recorder.running or vleader.running or policy_manager.running:
         raise HTTPException(status_code=409, detail="Cannot inspect serial buses during an active mode")
     last_doctor = run_hardware_doctor(settings)
     return last_doctor
@@ -585,7 +622,7 @@ def release_torque(request: Request, body: TorqueReleaseRequest) -> dict[str, ob
     _authorise_motion(_token_from(request))
     if body.confirmation != RELEASE_CONFIRMATION:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if teleop.running or recorder.running or vleader.running:
+    if teleop.running or recorder.running or vleader.running or policy_manager.running:
         raise HTTPException(
             status_code=409,
             detail="Stop the running mode before releasing torque",
@@ -607,6 +644,11 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
         raise HTTPException(
             status_code=409,
             detail="Stop the replay before teleoperation: the follower has one owner",
+        )
+    if policy_manager.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the policy before teleoperation: the follower has one owner",
         )
     if vleader.running:
         raise HTTPException(
@@ -686,6 +728,11 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         raise HTTPException(
             status_code=409,
             detail="Stop the replay before recording: the follower has one owner",
+        )
+    if policy_manager.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the policy before recording: the follower and cameras have one owner",
         )
     if request.teleop not in {"leader", "virtual"}:
         raise HTTPException(status_code=400, detail="teleop must be 'leader' or 'virtual'")
@@ -789,7 +836,7 @@ def delete_dataset(name: str) -> dict[str, object]:
     목록에서 사라지는 것으로 충분하고, 디스크를 실제로 비우는 것은 사람이
     `rm -rf data/.trash`로 한다.
     """
-    if recorder.running or replayer.running:
+    if recorder.running or replayer.running or policy_manager.running:
         raise HTTPException(
             status_code=409, detail="Cannot delete while recording or replaying"
         )
@@ -809,7 +856,7 @@ def delete_dataset_episode(name: str, episode_index: int) -> dict[str, object]:
     찍다 만 회차가 데이터셋 안에서 온전한 시연인 척하는 것을 고치는 길이다. 앞으로
     찍는 것은 `abort`가 막지만, 이미 들어 있는 것을 꺼낼 자리도 있어야 한다.
     """
-    if recorder.running or replayer.running:
+    if recorder.running or replayer.running or policy_manager.running:
         raise HTTPException(
             status_code=409, detail="Cannot delete while recording or replaying"
         )
@@ -834,7 +881,13 @@ def replay_preview(dataset: str, episode: int = 0) -> dict[str, object]:
     팔로워 serial을 읽으므로 다른 모드가 돌고 있으면 거절한다. 장치 하나에 소유자는
     하나다.
     """
-    if recorder.running or teleop.running or vleader.running or replayer.running:
+    if (
+        recorder.running
+        or teleop.running
+        or vleader.running
+        or replayer.running
+        or policy_manager.running
+    ):
         raise HTTPException(
             status_code=409,
             detail="Stop the running mode before reading the follower: it has one owner",
@@ -883,7 +936,7 @@ def replay_preview(dataset: str, episode: int = 0) -> dict[str, object]:
 def start_replay(request: ReplayRequest) -> dict[str, object]:
     """찍은 에피소드를 실제 팔에 다시 흘린다.
 
-    팔이 사람 손 없이 혼자 움직이는 유일한 경로다. 그래서 게이트가 셋이다: 텔레옵·수집과
+    팔이 사람 손 없이 혼자 움직이는 경로다. 그래서 게이트가 셋이다: 텔레옵·수집과
     같은 확인 문구, 모션 게이트, 그리고 **팔이 지금 그 에피소드가 시작하는 자리 근처에
     있는가**. 마지막 것이 이 경로에만 있는 이유는, 녹화의 첫 자세가 팔이 지금 서 있는
     자세와 아무 관계가 없기 때문이다.
@@ -892,6 +945,11 @@ def start_replay(request: ReplayRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if replayer.running:
         raise HTTPException(status_code=409, detail="Stop the replay that is already running")
+    if policy_manager.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the policy before replaying: the follower has one owner",
+        )
     if recorder.running:
         raise HTTPException(
             status_code=409,
@@ -945,11 +1003,57 @@ def stop_replay() -> dict[str, object]:
     return replayer.status()
 
 
+@app.post("/api/policy/start")
+def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
+    """Run a local model through LeRobot rollout after every motion gate passes."""
+    _authorise_motion(_token_from(request))
+    if not body.task.strip():
+        raise HTTPException(status_code=400, detail="A task description is required")
+    if not 1 <= body.fps <= 60:
+        raise HTTPException(status_code=400, detail="fps must be between 1 and 60")
+    if not 1 <= body.max_seconds <= 600:
+        raise HTTPException(status_code=400, detail="max_seconds must be between 1 and 600")
+    try:
+        model = describe_model(body.run, body.step)
+    except ModelNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not model["runnable"]:
+        raise HTTPException(status_code=400, detail="; ".join(model["problems"]))
+    if policy_manager.running:
+        raise HTTPException(status_code=409, detail="A policy rollout is already running")
+    if recorder.running or teleop.running or replayer.running or vleader.running:
+        raise HTTPException(status_code=409, detail="Stop the running mode before starting a policy")
+    if not settings.motion_enabled:
+        raise HTTPException(
+            status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
+        )
+    for worker in cameras.values():
+        worker.stop()
+    try:
+        policy_manager.start(body.run, body.step, body.task, body.fps, body.max_seconds)
+    except TeleopError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return policy_manager.status()
+
+
+@app.post("/api/policy/stop")
+def stop_policy() -> dict[str, object]:
+    try:
+        policy_manager.stop()
+    except TeleopError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return policy_manager.status()
+
+
 @app.post("/api/mode/stop")
 def stop_active_mode() -> dict[str, object]:
     try:
-        # 재생을 먼저 세운다. 이 셋 가운데 사람 손 없이 팔이 혼자 움직이는 것은
-        # 재생뿐이므로, 급한 손이 누르는 단추는 그것부터 멈춰야 한다.
+        # 예측한 목표로 혼자 움직이는 정책을 가장 먼저 세워 teardown(시작 자세 복귀)을
+        # 시작한다. 그 뒤 사람이 만든 궤적을 따르는 재생과 나머지 모드를 세운다.
+        if policy_manager.running:
+            policy_manager.stop()
         if replayer.running:
             replayer.stop()
         if recorder.running:
@@ -966,5 +1070,6 @@ def stop_active_mode() -> dict[str, object]:
         "teleoperation": teleop.status(),
         "recording": recorder.status(),
         "replay": replayer.status(),
+        "policy": policy_manager.status(),
         "virtual_leader": vleader.status(),
     }

@@ -56,7 +56,7 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 아니다. 그 경계에는 udev 권한 격리 같은 별도 설계가 필요하다.
 
 **재생 경로(2026-09-05)**: 찍어 둔 에피소드를 팔로워에 다시 흘린다. 이 프로젝트에서 사람의
-손이 팔의 목표를 만들지 않는 유일한 경로이므로 앞뒤에 게이트를 더 두었다. 시작은
+손이 팔의 목표를 만들지 않는 첫 번째 경로이므로 앞뒤에 게이트를 더 두었다. 시작은
 `REPLAY SOARM101` 확인 문구와 모션 게이트를 지나고, 텔레옵·수집·가상 리더가 도는 동안에는
 409로 거절한다(팔로워의 명령 권한은 하나다). 시작하기 전에 팔로워의 `Present_Position`을
 읽어 에피소드의 첫 action과 견준다. 그 거리로 거절하는 문턱은 한때 60도였는데 지금은 관절
@@ -83,6 +83,20 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 열지 않는다. 여기에 없는 것도 분명히 해 둔다: 충돌 회피 경로 계획이 없다. 느린 정렬 속도,
 시작 전에 관절별 거리를 읽는 미리보기, 그리고 **옆에 있는 사람**이 그 자리를 대신한다. 실물 확인은 사람이 옆에 있을 때
 `speed=0.25`로 한 에피소드를 끝까지 돌려 보고 중간에 stop이 듣는지 본 뒤에 한다.
+
+**정책 경로(2026-09-06)**: 학습 정책은 사람이 만든 궤적이 아니라 처음 보는 action을 내므로
+재생보다 좁은 별도 상한 `SOARM_POLICY_MAX_RELATIVE_TARGET`(기본 틱당 3.0°)을 쓴다. 시작은
+모션 토큰, `SOARM_ENABLE_MOTION=1`, follower calibration/port, 확정된 카메라 역할, runnable
+모델과 단일 모드 검사를 모두 지나야 한다. follower와 scene/wrist 카메라는 한 owner lock으로
+잡는다. 실행은 새 루프가 아니라 `lerobot-rollout`의 base strategy와 RTC inference이고,
+`max_seconds`(기본 120, 최대 600)가 `duration`에 들어가므로 무한 실행이 될 수 없다. 모델의
+`camera_map`을 뒤집은 `rename_map`으로 학습 때와 같은 image feature 이름을 만든다.
+
+중지는 서브프로세스에 SIGTERM을 보내 LeRobot의 `ProcessSignalHandler`와 teardown을 지나게
+한다. `return_to_initial_position=true`이므로 정상 teardown은 팔을 시작 자세로 되돌린다.
+SIGKILL은 SIGTERM 뒤 20초에도 자식이 남는 마지막 수단뿐이다. `/api/mode/stop`은 정책을 가장
+먼저 세운다. 이 경로도 충돌 회피나 독립 전원 차단을 제공하지 않으며, 실물 검증은 현장 관찰자와
+전원 차단 수단이 있을 때 별도로 해야 한다.
 
 **수집 중 회차를 버리는 길(2026-09-05)**: `POST /api/recording/control`의 `abort`는 찍던
 회차를 **버리고** 수집을 끝낸다. `esc`와 다르다 — `esc`는 루프를 빠져나온 뒤 `save_episode()`가

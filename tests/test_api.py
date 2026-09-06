@@ -23,6 +23,7 @@ def test_status_is_observation_only_and_exposes_all_subsystems():
     assert set(payload["devices"]) == {"leader", "follower", "scene_camera", "wrist_camera"}
     assert "teleoperation" in payload
     assert "recording" in payload
+    assert "policy" in payload
     assert "doctor" in payload
 
 

@@ -5,7 +5,7 @@ description = "Local-first SO-ARM101 hardware status and teleoperation console"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.116,<1",
-    "lerobot[dataset,feetech]==0.6.1",
+    "lerobot[dataset,feetech,smolvla]==0.6.1",
     "uvicorn[standard]>=0.35,<1",
 ]
 

@@ -9,7 +9,7 @@ SO-ARM101 leader–follower 팔을 위한 로컬 우선 운영 콘솔임. 브라
 > calibration, gated teleoperation, LeRobot-compatible recording, and dataset/checkpoint transfer to
 > a training server — all from one browser page. A virtual-leader path lets a Mac or iPhone drag a
 > 3D arm instead of a physical leader; every goal has to clear a server-side safety ladder before it
-> reaches a motor. Python 9.8k lines, 251 tests. Documentation is in Korean.*
+> reaches a motor. Python, 300+ hardware-free tests. Documentation is in Korean.*
 
 ![콘솔 관찰 화면](docs/images/console-main.png)
 
@@ -27,7 +27,8 @@ SO-ARM101 leader–follower 팔을 위한 로컬 우선 운영 콘솔임. 브라
 | **텔레옵** | 물리 리더 → 팔로워(30 FPS, 틱당 2° 상한) 또는 **가상 리더**(3D 화면 → 팔로워) |
 | **데이터 수집** | 로컬 LeRobot 데이터셋. 회차 조기 종료·재촬영·저장·**버리기** 네 조작, 이어 찍기, 회차 삭제 |
 | **재생** | 찍은 회차를 팔에 다시 흘려 봄. 첫 프레임으로 뛰지 않고 걸어서 감 |
-| **학습 연동** | 데이터셋을 DGX Spark로 보내고, 원격 tmux에서 학습을 띄우고, 체크포인트를 되받음 |
+| **학습 연동** | 데이터셋을 DGX Spark로 보내고, 체크포인트를 `models/`로 되받아 명세와 함께 관리 |
+| **정책 실행** | 로컬 모델을 `lerobot-rollout`의 base + RTC로 시한 내 실행하고 중지 시 시작 자세로 복귀 |
 
 ## 시스템 구조
 
@@ -161,7 +162,7 @@ cp config/soarm.env.example config/soarm.env
 
 ```bash
 ./scripts/doctor.sh
-.venv/bin/pytest -q      # 251개
+.venv/bin/pytest -q      # 300개 이상
 ```
 
 Doctor는 모터 ID, 모델, firmware, 현재 위치, 전압, torque 상태만 읽음. motion command는 보내지 않음.
@@ -203,17 +204,21 @@ motion session이 시작됨.
 ## 저장소 구조
 
 ```text
-src/soarm_console/        FastAPI app, teleop, recording, replay, diagnostics, camera workers
+src/soarm_console/        FastAPI app, teleop, recording, replay, policy, diagnostics, camera workers
   owner_lock.py             장치별 flock — 한 시점에 한 소유자
   follower_start.py         붙는 순간과 루프 직전의 부드러운 시작(s-curve)
   sensors.py                서보 블록 판독(주소 56~70) 한 번에, 부호-크기 해석
-  spark.py                  학습 서버 전송 · 원격 tmux 학습 · 체크포인트 회수
+  spark.py                  학습 서버 전송 · 원격 tmux 학습 · 모델 회수
+  models.py                 models/ 명세 · 카메라 대응 · 실행 가능성 · 삭제
+  policy_manager.py         정책 서브프로세스 · SIGTERM · 상태와 로그
+  policying.py              RolloutConfig 구성 · lerobot-rollout 호출
   static/                   데스크톱 콘솔 페이지
   static/viewer/            3D 조작 화면(맥·폰 공용). three.js r160 자체 호스팅, URDF 로더 직접 작성
 scripts/                  calibration, doctor, web, teleoperation, recording, service installation
 config/                   로컬 runtime 설정 template (커밋하지 않음)
+models/                   회수한 pretrained_model과 soarm_model.json (커밋하지 않음)
 deploy/                   systemd user service, udev rule
-tests/                    hardware-free 테스트 251개
+tests/                    hardware-free 테스트 300개 이상
 ADR/                      Architecture Decision Records
 ```
 
@@ -226,7 +231,7 @@ ADR/                      Architecture Decision Records
 | 3D 뷰어 | three.js r160(자체 호스팅), 직접 쓴 URDF 로더, 수치 야코비안 역기구학 |
 | Video / data | OpenCV camera input, PyAV / MP4, LeRobot dataset format |
 | Deployment | `uv`, systemd user service, udev device alias |
-| 검증 | pytest 기반 hardware-free 테스트 251개 + read-only bus doctor |
+| 검증 | pytest 기반 hardware-free 테스트 300개 이상 + read-only bus doctor |
 
 ## 문서
 

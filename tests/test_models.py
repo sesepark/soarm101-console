@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import signal
 import threading
 from pathlib import Path
 
@@ -219,7 +220,7 @@ def test_rollout_config_uses_rtc_duration_camera_rename_and_policy_limit(model_r
     assert config.strategy.type == "base"
     assert config.inference.type == "rtc"
     assert config.duration == 137
-    assert config.return_to_initial_position is True
+    assert config.return_to_initial_position is False
     assert config.robot.max_relative_target == 3.0
     assert config.rename_map == {
         "observation.images.scene": "observation.images.camera1",
@@ -238,9 +239,12 @@ def test_policy_home_is_validated_in_follower_units_and_calibration(policy_setti
 
 def test_policy_home_alignment_uses_replay_s_curve_and_exact_goal(policy_settings, monkeypatch):
     class Bus:
+        readings = 0
+
         def sync_read(self, register, num_retry=0):
             assert register == "Present_Position"
-            return {name: 0.0 for name in HOME}
+            self.readings += 1
+            return {name: 0.0 for name in HOME} if self.readings == 1 else HOME
 
     class Robot:
         bus = Bus()
@@ -272,6 +276,86 @@ def test_policy_without_home_skips_alignment_and_hardware(policy_settings, monke
     )
 
     assert policying.align_home(policy_settings, None, threading.Event()) is False
+
+
+def test_policy_home_alignment_retries_until_measured_arrival(policy_settings, monkeypatch):
+    positions = [
+        {name: 0.0 for name in HOME},
+        {**HOME, "shoulder_lift": HOME["shoulder_lift"] + 5.0},
+        HOME,
+    ]
+
+    class Bus:
+        def sync_read(self, register, num_retry=0):
+            return positions.pop(0)
+
+    class Robot:
+        bus = Bus()
+
+        def disconnect(self):
+            pass
+
+    starts = []
+    monkeypatch.setattr(policying, "_connect", lambda settings: Robot())
+    monkeypatch.setattr(
+        policying,
+        "align",
+        lambda robot, start, goal, **kwargs: starts.append(dict(start)) or False,
+    )
+    monkeypatch.setattr(policying, "_write_status", lambda **values: None)
+
+    assert policying.align_home(policy_settings, HOME, threading.Event()) is False
+    assert starts == [
+        {name: 0.0 for name in HOME},
+        {**HOME, "shoulder_lift": HOME["shoulder_lift"] + 5.0},
+    ]
+
+
+def test_policy_home_alignment_stop_holds_at_current_position(policy_settings, monkeypatch):
+    disconnected = []
+    stop_requested = threading.Event()
+    stop_requested.set()
+
+    class Bus:
+        def sync_read(self, register, num_retry=0):
+            return {name: 0.0 for name in HOME}
+
+    class Robot:
+        bus = Bus()
+
+        def disconnect(self):
+            disconnected.append(True)
+
+    monkeypatch.setattr(policying, "_connect", lambda settings: Robot())
+    monkeypatch.setattr(policying, "align", lambda *args, **kwargs: True)
+
+    assert policying.align_home(policy_settings, HOME, stop_requested, phase="returning") is True
+    assert disconnected == [True]
+
+
+def test_policy_home_alignment_reports_arrival_timeout(policy_settings, monkeypatch):
+    class Bus:
+        def sync_read(self, register, num_retry=0):
+            return {name: 0.0 for name in HOME}
+
+    class Robot:
+        bus = Bus()
+
+        def disconnect(self):
+            pass
+
+    times = iter([0.0, policying.ALIGNMENT_ARRIVAL_TIMEOUT_S + 1.0])
+    monkeypatch.setattr(policying, "_connect", lambda settings: Robot())
+    monkeypatch.setattr(policying.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        policying,
+        "align",
+        lambda *args, **kwargs: kwargs["should_stop"](),
+    )
+    monkeypatch.setattr(policying, "_write_status", lambda **values: None)
+
+    with pytest.raises(policying.ReplayError, match="did not reach its target within 30s"):
+        policying.align_home(policy_settings, HOME, threading.Event(), phase="returning")
 
 
 @pytest.fixture
@@ -321,8 +405,9 @@ def test_policy_start_rejects_home_outside_calibration_as_400(client, policy_set
     assert "outside calibration range" in detail
 
 
-def test_policy_status_exposes_used_home_and_phase():
+def test_policy_status_exposes_used_home_and_phase(tmp_path):
     manager = PolicyManager(_settings())
+    manager.runtime_dir = tmp_path
     manager._home = dict(HOME)
     manager._phase = "aligning"
 
@@ -330,6 +415,137 @@ def test_policy_status_exposes_used_home_and_phase():
 
     assert result["home"] == HOME
     assert result["phase"] == "aligning"
+
+    manager._phase = "returning"
+    manager._process = type("Running", (), {"poll": lambda self: None})()
+    returning = manager.status()
+    assert returning["phase"] == "returning"
+    assert returning["running"] is True
+
+
+@pytest.mark.parametrize("requested_home", [HOME, None])
+def test_policy_main_returns_to_requested_or_captured_home(
+    policy_settings, monkeypatch, requested_home
+):
+    captured = {**HOME, "shoulder_pan": 9.0}
+    phases = []
+    alignments = []
+
+    monkeypatch.setattr(
+        policying,
+        "Settings",
+        lambda: dataclasses.replace(
+            policy_settings, motion_enabled=True, camera_roles_confirmed=True
+        ),
+    )
+    monkeypatch.setattr(policying, "validate_calibration", lambda path: None)
+    monkeypatch.setattr(policying, "inherited_locks_cover", lambda devices: True)
+    monkeypatch.setattr(policying, "build_rollout_config", lambda *args: object())
+    monkeypatch.setattr(
+        policying,
+        "present_position",
+        lambda settings, acquire_owner_lock: captured,
+    )
+    monkeypatch.setattr(
+        policying,
+        "align_home",
+        lambda settings, goal, event, *, phase: alignments.append((phase, goal)) or False,
+    )
+    monkeypatch.setattr(
+        policying,
+        "_write_status",
+        lambda **values: phases.append(values["phase"]),
+    )
+    from lerobot.scripts import lerobot_rollout
+
+    monkeypatch.setattr(lerobot_rollout, "rollout", lambda config: None)
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+    monkeypatch.setenv("SOARM_POLICY_TASK", "Pick up block")
+    monkeypatch.setenv("SOARM_POLICY_HOME", json.dumps(requested_home) if requested_home else "")
+
+    policying.main()
+
+    assert list(dict.fromkeys(phases)) == (
+        ["aligning", "running", "returning"]
+        if requested_home
+        else ["running", "returning"]
+    )
+    assert alignments[-1] == ("returning", requested_home or captured)
+
+
+def test_policy_main_records_return_failure(policy_settings, monkeypatch):
+    statuses = []
+
+    monkeypatch.setattr(
+        policying,
+        "Settings",
+        lambda: dataclasses.replace(
+            policy_settings, motion_enabled=True, camera_roles_confirmed=True
+        ),
+    )
+    monkeypatch.setattr(policying, "validate_calibration", lambda path: None)
+    monkeypatch.setattr(policying, "inherited_locks_cover", lambda devices: True)
+    monkeypatch.setattr(policying, "build_rollout_config", lambda *args: object())
+    monkeypatch.setattr(policying, "_write_status", lambda **values: statuses.append(values))
+
+    def alignment(settings, goal, event, *, phase):
+        if phase == "returning":
+            raise policying.ReplayError("arrival timed out")
+        return False
+
+    monkeypatch.setattr(policying, "align_home", alignment)
+    from lerobot.scripts import lerobot_rollout
+
+    monkeypatch.setattr(lerobot_rollout, "rollout", lambda config: None)
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+    monkeypatch.setenv("SOARM_POLICY_TASK", "Pick up block")
+    monkeypatch.setenv("SOARM_POLICY_HOME", json.dumps(HOME))
+
+    with pytest.raises(RuntimeError, match="return to initial position failed"):
+        policying.main()
+
+    assert statuses[-1]["phase"] == "returning"
+    assert "return to initial position failed" in statuses[-1]["error"]
+
+
+def test_sigterm_during_policy_return_stops_alignment(policy_settings, monkeypatch):
+    return_was_stopped = []
+
+    monkeypatch.setattr(
+        policying,
+        "Settings",
+        lambda: dataclasses.replace(
+            policy_settings, motion_enabled=True, camera_roles_confirmed=True
+        ),
+    )
+    monkeypatch.setattr(policying, "validate_calibration", lambda path: None)
+    monkeypatch.setattr(policying, "inherited_locks_cover", lambda devices: True)
+    monkeypatch.setattr(policying, "build_rollout_config", lambda *args: object())
+    monkeypatch.setattr(policying, "_write_status", lambda **values: None)
+
+    def alignment(settings, goal, event, *, phase):
+        if phase == "returning":
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+            return_was_stopped.append(event.is_set())
+            return True
+        return False
+
+    monkeypatch.setattr(policying, "align_home", alignment)
+    from lerobot.scripts import lerobot_rollout
+
+    monkeypatch.setattr(lerobot_rollout, "rollout", lambda config: None)
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+    monkeypatch.setenv("SOARM_POLICY_TASK", "Pick up block")
+    monkeypatch.setenv("SOARM_POLICY_HOME", json.dumps(HOME))
+
+    policying.main()
+
+    assert return_was_stopped == [True]
 
 
 def test_policy_start_refuses_a_missing_model(client):

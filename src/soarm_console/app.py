@@ -93,7 +93,7 @@ static_dir = Path(__file__).with_name("static")
 async def lifespan(_: FastAPI):
     yield
     # 정책은 예측한 목표로 혼자 움직이는 모드다. 서버 종료에서도 가장 먼저 세워 rollout
-    # teardown이 시작 자세로 돌아갈 기회를 준다.
+    # teardown 뒤 콘솔의 s-curve 복귀가 기준 자세로 돌아갈 기회를 준다.
     with suppress(TeleopError):
         policy_manager.stop()
     for worker in cameras.values():
@@ -1058,7 +1058,7 @@ def stop_policy() -> dict[str, object]:
 @app.post("/api/mode/stop")
 def stop_active_mode() -> dict[str, object]:
     try:
-        # 예측한 목표로 혼자 움직이는 정책을 가장 먼저 세워 teardown(시작 자세 복귀)을
+        # 예측한 목표로 혼자 움직이는 정책을 가장 먼저 세워 teardown과 콘솔 복귀를
         # 시작한다. 그 뒤 사람이 만든 궤적을 따르는 재생과 나머지 모드를 세운다.
         if policy_manager.running:
             policy_manager.stop()

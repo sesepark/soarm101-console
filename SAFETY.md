@@ -93,12 +93,14 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 `camera_map`을 뒤집은 `rename_map`으로 학습 때와 같은 image feature 이름을 만든다.
 
 중지는 서브프로세스에 SIGTERM을 보내 LeRobot의 `ProcessSignalHandler`와 teardown을 지나게
-한다. `return_to_initial_position=true`이므로 정상 teardown은 팔을 시작 자세로 되돌린다.
-정책 요청에 `home`이 있으면 rollout을 열기 전에 재생과 같은 느린 s-curve(첨두 20°/s)로
-그 자세까지 옮긴다. 따라서 LeRobot이 기억하는 시작 자세가 곧 `home`이고, 종료 복귀는 기존
-`return_to_initial_position=true` 하나만 맡는다. 별도의 두 번째 복귀 동작은 만들지 않는다.
-SIGKILL은 SIGTERM 뒤 20초에도 자식이 남는 마지막 수단뿐이다. `/api/mode/stop`은 정책을 가장
-먼저 세운다. 이 경로도 충돌 회피나 독립 전원 차단을 제공하지 않으며, 실물 검증은 현장 관찰자와
+한다. LeRobot의 시간제 복귀는 틱당 상대 목표 상한에 잘린 채 끝날 수 있으므로
+`return_to_initial_position=false`로 끄고, 콘솔이 teardown 뒤 재생과 같은 느린
+s-curve(첨두 20°/s)로 직접 복귀한다. 정책 요청에 `home`이 있으면 시작 전에 그 자세로 정렬하고
+끝에도 같은 자세로 돌아간다. `home`이 없으면 rollout 직전에 읽은 관절값을 복귀 목표로 쓴다.
+복귀는 실제 관절값의 도착을 확인하며 `phase="returning"` 동안에도 프로세스와 owner lock이
+살아 있다. 이때 다시 SIGTERM이 오면 그 자리에서 멈추고 토크를 유지한다. 도착 제한 시간이나
+오류는 상태의 `error`에 남긴다. SIGKILL은 SIGTERM 뒤 40초에도 자식이 남는 마지막 수단뿐이다.
+`/api/mode/stop`은 정책을 가장 먼저 세운다. 이 경로도 충돌 회피나 독립 전원 차단을 제공하지 않으며, 실물 검증은 현장 관찰자와
 전원 차단 수단이 있을 때 별도로 해야 한다.
 
 **수집 중 회차를 버리는 길(2026-09-05)**: `POST /api/recording/control`의 `abort`는 찍던

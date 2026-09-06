@@ -13,12 +13,15 @@ from .config import Settings
 from .calibration import validate_calibration
 from .models import describe_model, model_dir
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
-from .replaying import REPLAY_ALIGNMENT, _connect, align
+from .replaying import REPLAY_ALIGNMENT, ReplayError, _connect, align, present_position
 from .vleader.spec import JOINT_ORDER, SpecError, load_joint_specs
 
 
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/policy"
 STATUS_PATH = RUNTIME_DIR / "status.json"
+ALIGNMENT_ARRIVAL_TIMEOUT_S = 30.0
+ALIGNMENT_TOLERANCE_DEG = 1.0
+ALIGNMENT_TOLERANCE_PERCENT = 2.0
 
 
 def validate_home(settings: Settings, home: dict[str, float] | None) -> dict[str, float] | None:
@@ -59,17 +62,19 @@ def align_home(
     settings: Settings,
     home: dict[str, float] | None,
     stop_requested: threading.Event,
+    *,
+    phase: str = "aligning",
 ) -> bool:
-    """정책 시작 자세로 재생과 똑같이 정렬한다. 자세가 없으면 팔에 연결하지 않는다."""
+    """정책 기준 자세로 재생과 똑같이 정렬하고, 실제 도착할 때까지 확인한다."""
     if home is None:
         return False
     robot = _connect(settings)
     try:
-        start = {
+        current = {
             name: float(value)
             for name, value in robot.bus.sync_read("Present_Position", num_retry=2).items()
         }
-
+        deadline = time.monotonic() + ALIGNMENT_ARRIVAL_TIMEOUT_S
         published = 0.0
 
         def publish(index: int, total: int, seconds_left: float) -> None:
@@ -78,7 +83,7 @@ def align_home(
             if index == 0 or now - published >= 0.1 or index == total:
                 published = now
                 _write_status(
-                    phase="aligning",
+                    phase=phase,
                     home=home,
                     frame=index,
                     total_frames=total,
@@ -86,14 +91,40 @@ def align_home(
                     error=None,
                 )
 
-        return align(
-            robot,
-            start,
-            home,
-            should_stop=stop_requested.is_set,
-            limits=REPLAY_ALIGNMENT,
-            progress=publish,
-        )
+        while True:
+            def should_stop() -> bool:
+                return stop_requested.is_set() or time.monotonic() >= deadline
+
+            stopped = align(
+                robot,
+                current,
+                home,
+                should_stop=should_stop,
+                limits=REPLAY_ALIGNMENT,
+                progress=publish,
+            )
+            if stopped and stop_requested.is_set():
+                return True
+            current = {
+                name: float(value)
+                for name, value in robot.bus.sync_read("Present_Position", num_retry=2).items()
+            }
+            outside = {
+                name: abs(home[name] - current[name])
+                for name in home
+                if abs(home[name] - current[name])
+                > (ALIGNMENT_TOLERANCE_PERCENT if name == "gripper" else ALIGNMENT_TOLERANCE_DEG)
+            }
+            if not outside:
+                return False
+            if stopped or time.monotonic() >= deadline:
+                detail = ", ".join(
+                    f"{name} {distance:.1f}" for name, distance in sorted(outside.items())
+                )
+                raise ReplayError(
+                    f"Policy {phase} did not reach its target within "
+                    f"{ALIGNMENT_ARRIVAL_TIMEOUT_S:g}s (remaining: {detail})"
+                )
     finally:
         robot.disconnect()
 
@@ -156,7 +187,7 @@ def build_rollout_config(
         duration=max_seconds,
         task=task.strip(),
         rename_map=rename_map,
-        return_to_initial_position=True,
+        return_to_initial_position=False,
         display_data=False,
         play_sounds=False,
     )
@@ -216,18 +247,42 @@ def main() -> None:
             phase=phase, home=home or {}, run=run, step=step, task=task, error=None
         )
         try:
-            stopped = align_home(settings, home, stop_requested)
+            stopped = align_home(settings, home, stop_requested, phase="aligning")
             if stopped:
                 _write_status(phase="aligning", home=home or {}, run=run, step=step, task=task)
                 return
-            # rollout은 자신의 SIGTERM teardown으로 시작 자세에 돌아간다. 정렬용 핸들러를
-            # 여기까지 끌고 가면 그 정상 종료 신호를 삼키므로 반드시 원래 처리로 되돌린다.
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            # home이 없으면 LeRobot이 예전에 기억하던 것과 같은 자리를, rollout이 팔을
+            # 연결하기 직전에 읽는다. 이미 owner lock을 갖고 있으므로 다른 모드가 사이에
+            # 끼어 관절값을 바꿀 수 없다.
+            return_home = home or present_position(settings, acquire_owner_lock=False)
             config = build_rollout_config(settings, run, step, task, fps, max_seconds)
+            if stop_requested.is_set():
+                return
             phase = "running"
             _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
-            lerobot_rollout.rollout(config)
-            _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            try:
+                # LeRobot의 ProcessSignalHandler가 running 중 SIGTERM을 받아 rollout을
+                # teardown한다. 자체 복귀는 꺼져 있으므로 teardown 뒤 아래로 내려온다.
+                lerobot_rollout.rollout(config)
+            finally:
+                phase = "returning"
+                return_stop_requested = threading.Event()
+                signal.signal(
+                    signal.SIGTERM,
+                    lambda _signum, _frame: return_stop_requested.set(),
+                )
+                _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
+                try:
+                    align_home(
+                        settings,
+                        return_home,
+                        return_stop_requested,
+                        phase="returning",
+                    )
+                except BaseException as exc:
+                    raise RuntimeError(f"Policy return to initial position failed: {exc}") from exc
+                _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
         except BaseException as exc:
             _write_status(
                 phase=phase,

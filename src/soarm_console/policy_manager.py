@@ -159,7 +159,7 @@ class PolicyManager:
             threading.Thread(target=self._collect_logs, daemon=True).start()
             threading.Thread(target=self._watch_exit, args=(self._process, owner_locks), daemon=True).start()
 
-    def stop(self, timeout: float = 20.0) -> None:
+    def stop(self, timeout: float = 40.0) -> None:
         process = self._process
         if process is None or process.poll() is not None:
             self._release_locks()
@@ -168,7 +168,7 @@ class PolicyManager:
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            # Rollout gets the full timeout to run teardown and return the arm.  A stuck
+            # Rollout gets the full timeout to run teardown and let the console return the arm. A stuck
             # child cannot be left commanding hardware indefinitely, so SIGKILL is the
             # final safety cutoff only after that graceful path failed.
             os.killpg(process.pid, signal.SIGKILL)
@@ -188,7 +188,7 @@ class PolicyManager:
             pass
         error = runtime.get("error")
         runtime_phase = runtime.get("phase")
-        if runtime_phase in {"aligning", "running"}:
+        if runtime_phase in {"aligning", "running", "returning"}:
             self._phase = str(runtime_phase)
         if error is None and process is not None and process.poll() not in (None, 0):
             error = self._logs[-1] if self._logs else f"Policy process exited with code {process.poll()}"

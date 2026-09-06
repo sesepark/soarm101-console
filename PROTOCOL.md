@@ -128,13 +128,17 @@ Hardware ownership은 command lease와 별개다.
 | `POST` | `/api/models/{run}/{step}` | Spark 체크포인트를 `models/`로 회수하고 명세 생성 |
 | `DELETE` | `/api/models/{run}/{step}` | 로컬 사본 삭제, `{run, step, freed_bytes}` 반환 |
 | `POST` | `/api/policy/start` | `{run, step, task, fps, max_seconds, home?}`로 rollout 시작 |
-| `POST` | `/api/policy/stop` | SIGTERM으로 rollout teardown 시작 |
+| `POST` | `/api/policy/stop` | SIGTERM으로 rollout 중지 또는 복귀 중 현재 자세 정지 |
 
 `POST /api/policy/start`는 `X-SOARM-Motion-Token`을 요구한다. `max_seconds`는 기본 120,
 `home`은 선택적인 관절 자세 객체다. 관절은 도, `gripper`는 퍼센트이며, 주어지면 재생과
 같은 s-curve/20°/s 첨두 속도로 먼저 그 자세에 정렬한 뒤 rollout을 시작한다. 이름은 팔로워의
 여섯 관절과 정확히 같아야 하고 calibration 범위 밖 값은 400으로 거절한다. `/api/status`의
-`policy.home`은 실제 사용한 자세(없으면 `{}`), `policy.phase`는 `aligning` 또는 `running`이다.
+`policy.home`은 요청에서 실제 사용한 자세(없으면 `{}`), `policy.phase`는 시작 자세로 가는
+`aligning`, rollout이 도는 `running`, 콘솔이 기준 자세로 복귀하는 `returning` 중 하나다.
+복귀 목표는 `home`이 있으면 그 값이고, 없으면 rollout 직전에 읽은 관절값이다. LeRobot 자체의
+시간제 복귀는 끄며, 콘솔이 같은 s-curve로 실제 도착을 확인할 때까지 복귀한다. 복귀 중에도
+`running=true`이고 stop을 받으면 현재 자세에서 토크를 유지한 채 선다. 복귀 실패는 `error`에 남는다.
 허용 범위 1–600초이고 LeRobot `RolloutConfig.duration`에 그대로 들어간다. `/api/status`와
 시작·중지 응답의 `policy` 상태에는 `run`, `step`, `task`, `started_at`, `expires_at`,
 `fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `home`, `phase`, `max_relative_target`,

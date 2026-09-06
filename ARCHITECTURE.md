@@ -70,8 +70,10 @@ Compute worker는 MacBook에 한정되지 않는다. 동일한 protocol을 구�
 
 현재 기본 owner는 LeRobot 기반 서버 Hardware Runtime이다. 이것은 영구 고정이 아니다. 향후 `ros2_control`이나 다른 runtime이 owner가 될 수 있지만, 전환 중 두 owner가 겹치면 안 된다.
 
-현재 실행 모드는 텔레옵, 수집, 재생, 정책 넷이다. 정책 모드는 follower와 scene/wrist 카메라를
-한 owner로 잡고, 다른 세 모드와 양방향으로 409 충돌 검사를 한다. 공통 정지는 예측 불가능한
+현재 실행 모드는 텔레옵, 수집, 재생, 정책, 카메라 캘리브레이션 다섯이다. 정책 모드와 캘리브레이션 모드는
+follower와 scene/wrist 카메라를 한 owner로 잡고, 다른 모드들과 **양방향으로** 409 충돌
+검사를 한다. 카메라 위치 추정 자체는 모드가 아니다 — 장치를 모르는 순수 객체이고, 그때그때
+프레임을 쥔 쪽이 넣어 주는 것만 받는다(`PERCEPTION.md`). 공통 정지는 예측 불가능한
 정책을 가장 먼저 SIGTERM으로 세운다.
 
 ### Command authority

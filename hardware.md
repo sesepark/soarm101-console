@@ -122,7 +122,7 @@ Follower: port open OK, discovered motors: none
 
 두 카메라는 동일한 USB serial number `20250606105`를 보고한다. 그 때문에 `/dev/v4l/by-id/usb-Xitech_USB_Camera_20250606105-*` 링크는 한 카메라만 가리키며 재연결 순서에 따라 대상이 달라질 수 있다. 카메라 설정에는 반드시 위 `by-path` 경로를 사용한다.
 
-아직 root port 7/8 중 어느 것이 장면 카메라와 손목 카메라인지는 문서에서 임의 지정하지 않았다. 실제 영상을 확인한 뒤 `scene`/`wrist` 역할을 이 표에 추가한다.
+역할은 확인했다(2026-09-06, 두 카메라 프레임 비교). `scene`은 테이블 위 **비스듬한 부감**이고 22mm 큐브가 22×20 픽셀로 잡힌다(약 1 mm/px). `wrist`는 **손목이 아니라 책상 높이의 고정 측면 카메라**다. 두 대 모두 배럴 왜곡이 뚜렷한 광각이다.
 
 ### 실제 지원 스트림 프로필
 
@@ -178,7 +178,10 @@ Waveshare 공식 데이터셋 문서도 두 arm은 hub에, 두 카메라는 Jets
 - 카메라에는 `/dev/video*`나 충돌하는 `by-id` 대신 `/dev/v4l/by-path/*-video-index0`를 사용한다.
 - 초기 수집 프로필은 두 카메라 `MJPEG 640x480@30`을 권장한다.
 - 두 카메라를 별도 capture thread에서 읽고 monotonic timestamp를 보존한다.
-- scene/wrist 카메라 역할, intrinsic calibration, 두 카메라와 robot base 사이 extrinsic calibration을 별도 기록한다.
+- scene/wrist 카메라 역할, intrinsic calibration, 두 카메라와 robot base 사이 extrinsic
+  calibration은 `PERCEPTION.md`가 맡는다. 절차와 코드는 구현되어 있고(2026-09-06), 실물
+  값은 아직 재지 않았다. **`wrist`는 이름과 달리 손목이 아니라 책상 높이의 고정 측면
+  카메라다** — 2026-09-06에 두 카메라 프레임을 받아 확인했다.
 - 학습 데이터 저장용 video compression은 USB 전송이 끝난 뒤 적용된다. H.264나 ROS `compressed` transport는 USB `STREAMON` 대역폭 문제를 해결하지 않는다.
 
 ## ROS 2 연동 원칙

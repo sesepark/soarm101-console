@@ -63,6 +63,10 @@ from .vleader.api import (
     build_router,
 )
 from .vleader.backend import HardwareError
+from .perception import store as perception_store
+from .perception.calibrating import preview_path as calibration_preview_path
+from .perception.hub import PerceptionHub
+from .perception_manager import CONFIRMATION as CALIBRATION_CONFIRMATION, PerceptionManager
 
 
 settings = Settings()
@@ -75,9 +79,21 @@ cameras = {
     "wrist": CameraWorker(settings.wrist_camera),
 }
 vleader = VirtualLeader(settings)
+calibrator = PerceptionManager(settings)
+# 추정기는 모드가 아니다. 장치를 모르는 채로 **프레임을 쥔 쪽**이 넣어 주는 것만 받는다.
+# 아무 모드도 안 돌 때는 아래에서 `CameraWorker`가 넣고, 모드가 돌 때는 그 자식이 넣는다.
+perception = PerceptionHub()
+for _role, _worker in cameras.items():
+    _worker.observer = (lambda role: lambda image, at: perception.offer(role, image, at))(_role)
+    _worker.on_release = (lambda role: lambda: perception.forget(role))(_role)
 policy_manager.other_mode_problem = lambda: (
     "Stop the running mode before starting a policy"
-    if recorder.running or teleop.running or replayer.running or vleader.running
+    if recorder.running or teleop.running or replayer.running or vleader.running or calibrator.running
+    else None
+)
+calibrator.other_mode_problem = lambda: (
+    "Stop the running mode before starting calibration"
+    if recorder.running or teleop.running or replayer.running or vleader.running or policy_manager.running
     else None
 )
 vleader.external_mode_problem = lambda: (
@@ -96,6 +112,9 @@ async def lifespan(_: FastAPI):
     # teardown 뒤 콘솔의 s-curve 복귀가 기준 자세로 돌아갈 기회를 준다.
     with suppress(TeleopError):
         policy_manager.stop()
+    with suppress(TeleopError):
+        calibrator.stop()
+    perception.close()
     for worker in cameras.values():
         worker.stop()
     # 가상 리더가 팔로워 serial을 쥐고 있으면 여기서 놓는다. `force=True`인 이유는
@@ -202,6 +221,10 @@ CAPABILITIES = [
     "sensor_extras",
     # 정책 rollout 전에 재생과 같은 느린 정렬로 지정 자세까지 간다.
     "policy_home",
+    # 카메라 두 대의 내부·외부 파라미터를 구하는 절차가 있다. 외부 쪽은 팔이 혼자 움직인다.
+    "rig_calibration",
+    # `/api/perception`이 큐브의 base_link 좌표를 내준다.
+    "object_position",
 ]
 
 
@@ -365,6 +388,10 @@ def status() -> dict[str, object]:
         "policy": policy_manager.status(),
         "policy_preflight": policy_manager.preflight(),
         "virtual_leader": vleader.status(),
+        "calibration": {
+            "intrinsics": perception.calibration_status(),
+            "extrinsics": calibrator.status(),
+        },
         "doctor": last_doctor,
     }
 
@@ -600,7 +627,7 @@ def spark_train(
 @app.post("/api/doctor")
 def doctor() -> dict[str, object]:
     global last_doctor
-    if teleop.running or recorder.running or vleader.running or policy_manager.running:
+    if teleop.running or recorder.running or vleader.running or policy_manager.running or calibrator.running:
         raise HTTPException(status_code=409, detail="Cannot inspect serial buses during an active mode")
     last_doctor = run_hardware_doctor(settings)
     return last_doctor
@@ -626,7 +653,10 @@ def release_torque(request: Request, body: TorqueReleaseRequest) -> dict[str, ob
     _authorise_motion(_token_from(request))
     if body.confirmation != RELEASE_CONFIRMATION:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if teleop.running or recorder.running or vleader.running or policy_manager.running:
+    if (
+        teleop.running or recorder.running or vleader.running
+        or policy_manager.running or calibrator.running
+    ):
         raise HTTPException(
             status_code=409,
             detail="Stop the running mode before releasing torque",
@@ -648,6 +678,11 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
         raise HTTPException(
             status_code=409,
             detail="Stop the replay before teleoperation: the follower has one owner",
+        )
+    if calibrator.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the camera calibration before teleoperation: the follower has one owner",
         )
     if policy_manager.running:
         raise HTTPException(
@@ -732,6 +767,11 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         raise HTTPException(
             status_code=409,
             detail="Stop the replay before recording: the follower has one owner",
+        )
+    if calibrator.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the camera calibration before recording: the follower and cameras have one owner",
         )
     if policy_manager.running:
         raise HTTPException(
@@ -891,6 +931,7 @@ def replay_preview(dataset: str, episode: int = 0) -> dict[str, object]:
         or vleader.running
         or replayer.running
         or policy_manager.running
+        or calibrator.running
     ):
         raise HTTPException(
             status_code=409,
@@ -949,6 +990,11 @@ def start_replay(request: ReplayRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
     if replayer.running:
         raise HTTPException(status_code=409, detail="Stop the replay that is already running")
+    if calibrator.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the camera calibration before replaying: the follower has one owner",
+        )
     if policy_manager.running:
         raise HTTPException(
             status_code=409,
@@ -1031,7 +1077,7 @@ def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="; ".join(model["problems"]))
     if policy_manager.running:
         raise HTTPException(status_code=409, detail="A policy rollout is already running")
-    if recorder.running or teleop.running or replayer.running or vleader.running:
+    if recorder.running or teleop.running or replayer.running or vleader.running or calibrator.running:
         raise HTTPException(status_code=409, detail="Stop the running mode before starting a policy")
     if not settings.motion_enabled:
         raise HTTPException(
@@ -1055,6 +1101,140 @@ def stop_policy() -> dict[str, object]:
     return policy_manager.status()
 
 
+class IntrinsicsRequest(BaseModel):
+    camera: str
+    target_views: int = 30
+
+
+class CalibrationRequest(BaseModel):
+    confirmation: str
+    poses: int = 24
+
+
+@app.get("/api/perception")
+def perception_status() -> dict[str, object]:
+    """리그 상태와 지금 보이는 큐브. 인증이 없고 언제나 200이다.
+
+    카메라가 꺼져 있어도 `rig`는 읽을 수 있어야 한다 — 사람이 이 화면에 처음 왔을 때
+    가장 먼저 묻는 것이 "무엇이 되어 있고 무엇이 안 되어 있나"이기 때문이다.
+    """
+    return perception.status()
+
+
+@app.post("/api/calibration/intrinsics/start")
+def start_intrinsics(body: IntrinsicsRequest) -> dict[str, object]:
+    """보드 모으기를 켠다. **팔은 움직이지 않으므로 모션 토큰을 받지 않는다.**
+
+    모드로 만들지 않은 이유가 있다. 모드가 되면 카메라 owner가 바뀌어 MJPEG 프리뷰가
+    꺼지는데, 그러면 사람은 화면을 못 보면서 보드를 흔들게 된다. 이 단계에서 사람이
+    가장 필요로 하는 것이 바로 그 화면이다.
+    """
+    if body.camera not in cameras:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    if calibrator.running or recorder.running or policy_manager.running:
+        raise HTTPException(status_code=409, detail="Stop the running mode before collecting board views")
+    try:
+        perception.start_collect(body.camera, body.target_views)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return perception.calibration_status()
+
+
+@app.post("/api/calibration/intrinsics/stop")
+def stop_intrinsics() -> dict[str, object]:
+    perception.stop_collect()
+    return perception.calibration_status()
+
+
+@app.post("/api/calibration/intrinsics/solve")
+def solve_intrinsics(body: IntrinsicsRequest) -> dict[str, object]:
+    """두 왜곡 모델을 모두 풀고 좋은 쪽을 저장한다. 워커 스레드에서 돈다."""
+    if body.camera not in cameras:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    try:
+        perception.solve(body.camera)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return perception.calibration_status()
+
+
+@app.delete("/api/calibration/intrinsics/{camera}")
+def discard_intrinsics(camera: str) -> dict[str, object]:
+    """렌즈를 만졌거나 해상도를 바꿨을 때. 그 카메라의 **자리도 함께** 버린다."""
+    if camera not in cameras:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    perception.discard(camera)
+    return perception.status()
+
+
+@app.post("/api/calibration/extrinsics/start")
+def start_extrinsics(request: Request, body: CalibrationRequest) -> dict[str, object]:
+    """**팔이 혼자 움직인다.** 거절 순서는 정책 시작과 같게 둔다."""
+    _authorise_motion(_token_from(request))
+    if body.confirmation != CALIBRATION_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
+    if not settings.motion_enabled:
+        raise HTTPException(
+            status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
+        )
+    if calibrator.running:
+        raise HTTPException(status_code=409, detail="Calibration is already running")
+    if recorder.running or teleop.running or replayer.running or vleader.running or policy_manager.running:
+        raise HTTPException(status_code=409, detail="Stop the running mode before starting calibration")
+    rig = perception_store.load()
+    missing = [role for role in perception_store.ROLES if role not in rig.intrinsics]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Collect the lens calibration first: {', '.join(missing)}",
+        )
+    # 보드 모으기가 켜져 있으면 그 카메라를 놓게 한 뒤에 시작한다. 자식이 카메라를
+    # 열어야 하므로 콘솔 쪽 worker가 먼저 손을 떼야 한다.
+    perception.stop_collect()
+    for worker in cameras.values():
+        worker.stop()
+    try:
+        calibrator.start(body.poses)
+    except TeleopError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return calibrator.status()
+
+
+@app.post("/api/calibration/extrinsics/stop")
+def stop_extrinsics() -> dict[str, object]:
+    try:
+        calibrator.stop()
+    except TeleopError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    perception.reload()
+    return calibrator.status()
+
+
+@app.get("/api/calibration/preview/{role}.jpg")
+def calibration_preview(role: str) -> Response:
+    """캘리브레이션이 방금 본 것. 수집 중 프리뷰와 같은 규칙이다.
+
+    캘리브레이션이 도는 동안 콘솔의 MJPEG은 꺼져 있다 — 카메라를 쥔 것은 자식이고
+    장치 하나를 두 프로세스가 열 수 없다. 오래된 그림은 404다.
+    """
+    if role not in cameras:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    if not calibrator.running:
+        raise HTTPException(status_code=404, detail="Calibration is not running")
+    path = calibration_preview_path(role)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="No preview yet") from exc
+    if age > PREVIEW_MAX_AGE_S:
+        raise HTTPException(status_code=404, detail="No preview yet")
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="No preview yet") from exc
+    return Response(content=content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/mode/stop")
 def stop_active_mode() -> dict[str, object]:
     try:
@@ -1062,6 +1242,8 @@ def stop_active_mode() -> dict[str, object]:
         # 시작한다. 그 뒤 사람이 만든 궤적을 따르는 재생과 나머지 모드를 세운다.
         if policy_manager.running:
             policy_manager.stop()
+        if calibrator.running:
+            calibrator.stop()
         if replayer.running:
             replayer.stop()
         if recorder.running:
@@ -1079,5 +1261,6 @@ def stop_active_mode() -> dict[str, object]:
         "recording": recorder.status(),
         "replay": replayer.status(),
         "policy": policy_manager.status(),
+        "calibration": calibrator.status(),
         "virtual_leader": vleader.status(),
     }

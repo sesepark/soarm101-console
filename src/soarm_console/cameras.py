@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import cv2
@@ -69,6 +69,15 @@ class CameraWorker:
         self._reconfigure = threading.Event()
         self._thread: threading.Thread | None = None
         self._clients = 0
+        # 디코드한 프레임을 한 번 더 보고 싶은 쪽. 지금은 위치 추정이 쓴다.
+        #
+        # 여기에 콜백을 두는 이유는 장치 소유권 때문이다. 장치 하나를 두 프로세스가 열 수
+        # 없으므로 추정기가 스스로 카메라를 열 수 없고, **이미 디코드된 프레임을 얻어
+        # 쓰는 것**만이 다른 모드와 부딪히지 않는 길이다. 콜백은 절대 막지 않아야 한다 —
+        # 여기서 몇십 ms를 쓰면 프리뷰의 프레임률이 통째로 떨어진다.
+        self.observer: Callable[[object, float], None] | None = None
+        #: 이 카메라가 닫혔다. 붙들고 있던 마지막 프레임을 버리라고 알린다.
+        self.on_release: Callable[[], None] | None = None
 
     # 기존 코드가 읽던 이름들은 그대로 둔다.
     @property
@@ -220,6 +229,11 @@ class CameraWorker:
                 if not self._capture_once(self.profile):
                     return
         finally:
+            if self.on_release is not None:
+                try:
+                    self.on_release()
+                except Exception:  # noqa: BLE001 - 카메라를 놓는 길이 콜백 때문에 막히면 안 된다
+                    pass
             with self._condition:
                 self._thread = None
                 self._frame = None
@@ -271,6 +285,11 @@ class CameraWorker:
                     time.sleep(0.03)
                     continue
                 consecutive_failures = 0
+                if self.observer is not None:
+                    try:
+                        self.observer(image, time.time())
+                    except Exception:  # noqa: BLE001 - 보는 쪽의 실패가 캡처를 세우지 않는다
+                        pass
                 now = time.monotonic()
                 scheduled = next_send_time(now, next_send, interval)
                 if scheduled is None:

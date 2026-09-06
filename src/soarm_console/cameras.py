@@ -187,25 +187,21 @@ class CameraWorker:
                 self._condition.notify_all()
 
     def frames(self) -> Iterator[bytes]:
-        self.acquire()
         last_frame: bytes | None = None
-        try:
-            while not self._stop.is_set():
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: self._frame is not None and self._frame is not last_frame
-                        or self._error is not None
-                        or self._stop.is_set(),
-                        timeout=2,
-                    )
-                    if self._error and self._frame is None:
-                        raise RuntimeError(self._error)
-                    frame = self._frame
-                if frame is not None and frame is not last_frame:
-                    last_frame = frame
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        finally:
-            self.release()
+        while not self._stop.is_set():
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._frame is not None and self._frame is not last_frame
+                    or self._error is not None
+                    or self._stop.is_set(),
+                    timeout=2,
+                )
+                if self._error and self._frame is None:
+                    raise RuntimeError(self._error)
+                frame = self._frame
+            if frame is not None and frame is not last_frame:
+                last_frame = frame
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
 
     def _capture(self) -> None:
         owner_locks: DeviceLockSet | None = None

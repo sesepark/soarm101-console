@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
 from .config import Settings
@@ -345,8 +346,11 @@ def camera_stream(name: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="Unknown camera")
     if not Path(worker.path).exists():
         raise HTTPException(status_code=503, detail=f"Camera is not connected: {worker.path}")
+    worker.acquire()
     return StreamingResponse(
-        worker.frames(), media_type="multipart/x-mixed-replace; boundary=frame"
+        worker.frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        background=BackgroundTask(worker.release),
     )
 
 

@@ -1,4 +1,6 @@
 import json
+import queue
+import threading
 from pathlib import Path
 
 import pytest
@@ -66,6 +68,114 @@ def test_unknown_camera_is_rejected():
     with pytest.raises(HTTPException) as error:
         camera_stream("unknown")
     assert error.value.status_code == 404
+
+
+class ControlledStreamWorker:
+    """Test worker whose streams stay open until their matching event is set."""
+
+    def __init__(self, path: Path, stream_ends: list[threading.Event]):
+        self.path = str(path)
+        self._stream_ends = queue.Queue()
+        for stream_end in stream_ends:
+            self._stream_ends.put(stream_end)
+        self._condition = threading.Condition()
+        self._clients = 0
+
+    @property
+    def clients(self) -> int:
+        with self._condition:
+            return self._clients
+
+    def acquire(self) -> None:
+        with self._condition:
+            self._clients += 1
+            self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._clients -= 1
+            self._condition.notify_all()
+
+    def wait_for_clients(self, expected: int) -> bool:
+        with self._condition:
+            return self._condition.wait_for(lambda: self._clients == expected, timeout=3)
+
+    def frames(self):
+        stream_end = self._stream_ends.get_nowait()
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\njpeg\r\n"
+        stream_end.wait(timeout=10)
+
+
+def request_camera_stream(client, errors: list[BaseException]) -> None:
+    try:
+        with client.stream("GET", "/api/cameras/scene.mjpg") as response:
+            assert response.status_code == 200
+            response.read()
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def test_closing_a_camera_stream_releases_its_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app, cameras
+
+    camera = tmp_path / "camera"
+    camera.touch()
+    stream_end = threading.Event()
+    worker = ControlledStreamWorker(camera, [stream_end])
+    monkeypatch.setitem(cameras, "scene", worker)
+    errors: list[BaseException] = []
+    thread = threading.Thread(
+        target=request_camera_stream, args=(TestClient(app), errors), daemon=True
+    )
+
+    thread.start()
+    assert worker.wait_for_clients(1)
+    stream_end.set()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert worker.clients == 0
+
+
+def test_closing_one_of_two_camera_streams_releases_only_its_client(
+    tmp_path, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from soarm_console.app import app, cameras
+
+    camera = tmp_path / "camera"
+    camera.touch()
+    first_end = threading.Event()
+    second_end = threading.Event()
+    worker = ControlledStreamWorker(camera, [first_end, second_end])
+    monkeypatch.setitem(cameras, "scene", worker)
+    errors: list[BaseException] = []
+    threads = [
+        threading.Thread(
+            target=request_camera_stream, args=(TestClient(app), errors), daemon=True
+        )
+        for _ in range(2)
+    ]
+
+    for thread in threads:
+        thread.start()
+    assert worker.wait_for_clients(2)
+
+    first_end.set()
+    assert worker.wait_for_clients(1)
+    assert worker.clients == 1
+
+    second_end.set()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert worker.clients == 0
 
 
 def test_camera_settings_accept_phone_saver_profile_and_report_it(monkeypatch):

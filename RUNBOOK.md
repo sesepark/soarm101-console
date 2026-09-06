@@ -40,9 +40,9 @@ temperature를 읽는다. 읽기도 serial packet을 보내므로 다른 owner�
 
 ### 1.1 영상 인코딩에 필요한 시스템 라이브러리
 
-이 기계에는 `libavdevice.so.58`이 없어 `torchcodec`이 로드되지 않는다. 동작 자체는
+HUB에는 아직 `ffmpeg`(`libavdevice.so.58`)가 없어 `torchcodec`이 로드되지 않는다. 동작 자체는
 `pyav` 폴백으로 돌지만, `record.log`가 100줄짜리 트레이스백으로 시작해 정작 읽어야 할
-경고를 밀어낸다. 사람이 한 번 설치한다:
+경고를 밀어낸다. 자동 설치하지 말고 사람이 한 번 설치한다:
 
 ```bash
 sudo apt install ffmpeg

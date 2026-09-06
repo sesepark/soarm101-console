@@ -463,6 +463,7 @@ def test_the_next_save_tells_the_screen_how_long_the_last_one_took(tmp_path, mon
 def counters(monkeypatch):
     """세는 값은 모듈 전역이다. 시험마다 0에서 시작한다."""
     monkeypatch.setattr(recording, "_total_frames", 0)
+    monkeypatch.setattr(recording, "_total_seconds", 0.0)
     monkeypatch.setattr(recording, "_sensor_read_failures", 0)
     monkeypatch.setattr(recording, "_camera_stale_frames", {"scene": 0, "wrist": 0})
     monkeypatch.setattr(recording, "_sensor_implausible", {"temperature": 0, "voltage": 0})
@@ -496,6 +497,24 @@ def test_the_stale_rate_is_the_whole_session_not_the_last_three_seconds(counters
     assert quality["camera_stale_frames"] == {"scene": 28, "wrist": 32}
     assert quality["camera_stale_pct"]["scene"] == pytest.approx(2.54, abs=0.01)
     assert quality["camera_stale_pct"]["wrist"] == pytest.approx(2.90, abs=0.01)
+
+
+def test_recording_time_accumulates_only_the_episode_loops(tmp_path, monkeypatch, counters):
+    monkeypatch.setattr(recording, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(recording, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(recording, "_ORIGINAL_RECORD_LOOP", lambda *args, **kwargs: time.sleep(0.02))
+
+    recording._record_loop_with_status(
+        robot=_Robot(), dataset=SimpleNamespace(num_episodes=0), control_time_s=10
+    )
+    recording._record_loop_with_status(
+        robot=_Robot(), dataset=SimpleNamespace(num_episodes=1), control_time_s=10
+    )
+    recorded_seconds = recording._sensor_quality_fields()["total_seconds"]
+    recording._record_loop_with_status(robot=_Robot(), dataset=None, control_time_s=10)
+
+    assert recorded_seconds >= 0.04
+    assert recording._sensor_quality_fields()["total_seconds"] == recorded_seconds
 
 
 def test_repeated_rows_are_counted_but_their_values_are_not_touched(counters):

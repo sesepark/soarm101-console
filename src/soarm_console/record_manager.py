@@ -57,6 +57,15 @@ def _merge_session_quality(
     merged: dict[str, object] = dict(session)
     for key in _COUNTED_QUALITY_KEYS:
         merged[key] = _as_int(session.get(key)) + _as_int(previous.get(key))
+    current_seconds = _as_float(session.get("total_seconds"))
+    previous_seconds = _as_float(previous.get("total_seconds"))
+    if previous_seconds <= 0.0:
+        previous_frames = _as_int(previous.get("total_frames"))
+        previous_hz = _as_float(previous.get("loop_hz"))
+        if previous_frames > 0 and previous_hz > 0.0:
+            # `total_seconds`를 쓰기 전 품질 파일도 이어 찍을 수 있어야 한다.
+            previous_seconds = previous_frames / previous_hz
+    merged["total_seconds"] = current_seconds + previous_seconds
     for key in _COUNTED_QUALITY_MAPS:
         current = session.get(key)
         current = current if isinstance(current, dict) else {}
@@ -81,6 +90,13 @@ def _as_int(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def preview_path(runtime_dir: Path, role: str) -> Path:
@@ -372,11 +388,16 @@ class RecordManager:
                 previous = {}
         session = runtime.get("session_quality")
         session = session if isinstance(session, dict) else {}
+        merged = _merge_session_quality(session, previous if self._resumed else {})
+        frames = _as_int(merged.get("total_frames"))
+        seconds = _as_float(merged.get("total_seconds"))
         quality = {
-            "loop_hz": runtime.get("loop_hz"),
+            # status의 값은 최근 3초 창이다. 품질 파일은 저장·정리를 뺀 모든 기록 구간의
+            # 프레임 수와 wall time으로 데이터셋 전체의 실제 속도를 말한다.
+            "loop_hz": frames / seconds if frames > 0 and seconds > 0.0 else runtime.get("loop_hz"),
             "slow_loop_warnings": warnings,
             "recorded_at": time.time(),
-            **_merge_session_quality(session, previous if self._resumed else {}),
+            **merged,
         }
         try:
             path.write_text(json.dumps(quality), encoding="utf-8")

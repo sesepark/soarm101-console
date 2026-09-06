@@ -87,6 +87,8 @@ _saving_seconds: float | None = None
 #: 2.90%였다. 화면이 지금 어떤지를 묻는 값과 이 데이터가 어떻게 찍혔는지를 묻는 값은
 #: 서로 다른 값이고, `soarm_quality.json`이 답해야 하는 것은 뒤쪽이다.
 _total_frames = 0
+#: 실제 기록 루프가 돈 시간의 세션 합계. 저장·정리 구간은 들어가지 않는다.
+_total_seconds = 0.0
 _camera_stale_frames: dict[str, int] = {key: 0 for key in sensors.CAMERA_KEYS}
 #: 블록 읽기가 실패해 직전 값이 되풀이된 프레임 수(`observation.sensor_read_ok` == 0).
 _sensor_read_failures = 0
@@ -431,7 +433,7 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
     fields we consume and forwarding every argument unchanged (apart from the
     transparent robot proxy) makes an upstream signature change fail loudly.
     """
-    global _consecutive_connection_failures, _episodes_aborted
+    global _consecutive_connection_failures, _episodes_aborted, _total_seconds
 
     robot = kwargs["robot"]
     dataset = kwargs.get("dataset")
@@ -481,6 +483,7 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
         events["exit_early"] = False
     # 표를 비운 **뒤에** 문을 연다. 순서가 반대면 그사이에 적용된 키가 곧바로 지워진다.
     _loop_running.set()
+    recording_started = time.perf_counter() if dataset is not None else None
     try:
         try:
             return _ORIGINAL_RECORD_LOOP(*args, **forwarded)
@@ -503,6 +506,8 @@ def _record_loop_with_status(*args: object, **kwargs: object) -> object:
             return None
     finally:
         _loop_running.clear()
+        if recording_started is not None:
+            _total_seconds += time.perf_counter() - recording_started
         monitor.stop()
         preview.stop()
         if reader is not None:
@@ -622,6 +627,7 @@ def _sensor_quality_fields() -> dict[str, object]:
     """`soarm_quality.json`이 실을, 이 세션에서 실제로 센 값들."""
     return {
         "total_frames": _total_frames,
+        "total_seconds": _total_seconds,
         "episodes_aborted": _episodes_aborted,
         "camera_stale_frames": dict(_camera_stale_frames),
         "camera_stale_pct": {

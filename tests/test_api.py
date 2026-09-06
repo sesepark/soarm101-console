@@ -641,6 +641,7 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
             "camera_stale_pct": {"wrist": 0.0},
             "session_quality": {
                 "total_frames": 1104,
+                "total_seconds": 36.8,
                 "episodes_aborted": 2,
                 "camera_stale_frames": {"scene": 28, "wrist": 32},
                 "camera_stale_pct": {"scene": 2.54, "wrist": 2.90},
@@ -654,7 +655,8 @@ def test_the_recording_leaves_its_own_measurements_beside_the_dataset(tmp_path, 
     )
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
-    assert quality["loop_hz"] == 28.6
+    assert quality["loop_hz"] == pytest.approx(30.0)
+    assert quality["total_seconds"] == 36.8
     # 창 값이 아니라 세션 전체다. 3초 창은 회차가 끝나는 순간만 말한다.
     assert quality["camera_stale_frames"] == {"scene": 28, "wrist": 32}
     assert quality["total_frames"] == 1104
@@ -707,16 +709,21 @@ def test_resuming_adds_this_runs_warnings_to_the_ones_already_counted(tmp_path, 
     data = tmp_path / "data" / "soarm101_pick"
     data.mkdir(parents=True)
     (data / "soarm_quality.json").write_text(
-        json.dumps({"slow_loop_warnings": 5, "loop_hz": 22.0}), encoding="utf-8"
+        json.dumps({"slow_loop_warnings": 5, "loop_hz": 20.0, "total_frames": 200}),
+        encoding="utf-8",
     )
     manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=True, warnings=3)
 
-    manager._write_quality(data, {"loop_hz": 29.9, "camera_stale_pct": {}})
+    manager._write_quality(data, {"loop_hz": 15.9, "session_quality": {
+        "total_frames": 300, "total_seconds": 10.0,
+    }})
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
     assert quality["slow_loop_warnings"] == 8
-    # 속도는 이번 실행의 값으로 바뀐다 — 더할 수 있는 것이 아니다.
-    assert quality["loop_hz"] == 29.9
+    # 구형 파일의 200 / 20 == 10초와 이번 10초를 합친 세션 평균이다.
+    assert quality["total_frames"] == 500
+    assert quality["total_seconds"] == pytest.approx(20.0)
+    assert quality["loop_hz"] == pytest.approx(25.0)
 
 
 def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, monkeypatch):
@@ -730,6 +737,7 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
         json.dumps({
             "slow_loop_warnings": 0,
             "total_frames": 600,
+            "total_seconds": 20.0,
             "episodes_aborted": 2,
             "camera_stale_frames": {"scene": 30, "wrist": 0},
             "camera_stale_pct": {"scene": 5.0, "wrist": 0.0},
@@ -742,6 +750,7 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
 
     manager._write_quality(data, {"loop_hz": 29.9, "session_quality": {
         "total_frames": 400,
+        "total_seconds": 10.0,
         "episodes_aborted": 1,
         "camera_stale_frames": {"scene": 10, "wrist": 8},
         "camera_stale_pct": {"scene": 2.5, "wrist": 2.0},
@@ -751,6 +760,8 @@ def test_resuming_adds_this_runs_frames_to_the_ones_already_counted(tmp_path, mo
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
     assert quality["total_frames"] == 1000
+    assert quality["total_seconds"] == 30.0
+    assert quality["loop_hz"] == pytest.approx(1000 / 30)
     assert quality["episodes_aborted"] == 3
     assert quality["camera_stale_frames"] == {"scene": 40, "wrist": 8}
     assert quality["sensor_read_failures"] == 3
@@ -770,10 +781,11 @@ def test_a_fresh_run_does_not_inherit_the_previous_datasets_counts(tmp_path, mon
     manager = _finished_recording(tmp_path, monkeypatch, "soarm101_pick", resumed=False, warnings=0)
 
     manager._write_quality(data, {"session_quality": {
-        "total_frames": 100, "sensor_read_failures": 0,
+        "total_frames": 100, "total_seconds": 4.0, "sensor_read_failures": 0,
         "camera_stale_frames": {"scene": 1}, "sensor_implausible": {},
     }})
 
     quality = json.loads((data / "soarm_quality.json").read_text(encoding="utf-8"))
     assert quality["total_frames"] == 100
+    assert quality["loop_hz"] == 25.0
     assert quality["sensor_read_failures"] == 0

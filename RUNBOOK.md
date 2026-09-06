@@ -174,7 +174,8 @@ curl -s http://127.0.0.1:8088/api/recording/preview/scene.jpg -o /tmp/scene.jpg
 주지 못하고 있다는 뜻이므로 `/api/status`의 `recording.runtime.camera_stale_pct`를 본다.
 
 수집이 끝나면 `data/<name>/record.log`와 `data/<name>/soarm_quality.json`이 남는다. 후자에는
-마지막 회차의 `loop_hz`, 카메라별 stale 비율, 이번 실행에서 센 느린 루프 경고 수가 들어 있고,
+모든 기록 구간의 `total_frames / total_seconds`인 `loop_hz`, 카메라별 stale 비율,
+이번 실행에서 센 느린 루프 경고 수가 들어 있고,
 `GET /api/datasets`가 그것을 함께 실어 보낸다.
 
 수집 중 serial과 camera owner는 `lerobot-record`다. 가상 리더 수집이면 콘솔은 목표만

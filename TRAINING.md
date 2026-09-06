@@ -164,10 +164,23 @@ lerobot 버전, calibration `sha256`, 카메라 컨트롤, 시작 진단, fps). 
 | `GET /api/spark/datasets` | Spark에 올라가 있는 데이터셋 목록 |
 | `POST /api/spark/datasets/{name}` | 녹화한 데이터셋 하나를 Spark로 전송 |
 | `GET /api/spark/runs` | 학습 실행별 체크포인트 **와 진행 상황** |
-| `POST /api/spark/train` | `{dataset, policy}` — 학습을 tmux 안에서 띄운다 |
+| `POST /api/spark/train` | `{dataset, policy}` — 학습을 tmux 안에서 띄운다(앱은 부르지 않는다, 바로 아래) |
 | `POST /api/spark/runs/{run}/stop` | 도는 학습에 Ctrl-C를 보낸다 |
 | `POST /api/spark/runs/{run}/{step}` | 체크포인트의 `pretrained_model`을 회수 |
 | `GET /api/spark/train-command` | 사람이 터미널에 붙여 넣을 학습 명령(그대로 남겨 둔다) |
+
+### 학습을 거는 문은 sparkq 큐다 (2026-09-06)
+
+`POST /api/spark/train`은 그대로 남아 있지만 **맥 앱(SeoulLocalAgent)은 더 이상 이것을
+부르지 않는다.** `수집 데이터` 화면의 학습 버튼도 콘솔이 아니라 Spark 위의 sparkq 큐에
+`lerobot-train`을 건다. **학습을 거는 정상 경로는 그 큐 하나다.**
+
+문을 하나로 모은 이유는 GPU가 하나이기 때문이다. 문이 둘이면 서로가 서로를 보지 못한다 —
+실제로 큐가 `isaac-rl`을 돌리는 동안 앱의 학습 버튼이 켜져 있었다.
+
+엔드포인트를 지우지는 않는다. 사람이 `curl`로 직접 열 수 있는 문이 하나쯤 있어야 하기
+때문이다. 다만 **이 문으로 띄운 학습은 sparkq의 대기열을 건너뛰고 GPU를 먼저 잡는다 —
+새치기다.** 줄 서 있는 작업이 있는지 보고 부를 것.
 
 ### 콘솔이 학습을 띄우되 품지는 않는다 (2026-09-05)
 
@@ -324,7 +337,9 @@ HUB의 `deploy` 공개키가 Spark의 `authorized_keys`에 등록되어 있어�
 # 1. 데이터셋을 Spark로
 curl -X POST http://127.0.0.1:8088/api/spark/datasets/<name>
 
-# 2. 학습 시작 — 돌려주는 `run`이 이후의 이름이다
+# 2. 학습 시작 — 사람이 직접 여는 문이다. sparkq의 대기열을 건너뛰므로
+#    (위 "학습을 거는 문은 sparkq 큐다") 평소에는 큐에 건다.
+#    돌려주는 `run`이 이후의 이름이다
 curl -X POST http://127.0.0.1:8088/api/spark/train \
   -H 'content-type: application/json' \
   -d '{"dataset": "<name>", "policy": "act"}'

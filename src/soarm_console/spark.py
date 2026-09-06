@@ -405,6 +405,11 @@ def list_runs(settings: Settings) -> list[dict[str, Any]]:
 # 두 벌뿐인 이유는 이 팔에서 실제로 돌려 본 것이 둘이기 때문이다. ACT는 처음부터
 # 배우므로 10만 스텝이 필요하고, SmolVLA는 이미 배운 것을 옮겨 오므로 2만 스텝이면
 # 충분하다 — 대신 첫 실행은 HF에서 기반 모델을 내려받느라 오래 걸린다.
+#
+# **이 표는 Spark의 `~/sparkq/kinds/lerobot-train.json`의 presets와 같은 값이어야 한다.**
+# 학습을 거는 정상 경로는 sparkq 큐이고 이 엔드포인트는 사람이 직접 여는 문이라, 한쪽만
+# 고치면 어느 문으로 걸었느냐에 따라 다른 학습이 돈다. 그 차이는 50시간 뒤에야 드러난다.
+# (맥 앱에도 같은 표가 한 벌 더 있었고, 그것은 지웠다.)
 TRAINING_POLICIES: dict[str, dict[str, Any]] = {
     "act": {"flag": "--policy.type=act", "steps": 100_000, "batch_size": 64, "save_freq": 20_000},
     "smolvla": {
@@ -497,6 +502,10 @@ def start_training(settings: Settings, dataset: str, policy: str) -> dict[str, A
         raise DatasetError(f"Unknown policy type: expected one of {sorted(TRAINING_POLICIES)}")
 
     root = _remote_dataset_root(settings)
+    # preflight는 이미 도는 학습을 tmux의 `train-*` 세션으로 판단한다. 그 이름 규칙을
+    # 강제하는 것은 이쪽이 아니라 sparkq의 `_session_name`이다. 즉 이 검사가 무엇을 보는지는
+    # 큐가 세션 이름을 어떻게 짓느냐에 달려 있다 — 어느 한쪽의 이름 규칙을 고치는 사람은
+    # 반드시 반대쪽도 함께 보아야 한다.
     state = _remote_python(settings, _TRAIN_PREFLIGHT, f"{root}/{dataset}", timeout=45)
     if not state.get("dataset_present"):
         raise SparkNotFound(

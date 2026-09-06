@@ -38,6 +38,10 @@
 | 서보 블록 읽기 실패 | `observation.sensor_read_ok` == 0 | 직전 값을 그대로 다시 쓰고 그 행에 표시한다 | 다음 틱에 저절로 | 프레임을 버리면 회차 전체가 막힌다(`validate_frame`). 되풀이한 행인지는 이 열로만 알 수 있다 |
 | 0프레임 회차 | 저장 직전 `writer.episode_buffer["size"]` | 저장을 건너뛰고 버퍼만 비운다. `empty_episodes_skipped`를 올린다 | 다음 회차는 정상 진행 | 저장하면 `validate_episode_buffer`가 `ValueError`로 세션 전체를 끝낸다 |
 
+수집 화면의 `preview-<role>.jpg`는 LeRobot 카메라가 내놓은 RGB 관측을 표시용 BGR로
+바꿔 OpenCV로 인코딩한다. 이 변환은 프리뷰 전용이며, 파케이와 MP4에는 LeRobot이 RGB
+관측을 직접 기록하므로 과거 데이터셋은 영향을 받지 않고 다시 수집할 필요도 없다.
+
 ## Fault injection 계획
 
 Servo 이동 전에 mock 또는 power-off 상태에서 다음을 검증한다.

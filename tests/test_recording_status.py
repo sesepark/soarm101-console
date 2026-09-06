@@ -720,6 +720,26 @@ def test_the_snapshot_is_written_at_most_five_times_a_second(tmp_path, monkeypat
     assert len(writer._pending) == 0
 
 
+def test_the_snapshot_keeps_the_rgb_camera_color(tmp_path):
+    """LeRobot의 RGB 빨강이 OpenCV가 읽을 때도 빨강이어야 한다."""
+    import cv2
+
+    writer = recording._PreviewWriter(tmp_path)
+    try:
+        rgb_red = np.zeros((32, 32, 3), dtype=np.uint8)
+        rgb_red[:, :, 0] = 255
+        writer.offer("scene", rgb_red)
+    finally:
+        writer.stop()
+
+    decoded_bgr = cv2.imread(str(tmp_path / "preview-scene.jpg"))
+    assert decoded_bgr is not None
+    mean_blue, mean_green, mean_red = decoded_bgr.mean(axis=(0, 1))
+    assert mean_red > 240
+    assert mean_green < 15
+    assert mean_blue < 15
+
+
 def test_a_preview_failure_never_stops_the_recording(tmp_path, monkeypatch):
     import cv2
 

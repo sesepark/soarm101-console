@@ -280,6 +280,7 @@ class CameraWorker:
                 if scheduled is None:
                     continue
                 next_send = scheduled
+                # VideoCapture.read()가 이미 BGR을 주므로 recording.py의 RGB 변환은 필요 없다.
                 ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
                 if ok:
                     with self._condition:

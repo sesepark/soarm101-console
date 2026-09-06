@@ -284,6 +284,9 @@ class _PreviewWriter:
                     return
                 role, frame = self._pending.popitem()
             try:
+                # LeRobot OpenCVCamera의 관측은 RGB다. VideoCapture의 BGR을 직접 받는
+                # cameras.py 프리뷰와 달리, OpenCV JPEG 인코더 앞에서 순서를 바꿔야 한다.
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 ok, encoded = cv2.imencode(
                     ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), PREVIEW_QUALITY]
                 )

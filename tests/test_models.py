@@ -569,13 +569,125 @@ def test_policy_start_refuses_a_missing_model(client):
     assert response.status_code == 404
 
 
+def test_remote_policy_start_does_not_require_a_local_checkpoint(client, monkeypatch):
+    from soarm_console import app as app_module
+
+    monkeypatch.setattr(
+        app_module, "settings", dataclasses.replace(app_module.settings, motion_enabled=True)
+    )
+    started = []
+    monkeypatch.setattr(
+        app_module.policy_manager,
+        "start",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    response = client.post(
+        "/api/policy/start",
+        json=_policy_body(remote=True),
+        headers={"X-SOARM-Motion-Token": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert started[0][1] == {"remote": True}
+
+
+def test_remote_client_keeps_dataset_camera_names_and_the_twelve_degree_clamp():
+    config = policying.build_remote_client_config(
+        _settings(policy_max_relative_target=12.0),
+        "pi05",
+        "/home/operator/outputs/run/checkpoints/002000/pretrained_model",
+        "Pick up block",
+        30,
+        {
+            "observation.images.scene": "observation.images.base_0_rgb",
+            "observation.images.wrist": "observation.images.left_wrist_0_rgb",
+        },
+    )
+
+    assert set(config.robot.cameras) == {"scene", "wrist"}
+    assert config.robot.max_relative_target == 12.0
+    assert config.checkpoint_rename_map["observation.images.scene"].endswith("base_0_rgb")
+
+
+def test_remote_connection_failure_discards_every_buffered_action():
+    from queue import Queue
+
+    class Client:
+        action_queue = Queue()
+        action_queue_lock = threading.Lock()
+        shutdown_event = threading.Event()
+
+    adapter = object.__new__(policying.FailSafeRobotClient)
+    adapter.client = Client()
+    adapter.failure = None
+    adapter.client.action_queue.put(object())
+    adapter.client.action_queue.put(object())
+
+    adapter.abort("tunnel broke")
+
+    assert adapter.client.shutdown_event.is_set()
+    assert adapter.client.action_queue.empty()
+    assert adapter.failure == "tunnel broke"
+
+
+def test_remote_connection_failure_holds_in_place_instead_of_returning(
+    policy_settings, monkeypatch
+):
+    alignments = []
+    monkeypatch.setattr(
+        policying,
+        "Settings",
+        lambda: dataclasses.replace(
+            policy_settings, motion_enabled=True, camera_roles_confirmed=True
+        ),
+    )
+    monkeypatch.setattr(policying, "validate_calibration", lambda path: None)
+    monkeypatch.setattr(policying, "inherited_locks_cover", lambda devices: True)
+    monkeypatch.setattr(policying, "build_remote_client_config", lambda *args: object())
+    monkeypatch.setattr(policying, "_write_status", lambda **values: None)
+    monkeypatch.setattr(
+        policying,
+        "align_home",
+        lambda settings, goal, event, *, phase: alignments.append((phase, goal)) or False,
+    )
+
+    class BrokenClient:
+        def __init__(self, config):
+            pass
+
+        def run(self, task, stop_requested, max_seconds):
+            raise RuntimeError("Remote policy connection became TRANSIENT_FAILURE")
+
+    monkeypatch.setattr(policying, "FailSafeRobotClient", BrokenClient)
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+    monkeypatch.setenv("SOARM_POLICY_TASK", "Pick up block")
+    monkeypatch.setenv("SOARM_POLICY_HOME", json.dumps(HOME))
+    monkeypatch.setenv("SOARM_REMOTE_POLICY_PATH", "/home/operator/model")
+    monkeypatch.setenv("SOARM_REMOTE_POLICY_TYPE", "pi05")
+    monkeypatch.setenv(
+        "SOARM_REMOTE_RENAME_MAP",
+        json.dumps({"observation.images.scene": "observation.images.base_0_rgb"}),
+    )
+
+    with pytest.raises(RuntimeError, match="TRANSIENT_FAILURE"):
+        policying.main()
+
+    assert alignments == [("aligning", HOME)]
+
+
 def test_policy_start_refuses_the_motion_gate_without_starting(client, model_root, monkeypatch):
     from soarm_console import app as app_module
 
     _received_model(model_root)
     models.build_manifest(_settings(), RUN, STEP)
     started = []
-    monkeypatch.setattr(app_module.policy_manager, "start", lambda *args: started.append(args))
+    monkeypatch.setattr(
+        app_module.policy_manager,
+        "start",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
 
     response = client.post(
         "/api/policy/start", json=_policy_body(), headers={"X-SOARM-Motion-Token": "secret"}

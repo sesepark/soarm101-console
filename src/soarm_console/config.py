@@ -59,7 +59,7 @@ class Settings:
         default_factory=lambda: float(os.getenv("SOARM_MAX_RELATIVE_TARGET", "2"))
     )
     policy_max_relative_target: float = field(
-        default_factory=lambda: float(os.getenv("SOARM_POLICY_MAX_RELATIVE_TARGET", "3.0"))
+        default_factory=lambda: float(os.getenv("SOARM_POLICY_MAX_RELATIVE_TARGET", "12.0"))
     )
 
     # 학습이 도는 기계. 주소와 계정은 이 저장소가 공개이므로 여기 적지 않고 `config/soarm.env`에
@@ -74,6 +74,17 @@ class Settings:
     )
     spark_output_root: str = field(
         default_factory=lambda: os.getenv("SOARM_SPARK_OUTPUT_ROOT", "outputs")
+    )
+    spark_home: str = field(
+        default_factory=lambda: os.getenv(
+            "SOARM_SPARK_HOME", f"/home/{os.getenv('SOARM_SPARK_USER', '')}"
+        )
+    )
+    spark_queue_port: int = field(
+        default_factory=lambda: int(os.getenv("SOARM_SPARK_QUEUE_PORT", "8092"))
+    )
+    remote_policy_port: int = field(
+        default_factory=lambda: int(os.getenv("SOARM_REMOTE_POLICY_PORT", "8091"))
     )
 
     @property

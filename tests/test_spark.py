@@ -202,3 +202,76 @@ def test_the_training_metadata_script_carries_quotes_without_an_escape_dance(tmp
 
     written = json.loads((tmp_path / "run" / "soarm_train.json").read_text(encoding="utf-8"))
     assert written == {"dataset": "pick", "policy": "act", "steps": 100000}
+
+
+# MARK: remote policy inference
+
+
+def test_remote_checkpoint_path_is_absolute_on_spark():
+    settings = _settings(spark_home="/home/operator")
+
+    assert spark.policy_checkpoint_path(settings, "pick__pi05__abcd", "002000") == (
+        "/home/operator/outputs/pick__pi05__abcd/checkpoints/002000/pretrained_model"
+    )
+
+
+def test_remote_checkpoint_path_refuses_traversal():
+    with pytest.raises(DatasetError):
+        spark.policy_checkpoint_path(_settings(), "../outside", "002000")
+
+
+def test_policy_side_is_extended_once_per_reused_trial(monkeypatch):
+    calls = []
+    ready = {"kind": "soarm-policy", "stream_ready": True, "live": True}
+
+    def request(settings, method, path, payload=None):
+        calls.append((method, path, payload))
+        if path == "/api/queue":
+            return {"side": ready}
+        return {}
+
+    monkeypatch.setattr(spark, "_queue_request", request)
+
+    assert spark.ensure_policy_side(_settings()) == ready
+    assert calls == [
+        ("GET", "/api/queue", None),
+        ("POST", "/api/side/extend", {"seconds": 300}),
+    ]
+
+
+def test_policy_side_refuses_to_replace_an_unrelated_side_job(monkeypatch):
+    monkeypatch.setattr(
+        spark,
+        "_queue_request",
+        lambda *args, **kwargs: {"side": {"kind": "isaac-play", "stream_ready": True}},
+    )
+
+    with pytest.raises(spark.SparkBusy, match="isaac-play"):
+        spark.ensure_policy_side(_settings())
+
+
+def test_remote_model_uses_the_checkpoint_saved_camera_map(monkeypatch):
+    monkeypatch.setattr(
+        spark,
+        "_remote_python",
+        lambda *args, **kwargs: {
+            "policy": "pi05",
+            "dataset": "pick",
+            "state_dim": 32,
+            "action_dim": 6,
+            "rename_map": {
+                "observation.images.scene": "observation.images.base_0_rgb",
+                "observation.images.wrist": "observation.images.left_wrist_0_rgb",
+            },
+        },
+    )
+
+    model = spark.describe_remote_model(
+        _settings(spark_home="/home/operator"), "pick__pi05__abcd", "002000"
+    )
+
+    assert model["runnable"] is True
+    assert model["camera_map"] == {
+        "observation.images.base_0_rgb": "scene",
+        "observation.images.left_wrist_0_rgb": "wrist",
+    }

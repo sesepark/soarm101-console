@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import time
+from queue import Empty
 from math import isfinite
 from pathlib import Path
 
@@ -267,6 +268,29 @@ def _write_status(**values: object) -> None:
 RTC_EXECUTION_HORIZON = 25
 
 
+def _robot_config(settings: Settings, fps: float):
+    from lerobot.cameras.opencv import OpenCVCameraConfig
+    from lerobot.robots.so_follower import SO101FollowerConfig
+
+    # These names are the dataset names. Remote inference deliberately sends scene/wrist unchanged;
+    # the checkpoint's saved preprocessor owns the rename to policy-specific feature names.
+    cameras = {
+        "scene": OpenCVCameraConfig(
+            Path(settings.scene_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
+        ),
+        "wrist": OpenCVCameraConfig(
+            Path(settings.wrist_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
+        ),
+    }
+    return SO101FollowerConfig(
+        port=settings.follower_port,
+        id=settings.follower_id,
+        cameras=cameras,
+        max_relative_target=settings.policy_max_relative_target,
+        disable_torque_on_disconnect=False,
+    )
+
+
 def _inference_config(policy_type: str):
     """이 정책에 맞는 추론 방식.
 
@@ -300,9 +324,7 @@ def build_rollout_config(
     max_seconds: float,
 ):
     """Construct (but do not execute) the LeRobot rollout configuration."""
-    from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.configs import PreTrainedConfig
-    from lerobot.robots.so_follower import SO101FollowerConfig
     from lerobot.rollout.configs import BaseStrategyConfig, RolloutConfig
 
     model = describe_model(run, step)
@@ -313,21 +335,7 @@ def build_rollout_config(
     importlib.import_module(f"lerobot.policies.{policy_type}.configuration_{policy_type}")
     policy = PreTrainedConfig.from_pretrained(pretrained)
     policy.pretrained_path = str(pretrained)
-    cameras = {
-        "scene": OpenCVCameraConfig(
-            Path(settings.scene_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
-        ),
-        "wrist": OpenCVCameraConfig(
-            Path(settings.wrist_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
-        ),
-    }
-    robot = SO101FollowerConfig(
-        port=settings.follower_port,
-        id=settings.follower_id,
-        cameras=cameras,
-        max_relative_target=settings.policy_max_relative_target,
-        disable_torque_on_disconnect=False,
-    )
+    robot = _robot_config(settings, fps)
     rename_map = {
         f"observation.images.{role}": feature
         for feature, role in model["camera_map"].items()
@@ -347,12 +355,114 @@ def build_rollout_config(
     )
 
 
+class FailSafeRobotClient:
+    """RobotClient adapter that turns the first broken RPC into an immediate hold."""
+
+    def __init__(self, config):
+        import grpc
+        from lerobot.async_inference.robot_client import RobotClient
+
+        self.client = RobotClient(config)
+        self.client.policy_config.rename_map = dict(config.checkpoint_rename_map)
+        self.failure: str | None = None
+        original_stub = self.client.stub
+        owner = self
+
+        class WatchedStub:
+            def __getattr__(self, name):
+                call = getattr(original_stub, name)
+
+                def watched(*args, **kwargs):
+                    try:
+                        return call(*args, **kwargs)
+                    except grpc.RpcError as exc:
+                        owner.abort(f"Remote policy connection failed: {exc.code().name}")
+                        raise
+
+                return watched
+
+        self.client.stub = WatchedStub()
+        self.client.channel.subscribe(self._channel_state, try_to_connect=True)
+
+    def _channel_state(self, state) -> None:
+        import grpc
+
+        if state in {grpc.ChannelConnectivity.TRANSIENT_FAILURE, grpc.ChannelConnectivity.SHUTDOWN}:
+            self.abort(f"Remote policy connection became {state.name}")
+
+    def abort(self, reason: str) -> None:
+        if self.failure is None:
+            self.failure = reason
+        self.client.shutdown_event.set()
+        with self.client.action_queue_lock:
+            while True:
+                try:
+                    self.client.action_queue.get_nowait()
+                except Empty:
+                    break
+
+    def run(self, task: str, stop_requested: threading.Event, max_seconds: float) -> None:
+        if not self.client.start():
+            raise RuntimeError(self.failure or "Could not connect to the remote policy server")
+        receiver = threading.Thread(target=self.client.receive_actions, kwargs={"verbose": True}, daemon=True)
+        receiver.start()
+
+        def watchdog() -> None:
+            if stop_requested.wait(max_seconds):
+                self.client.shutdown_event.set()
+            else:
+                self.client.shutdown_event.set()
+
+        timer = threading.Thread(target=watchdog, daemon=True)
+        timer.start()
+        try:
+            self.client.control_loop(task=task, verbose=True)
+        finally:
+            self.client.stop()
+            receiver.join(timeout=5)
+        if self.failure:
+            raise RuntimeError(self.failure)
+
+
+def build_remote_client_config(
+    settings: Settings,
+    policy_type: str,
+    pretrained_path: str,
+    task: str,
+    fps: float,
+    rename_map: dict[str, str],
+):
+    from lerobot.async_inference.configs import RobotClientConfig
+
+    config = RobotClientConfig(
+        policy_type=policy_type,
+        pretrained_name_or_path=pretrained_path,
+        robot=_robot_config(settings, fps),
+        actions_per_chunk=50,
+        task=task.strip(),
+        server_address=f"127.0.0.1:{settings.remote_policy_port}",
+        policy_device="cuda",
+        client_device="cpu",
+        fps=int(fps),
+        chunk_size_threshold=0.5,
+        aggregate_fn_name="weighted_average",
+    )
+    # LeRobot 0.6.1's server always applies the incoming rename override, even when it is empty.
+    # Re-send the checkpoint's own saved map so the server does not erase it. The client still emits
+    # scene/wrist and performs no local renaming.
+    config.checkpoint_rename_map = dict(rename_map)
+    return config
+
+
 def main() -> None:
     settings = Settings()
     run = os.getenv("SOARM_POLICY_RUN", "")
     step = os.getenv("SOARM_POLICY_STEP", "")
     task = os.getenv("SOARM_POLICY_TASK", "")
     raw_home = os.getenv("SOARM_POLICY_HOME", "")
+    remote_path = os.getenv("SOARM_REMOTE_POLICY_PATH", "")
+    remote_type = os.getenv("SOARM_REMOTE_POLICY_TYPE", "")
+    raw_rename_map = os.getenv("SOARM_REMOTE_RENAME_MAP", "")
     try:
         fps = float(os.getenv("SOARM_POLICY_FPS", "30"))
         max_seconds = float(os.getenv("SOARM_POLICY_MAX_SECONDS", "120"))
@@ -415,41 +525,66 @@ def main() -> None:
             # 연결하기 직전에 읽는다. 이미 owner lock을 갖고 있으므로 다른 모드가 사이에
             # 끼어 관절값을 바꿀 수 없다.
             return_home = home or present_position(settings, acquire_owner_lock=False)
-            config = build_rollout_config(settings, run, step, task, fps, max_seconds)
+            if remote_path:
+                try:
+                    rename_map = json.loads(raw_rename_map)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid remote checkpoint rename map: {exc}") from exc
+                if not isinstance(rename_map, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in rename_map.items()
+                ):
+                    raise ValueError("Invalid remote checkpoint rename map")
+                config = build_remote_client_config(
+                    settings, remote_type, remote_path, task, fps, rename_map
+                )
+            else:
+                config = build_rollout_config(settings, run, step, task, fps, max_seconds)
             if stop_requested.is_set():
                 return
             phase = "running"
             _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            if not remote_path:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            remote_failed = False
             try:
                 # LeRobot의 ProcessSignalHandler가 running 중 SIGTERM을 받아 rollout을
                 # teardown한다. 자체 복귀는 꺼져 있으므로 teardown 뒤 아래로 내려온다.
-                lerobot_rollout.rollout(config)
+                if remote_path:
+                    FailSafeRobotClient(config).run(task, stop_requested, max_seconds)
+                else:
+                    lerobot_rollout.rollout(config)
+            except BaseException:
+                remote_failed = bool(remote_path)
+                raise
             finally:
-                phase = "returning"
-                return_stop_requested = threading.Event()
-                signal.signal(
-                    signal.SIGTERM,
-                    lambda _signum, _frame: return_stop_requested.set(),
-                )
-                _write_status(
-                    phase=phase,
-                    home=home or {},
-                    run=run,
-                    step=step,
-                    task=task,
-                    alignment_residual={},
-                )
-                try:
-                    align_home(
-                        settings,
-                        return_home,
-                        return_stop_requested,
-                        phase="returning",
+                # A broken remote connection is an emergency hold, not a request for another
+                # autonomous movement. Keep the last commanded position and report the failure.
+                if not remote_failed:
+                    phase = "returning"
+                    return_stop_requested = threading.Event()
+                    signal.signal(
+                        signal.SIGTERM,
+                        lambda _signum, _frame: return_stop_requested.set(),
                     )
-                except BaseException as exc:
-                    raise RuntimeError(f"Policy return to initial position failed: {exc}") from exc
-                _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
+                    _write_status(
+                        phase=phase,
+                        home=home or {},
+                        run=run,
+                        step=step,
+                        task=task,
+                        alignment_residual={},
+                    )
+                    try:
+                        align_home(
+                            settings,
+                            return_home,
+                            return_stop_requested,
+                            phase="returning",
+                        )
+                    except BaseException as exc:
+                        raise RuntimeError(f"Policy return to initial position failed: {exc}") from exc
+                    _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
         except BaseException as exc:
             _write_status(
                 phase=phase,

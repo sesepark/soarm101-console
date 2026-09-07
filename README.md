@@ -136,6 +136,12 @@ flowchart TB
   다만 **학습을 거는 정상 경로는 Spark 위의 sparkq 큐 하나이고**(맥 앱의 학습 버튼도 그리로 감),
   이 엔드포인트는 사람이 `curl`로 여는 문으로 남아 있되 큐의 대기열을 건너뜀 — GPU가 하나라
   문이 둘이면 서로를 보지 못하기 때문임.
+- **큰 정책은 Spark에서 추론함.** `POST /api/policy/start`에 `remote: true`를 주면 콘솔이 sparkq의
+  `soarm-policy` 곁다리를 켜고 준비를 기다린 뒤, `127.0.0.1:8091` SSH 터널로 LeRobot
+  `RobotClient`를 붙임. 팔·카메라·12° 스텝 상한·정렬·토크·중지는 HUB가 계속 소유하고 가중치와
+  계산만 Spark에 남음. 시행마다 곁다리 시한을 300초 연장하며, 명시 중지·오류 때는 곁다리를
+  내려 얼린 학습을 즉시 깨움. 터널이나 서버가 끊기면 받은 액션 큐를 비우고 그 자리에서 멈추며,
+  안전 자세 복귀도 새 자율 동작이므로 장애 때는 시도하지 않음.
 - **지우는 것은 옮기는 것임.** `DELETE /api/datasets/{name}`은 `data/.trash/`로 **옮기기만** 함.
   회차 하나는 `DELETE /api/datasets/{name}/episodes/{index}`가 `lerobot-edit-dataset`으로 들어냄.
   과제가 다른 데이터셋에 이어 찍기는 400으로 거절함 — 데이터셋 하나는 학습 한 번의 단위이고,
@@ -208,10 +214,10 @@ src/soarm_console/        FastAPI app, teleop, recording, replay, policy, diagno
   owner_lock.py             장치별 flock — 한 시점에 한 소유자
   follower_start.py         붙는 순간과 루프 직전의 부드러운 시작(s-curve)
   sensors.py                서보 블록 판독(주소 56~70) 한 번에, 부호-크기 해석
-  spark.py                  학습 서버 전송 · 원격 tmux 학습 · 모델 회수
+  spark.py                  학습 서버 전송 · 원격 tmux 학습 · 모델 회수 · 원격 추론 곁다리
   models.py                 models/ 명세 · 카메라 대응 · 실행 가능성 · 삭제
   policy_manager.py         정책 서브프로세스 · SIGTERM · 상태와 로그
-  policying.py              RolloutConfig 구성 · lerobot-rollout 호출
+  policying.py              로컬 rollout · 원격 RobotClient · 연결 장애 즉시 정지
   static/                   데스크톱 콘솔 페이지
   static/viewer/            3D 조작 화면(맥·폰 공용). three.js r160 자체 호스팅, URDF 로더 직접 작성
 scripts/                  calibration, doctor, web, teleoperation, recording, service installation

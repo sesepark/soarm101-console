@@ -221,6 +221,8 @@ CAPABILITIES = [
     "sensor_extras",
     # 정책 rollout 전에 재생과 같은 느린 정렬로 지정 자세까지 간다.
     "policy_home",
+    # Spark의 policy_server로 계산만 옮기고 팔·카메라·안전은 이 콘솔이 계속 소유한다.
+    "remote_policy",
     # 카메라 두 대의 내부·외부 파라미터를 구하는 절차가 있다. 외부 쪽은 팔이 혼자 움직인다.
     "rig_calibration",
     # `/api/perception`이 큐브의 base_link 좌표를 내준다.
@@ -252,6 +254,7 @@ class PolicyRequest(BaseModel):
     fps: float = 30
     max_seconds: float = 120
     home: dict[str, float] | None = None
+    remote: bool = False
 
 
 class CameraSettingsRequest(BaseModel):
@@ -1067,14 +1070,15 @@ def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="fps must be between 1 and 60")
     if not 1 <= body.max_seconds <= 600:
         raise HTTPException(status_code=400, detail="max_seconds must be between 1 and 600")
-    try:
-        model = describe_model(body.run, body.step)
-    except ModelNotFound as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except DatasetError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not model["runnable"]:
-        raise HTTPException(status_code=400, detail="; ".join(model["problems"]))
+    if not body.remote:
+        try:
+            model = describe_model(body.run, body.step)
+        except ModelNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DatasetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not model["runnable"]:
+            raise HTTPException(status_code=400, detail="; ".join(model["problems"]))
     if policy_manager.running:
         raise HTTPException(status_code=409, detail="A policy rollout is already running")
     if recorder.running or teleop.running or replayer.running or vleader.running or calibrator.running:
@@ -1086,7 +1090,9 @@ def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
     for worker in cameras.values():
         worker.stop()
     try:
-        policy_manager.start(body.run, body.step, body.task, body.fps, body.max_seconds, home)
+        policy_manager.start(
+            body.run, body.step, body.task, body.fps, body.max_seconds, home, remote=body.remote
+        )
     except TeleopError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return policy_manager.status()

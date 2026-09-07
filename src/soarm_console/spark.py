@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
+from pathlib import PurePosixPath
 from typing import Any
 
 from .config import Settings
@@ -102,6 +104,37 @@ os.makedirs(directory, exist_ok=True)
 with open(os.path.join(directory, "soarm_train.json"), "w", encoding="utf-8") as handle:
     handle.write(__PAYLOAD__)
 print(json.dumps({"ok": True}))
+"""
+
+_REMOTE_MODEL = """
+import json, os, sys
+root = os.path.expanduser(sys.argv[1])
+def read(name):
+    with open(os.path.join(root, name), encoding="utf-8") as handle:
+        return json.load(handle)
+config = read("config.json")
+train = read("train_config.json")
+processor = read("policy_preprocessor.json")
+rename_map = {}
+for step in processor.get("steps", []):
+    if step.get("registry_name") == "rename_observations_processor":
+        rename_map = (step.get("config") or {}).get("rename_map") or {}
+        break
+def dim(features, key):
+    shape = (features.get(key) or {}).get("shape") or []
+    return shape[0] if shape else None
+inputs = config.get("input_features") or {}
+images = [name for name, value in inputs.items()
+          if (value or {}).get("type") == "VISUAL" or name.startswith("observation.images.")]
+dataset = train.get("dataset") or {}
+print(json.dumps({
+    "policy": config.get("type"), "dataset": dataset.get("repo_id"),
+    "trained_steps": train.get("steps"), "chunk_size": config.get("chunk_size"),
+    "n_action_steps": config.get("n_action_steps"), "image_features": images,
+    "state_dim": dim(inputs, "observation.state"),
+    "action_dim": dim(config.get("output_features") or {}, "action"),
+    "rename_map": rename_map,
+}))
 """
 
 _PROBE = """
@@ -217,6 +250,142 @@ def _remote_python(settings: Settings, script: str, *argv: str, timeout: float =
         return json.loads(raw)
     except ValueError as error:
         raise SparkError("The training machine sent something that is not JSON") from error
+
+
+def _queue_request(
+    settings: Settings, method: str, path: str, payload: dict[str, Any] | None = None
+) -> Any:
+    """Call sparkq through SSH without exposing its loopback-only HTTP port."""
+    if method not in {"GET", "POST", "DELETE"} or not path.startswith("/api/"):
+        raise ValueError("Invalid sparkq request")
+    body = json.dumps(payload, separators=(",", ":")) if payload is not None else None
+    script = f"""
+import json, urllib.error, urllib.request
+url = {json.dumps(f"http://127.0.0.1:{settings.spark_queue_port}{path}")}
+body = {json.dumps(body)}
+request = urllib.request.Request(
+    url,
+    method={json.dumps(method)},
+    data=None if body is None else body.encode(),
+    headers={{"Content-Type": "application/json"}},
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        raw = response.read().decode()
+        print(json.dumps({{"ok": True, "value": json.loads(raw) if raw else {{}}}}))
+except urllib.error.HTTPError as error:
+    raw = error.read().decode(errors="replace")
+    print(json.dumps({{"ok": False, "status": error.code, "error": raw}}))
+except Exception as error:
+    print(json.dumps({{"ok": False, "status": 0, "error": str(error)}}))
+"""
+    result = _remote_python(settings, script, timeout=30)
+    if not result.get("ok"):
+        detail = str(result.get("error") or "sparkq request failed")
+        try:
+            decoded = json.loads(detail)
+            detail = str(decoded.get("detail") or detail)
+        except (TypeError, ValueError):
+            pass
+        if result.get("status") == 409:
+            raise SparkBusy(detail)
+        raise SparkError(detail)
+    return result.get("value")
+
+
+def policy_checkpoint_path(settings: Settings, run: str, step: str) -> str:
+    """The pretrained path is interpreted by the policy server on Spark."""
+    if not NAME_PATTERN.fullmatch(run) or not NAME_PATTERN.fullmatch(step):
+        raise DatasetError("Unknown run or step")
+    root = PurePosixPath(settings.spark_output_root)
+    if not root.is_absolute():
+        root = PurePosixPath(settings.spark_home) / root
+    return str(root / run / "checkpoints" / step / "pretrained_model")
+
+
+def describe_remote_model(settings: Settings, run: str, step: str) -> dict[str, Any]:
+    """Read only the small checkpoint metadata on Spark; weights remain there."""
+    path = policy_checkpoint_path(settings, run, step)
+    try:
+        model = _remote_python(settings, _REMOTE_MODEL, path, timeout=30)
+    except SparkError as exc:
+        raise SparkNotFound(f"No usable remote model: {run}/{step} ({exc})") from exc
+    problems = []
+    # PI0.5 stores its padded maximum (32), not the physical state width (6), in config.json.
+    # The server's processor pads the six joint values, so only a smaller limit is incompatible.
+    if not isinstance(model.get("state_dim"), int) or model["state_dim"] < 6:
+        problems.append(
+            f"The model state dimension must accommodate 6 joints, not {model.get('state_dim')!r}."
+        )
+    if model.get("action_dim") != 6:
+        problems.append(f"The model action dimension must be 6, not {model.get('action_dim')!r}.")
+    rename_map = model.get("rename_map")
+    expected_sources = {"observation.images.scene", "observation.images.wrist"}
+    if not isinstance(rename_map, dict) or not expected_sources.issubset(rename_map):
+        problems.append("The checkpoint does not preserve the scene/wrist camera rename map.")
+    return {
+        **model,
+        "run": run,
+        "step": step,
+        "remote": True,
+        "source": path,
+        "camera_map": {
+            feature: source.removeprefix("observation.images.")
+            for source, feature in (rename_map or {}).items()
+        },
+        "runnable": not problems,
+        "problems": problems,
+    }
+
+
+def ensure_policy_side(settings: Settings, *, timeout: float = 120.0) -> dict[str, Any]:
+    """Start or reuse the policy side job, extend it for this trial, and wait until ready."""
+    snapshot = _queue_request(settings, "GET", "/api/queue")
+    side = snapshot.get("side")
+    if side is not None and side.get("kind") != "soarm-policy":
+        raise SparkBusy(f"Another side job is already running: {side.get('kind', 'unknown')}")
+    if side is None:
+        side = _queue_request(
+            settings, "POST", "/api/side", {"kind": "soarm-policy", "params": {}}
+        )
+    else:
+        _queue_request(settings, "POST", "/api/side/extend", {"seconds": 300})
+
+    deadline = time.monotonic() + timeout
+    while not side.get("stream_ready"):
+        if not side.get("live", True):
+            raise SparkError("The remote policy server stopped before becoming ready")
+        if time.monotonic() >= deadline:
+            raise SparkError(f"The remote policy server was not ready within {timeout:g} seconds")
+        time.sleep(0.25)
+        side = (_queue_request(settings, "GET", "/api/queue").get("side") or {})
+    return side
+
+
+def stop_policy_side(settings: Settings) -> None:
+    """Stop only the side lane; sparkq resumes any preempted training itself."""
+    snapshot = _queue_request(settings, "GET", "/api/queue")
+    side = snapshot.get("side")
+    if side is not None and side.get("kind") == "soarm-policy":
+        _queue_request(settings, "DELETE", "/api/side")
+
+
+def policy_tunnel_command(settings: Settings) -> list[str]:
+    port = settings.remote_policy_port
+    return [
+        "ssh",
+        *SSH_OPTIONS,
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=2",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-N",
+        "-L",
+        f"{port}:127.0.0.1:{port}",
+        _target(settings),
+    ]
 
 
 def _remote_dataset_root(settings: Settings) -> str:

@@ -556,6 +556,7 @@ def test_status_names_every_capability_the_app_looks_for():
         "soft_start",
         "sensor_extras",
         "policy_home",
+        "remote_policy",
         "rig_calibration",
         "object_position",
     ]

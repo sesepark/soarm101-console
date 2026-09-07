@@ -207,6 +207,47 @@ def test_the_training_metadata_script_carries_quotes_without_an_escape_dance(tmp
 # MARK: remote policy inference
 
 
+def test_queue_api_uses_allowed_loopback_curl_and_stdin_json(monkeypatch):
+    calls = []
+
+    def run(args, *, timeout, stdin=None):
+        calls.append((args, timeout, stdin))
+        return '{"side":{"id":"side-1"}}200'
+
+    monkeypatch.setattr(spark, "_run", run)
+
+    result = spark._queue_request(_settings(), "POST", "/api/side", {"kind": "soarm-policy"})
+
+    assert result == {"side": {"id": "side-1"}}
+    (args, timeout, stdin), = calls
+    assert args[:1] == ["ssh"]
+    assert args[-10:] == [
+        "curl",
+        "-sS",
+        "-X",
+        "POST",
+        "-HContent-Type:application/json",
+        "--data-binary",
+        "@-",
+        "-w",
+        "%{http_code}",
+        "http://127.0.0.1:8092/api/side",
+    ]
+    assert timeout == 30
+    assert stdin == '{"kind":"soarm-policy"}'
+
+
+def test_queue_api_preserves_busy_response(monkeypatch):
+    monkeypatch.setattr(
+        spark,
+        "_run",
+        lambda *args, **kwargs: '{"detail":"another side is running"}409',
+    )
+
+    with pytest.raises(spark.SparkBusy, match="another side is running"):
+        spark._queue_request(_settings(), "POST", "/api/side", {"kind": "soarm-policy"})
+
+
 def test_remote_checkpoint_path_is_absolute_on_spark():
     settings = _settings(spark_home="/home/operator")
 

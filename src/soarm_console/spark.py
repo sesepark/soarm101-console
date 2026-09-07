@@ -258,39 +258,48 @@ def _queue_request(
     """Call sparkq through SSH without exposing its loopback-only HTTP port."""
     if method not in {"GET", "POST", "DELETE"} or not path.startswith("/api/"):
         raise ValueError("Invalid sparkq request")
-    body = json.dumps(payload, separators=(",", ":")) if payload is not None else None
-    script = f"""
-import json, urllib.error, urllib.request
-url = {json.dumps(f"http://127.0.0.1:{settings.spark_queue_port}{path}")}
-body = {json.dumps(body)}
-request = urllib.request.Request(
-    url,
-    method={json.dumps(method)},
-    data=None if body is None else body.encode(),
-    headers={{"Content-Type": "application/json"}},
-)
-try:
-    with urllib.request.urlopen(request, timeout=15) as response:
-        raw = response.read().decode()
-        print(json.dumps({{"ok": True, "value": json.loads(raw) if raw else {{}}}}))
-except urllib.error.HTTPError as error:
-    raw = error.read().decode(errors="replace")
-    print(json.dumps({{"ok": False, "status": error.code, "error": raw}}))
-except Exception as error:
-    print(json.dumps({{"ok": False, "status": 0, "error": str(error)}}))
-"""
-    result = _remote_python(settings, script, timeout=30)
-    if not result.get("ok"):
-        detail = str(result.get("error") or "sparkq request failed")
+    body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
+    # Spark's login policy allows the queue's loopback curl API and rejects ad-hoc remote Python.
+    # Feed JSON over stdin: putting it in SSH argv would make the remote shell parse its quotes again.
+    raw = _run(
+        [
+            "ssh",
+            *SSH_OPTIONS,
+            _target(settings),
+            "curl",
+            "-sS",
+            "-X",
+            method,
+            "-HContent-Type:application/json",
+            "--data-binary",
+            "@-",
+            "-w",
+            "%{http_code}",
+            f"http://127.0.0.1:{settings.spark_queue_port}{path}",
+        ],
+        timeout=30,
+        stdin=body,
+    )
+    if len(raw) < 3 or not raw[-3:].isdigit():
+        raise SparkError("sparkq did not return an HTTP status")
+    status = int(raw[-3:])
+    response = raw[:-3]
+    if not 200 <= status < 300:
+        detail = response or "sparkq request failed"
         try:
             decoded = json.loads(detail)
             detail = str(decoded.get("detail") or detail)
         except (TypeError, ValueError):
             pass
-        if result.get("status") == 409:
+        if status == 409:
             raise SparkBusy(detail)
         raise SparkError(detail)
-    return result.get("value")
+    if not response:
+        return {}
+    try:
+        return json.loads(response)
+    except ValueError as exc:
+        raise SparkError("sparkq returned a response that is not JSON") from exc
 
 
 def policy_checkpoint_path(settings: Settings, run: str, step: str) -> str:

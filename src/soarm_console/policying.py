@@ -268,20 +268,27 @@ def _write_status(**values: object) -> None:
 RTC_EXECUTION_HORIZON = 25
 
 
-def _robot_config(settings: Settings, fps: float):
+def _robot_config(
+    settings: Settings,
+    fps: float,
+    *,
+    camera_rename_map: dict[str, str] | None = None,
+):
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101FollowerConfig
 
-    # These names are the dataset names. Remote inference deliberately sends scene/wrist unchanged;
-    # the checkpoint's saved preprocessor owns the rename to policy-specific feature names.
-    cameras = {
-        "scene": OpenCVCameraConfig(
-            Path(settings.scene_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
-        ),
-        "wrist": OpenCVCameraConfig(
-            Path(settings.wrist_camera), fps=int(fps), width=640, height=480, fourcc="MJPG"
-        ),
-    }
+    # Recording and local inference omit camera_rename_map and keep the dataset's scene/wrist names.
+    # Remote inference instead gives RobotClient the policy feature names before LeRobot builds its
+    # lerobot_features: LeRobot 0.6.1 indexes policy_image_features before its preprocessor can rename.
+    rename_map = camera_rename_map or {}
+    cameras = {}
+    for role, device in (("scene", settings.scene_camera), ("wrist", settings.wrist_camera)):
+        raw_key = f"observation.images.{role}"
+        policy_key = rename_map.get(raw_key, raw_key)
+        camera_name = policy_key.removeprefix("observation.images.")
+        cameras[camera_name] = OpenCVCameraConfig(
+            Path(device), fps=int(fps), width=640, height=480, fourcc="MJPG"
+        )
     return SO101FollowerConfig(
         port=settings.follower_port,
         id=settings.follower_id,
@@ -437,7 +444,7 @@ def build_remote_client_config(
     config = RobotClientConfig(
         policy_type=policy_type,
         pretrained_name_or_path=pretrained_path,
-        robot=_robot_config(settings, fps),
+        robot=_robot_config(settings, fps, camera_rename_map=rename_map),
         actions_per_chunk=50,
         task=task.strip(),
         server_address=f"127.0.0.1:{settings.remote_policy_port}",
@@ -447,9 +454,8 @@ def build_remote_client_config(
         chunk_size_threshold=0.5,
         aggregate_fn_name="weighted_average",
     )
-    # LeRobot 0.6.1's server always applies the incoming rename override, even when it is empty.
-    # Re-send the checkpoint's own saved map so the server does not erase it. The client still emits
-    # scene/wrist and performs no local renaming.
+    # Keep sending the checkpoint map. The remote RobotConfig already emits policy-named camera keys,
+    # so none of its scene/wrist source keys exist and the server-side rename processor is a no-op.
     config.checkpoint_rename_map = dict(rename_map)
     return config
 

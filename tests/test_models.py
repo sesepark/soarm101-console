@@ -592,7 +592,7 @@ def test_remote_policy_start_does_not_require_a_local_checkpoint(client, monkeyp
     assert started[0][1] == {"remote": True}
 
 
-def test_remote_client_keeps_dataset_camera_names_and_the_twelve_degree_clamp():
+def test_remote_client_uses_checkpoint_camera_names_and_the_twelve_degree_clamp():
     config = policying.build_remote_client_config(
         _settings(policy_max_relative_target=12.0),
         "pi05",
@@ -605,9 +605,28 @@ def test_remote_client_keeps_dataset_camera_names_and_the_twelve_degree_clamp():
         },
     )
 
-    assert set(config.robot.cameras) == {"scene", "wrist"}
+    assert set(config.robot.cameras) == {"base_0_rgb", "left_wrist_0_rgb"}
     assert config.robot.max_relative_target == 12.0
     assert config.checkpoint_rename_map["observation.images.scene"].endswith("base_0_rgb")
+
+
+def test_local_policy_robot_keeps_dataset_camera_names():
+    config = policying._robot_config(_settings(), 30)
+
+    assert set(config.cameras) == {"scene", "wrist"}
+
+
+def test_remote_camera_name_falls_back_when_checkpoint_has_no_mapping():
+    config = policying.build_remote_client_config(
+        _settings(),
+        "pi05",
+        "/home/operator/model",
+        "Pick up block",
+        30,
+        {"observation.images.scene": "observation.images.overhead_rgb"},
+    )
+
+    assert set(config.robot.cameras) == {"overhead_rgb", "wrist"}
 
 
 def test_remote_connection_failure_discards_every_buffered_action():

@@ -26,11 +26,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedObservation
+from lerobot.async_inference.helpers import map_robot_keys_to_lerobot_features
+from lerobot.robots import make_robot_from_config
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.feature_utils import hw_to_dataset_features
 
 from soarm_console.config import Settings
+from soarm_console.policying import build_remote_client_config
 from soarm_console.spark import (
     SSH_OPTIONS,
     _queue_request,
@@ -45,6 +47,7 @@ RUN = "soarm101_cube104_dn_strat__pi05__b67e"
 STEP = "002000"
 TASK = "Pick up the orange cube and place it in the yellow square area."
 LOAD_LINE = re.compile(r"Time taken to put policy on cuda: ([0-9.]+) seconds")
+SERVER_TOTAL_LINE = re.compile(r"Observation \d+ \| Total time: ([0-9.]+)ms")
 
 
 def remote_snapshot(settings: Settings) -> str:
@@ -54,7 +57,7 @@ def remote_snapshot(settings: Settings) -> str:
         'printf "GPU="; nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; '
         'printf "QUEUE="; python3 ~/sparkq/sparkq.py ls | head -1; '
         'printf "TRAINING_PROCESSES\\n"; '
-        'ps -eo pid=,stat=,args= | grep -E "[l]erobot-train|[r]sl_rl/train.py"'
+        'ps -eo pid=,stat=,args= | grep -E "[l]erobot-train|[r]sl_rl/train.py" || true'
     )
     result = subprocess.run(
         ["ssh", *SSH_OPTIONS, target, command], capture_output=True, text=True, timeout=30
@@ -75,29 +78,16 @@ def side_log(settings: Settings, side_id: str) -> list[str]:
     return [str(line) for line in value]
 
 
-def synthetic_features(
-    rename_map: dict[str, str], *, policy_keyed: bool
-) -> tuple[dict[str, dict], dict[str, object]]:
-    motors = [
-        "shoulder_pan.pos",
-        "shoulder_lift.pos",
-        "elbow_flex.pos",
-        "wrist_flex.pos",
-        "wrist_roll.pos",
-        "gripper.pos",
-    ]
-    hardware = {name: float for name in motors}
-    camera_names = ["scene", "wrist"]
-    if policy_keyed:
-        camera_names = [
-            rename_map[f"observation.images.{name}"].removeprefix("observation.images.")
-            for name in camera_names
-        ]
-    hardware.update({name: (480, 640, 3) for name in camera_names})
-    features = hw_to_dataset_features(hardware, "observation", use_video=False)
-    black = np.zeros((480, 640, 3), dtype=np.uint8)
-    observation: dict[str, object] = {name: 0.0 for name in motors}
-    observation.update({name: black for name in camera_names})
+def synthetic_observation(robot_config) -> tuple[dict[str, dict], dict[str, object]]:
+    # This constructs the same robot object as RobotClient but deliberately never calls connect().
+    # Camera and bus constructors only describe devices; no serial/video handle is opened.
+    robot = make_robot_from_config(robot_config)
+    features = map_robot_keys_to_lerobot_features(robot)
+    observation: dict[str, object] = {}
+    for name, feature_type in robot.observation_features.items():
+        observation[name] = (
+            np.zeros(feature_type, dtype=np.uint8) if isinstance(feature_type, tuple) else 0.0
+        )
     observation["task"] = TASK
     return features, observation
 
@@ -106,25 +96,26 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
     address = f"127.0.0.1:{settings.remote_policy_port}"
     channel = grpc.insecure_channel(address, grpc_channel_options(initial_backoff="0.0333s"))
     stub = services_pb2_grpc.AsyncInferenceStub(channel)
-    policy_keyed = os.environ.get("SOARM_PROBE_POLICY_KEYS") == "1"
     rename_map = dict(model["rename_map"])
-    features, raw_observation = synthetic_features(rename_map, policy_keyed=policy_keyed)
-    print(
-        "PROBE_INPUT="
-        + (
-            "POLICY_KEYS_DIAGNOSTIC_ONLY (checkpoint rename bypassed)"
-            if policy_keyed
-            else "CONSOLE_KEYS (scene/wrist; production path)"
-        )
+    client_config = build_remote_client_config(
+        settings,
+        str(model["policy"]),
+        str(model["source"]),
+        TASK,
+        30,
+        rename_map,
     )
+    features, raw_observation = synthetic_observation(client_config.robot)
+    print("PROBE_INPUT=CONSOLE_REMOTE_ROBOT_CONFIG (synthetic images; no device connection)")
+    print("ROBOT_CONFIG_CAMERA_KEYS=" + ",".join(client_config.robot.cameras))
     policy = RemotePolicyConfig(
-        policy_type=str(model["policy"]),
-        pretrained_name_or_path=str(model["source"]),
+        policy_type=client_config.policy_type,
+        pretrained_name_or_path=client_config.pretrained_name_or_path,
         lerobot_features=features,
-        actions_per_chunk=50,
-        device="cuda",
-        # LeRobot 0.6.1 otherwise replaces the checkpoint's saved map with an empty override.
-        rename_map={} if policy_keyed else rename_map,
+        actions_per_chunk=client_config.actions_per_chunk,
+        device=client_config.policy_device,
+        # Match FailSafeRobotClient: the inputs already have policy keys, so this map is a no-op.
+        rename_map=dict(client_config.checkpoint_rename_map),
     )
     try:
         stub.Ready(services_pb2.Empty(), timeout=10)
@@ -161,6 +152,37 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
             latencies.append(elapsed_ms)
             print(f"INFERENCE_{index + 1:02d}_MS={elapsed_ms:.2f} ACTIONS={len(actions)}")
         print(f"INFERENCE_MEDIAN_MS={statistics.median(latencies):.2f}")
+
+        logs = side_log(settings, side_id)
+        server_latencies = [
+            float(match.group(1))
+            for line in logs
+            if (match := SERVER_TOTAL_LINE.search(line)) is not None
+        ][-10:]
+        if len(server_latencies) == 10:
+            print(f"SERVER_INFERENCE_MEDIAN_MS={statistics.median(server_latencies):.2f}")
+        else:
+            print(f"SERVER_INFERENCE_SAMPLES={len(server_latencies)}")
+
+        if os.environ.get("SOARM_PROBE_RECONNECT", "1") != "0":
+            # A new RobotClient calls Ready and SendPolicyInstructions again. Repeat those two RPCs
+            # on a fresh channel to determine whether the server caches the loaded checkpoint.
+            channel.close()
+            channel = grpc.insecure_channel(address, grpc_channel_options(initial_backoff="0.0333s"))
+            stub = services_pb2_grpc.AsyncInferenceStub(channel)
+            stub.Ready(services_pb2.Empty(), timeout=10)
+            started = time.perf_counter()
+            stub.SendPolicyInstructions(
+                services_pb2.PolicySetup(data=pickle.dumps(policy)), timeout=300
+            )
+            reconnect_ms = (time.perf_counter() - started) * 1000
+            reconnect_logs = side_log(settings, side_id)
+            reconnect_loads = [line for line in reconnect_logs if LOAD_LINE.search(line)]
+            print(f"RECONNECT_SETUP_WALL_MS={reconnect_ms:.2f}")
+            print(
+                "SERVER_RECONNECT_POLICY_LOAD="
+                + (reconnect_loads[-1] if reconnect_loads else "NOT_FOUND")
+            )
         return latencies
     finally:
         channel.close()

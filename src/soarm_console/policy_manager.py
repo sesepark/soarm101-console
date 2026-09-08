@@ -48,11 +48,12 @@ class PolicyManager:
         self._step: str | None = None
         self._task: str | None = None
         self._started_at: float | None = None
+        self._moving_since: float | None = None
         self._expires_at: float | None = None
         self._fps_target: float | None = None
         #: 이 시행에 허락된 초. 적재가 끝난 뒤 시한을 다시 세는 데 쓴다.
         self._max_seconds: float | None = None
-        #: 프로세스를 띄운 시각. 적재가 끝나면 `_started_at`은 옮겨지므로 따로 든다.
+        #: 프로세스를 띄운 시각. 원격 적재 시간을 재기 위해 둔다.
         self._launched_at: float | None = None
         #: 이 체크포인트를 지난번에 올리는 데 걸린 초. 없으면 처음 올리는 것이다.
         self._expected_load_seconds: float | None = None
@@ -156,6 +157,7 @@ class PolicyManager:
             now = time.time()
             self._run, self._step, self._task = run, step, task.strip()
             self._started_at, self._expires_at = now, now + max_seconds
+            self._moving_since = None
             self._max_seconds = max_seconds
             self._launched_at = now
             self._load_seconds = None
@@ -315,15 +317,16 @@ class PolicyManager:
         alignment_residual = runtime.get("alignment_residual", {})
         runtime_phase = runtime.get("phase")
         if runtime_phase in {"aligning", "loading", "running", "returning"}:
-            # 적재가 끝나 팔이 실제로 움직이기 시작한 순간이 시행의 시작이다. 프로세스를
-            # 띄운 순간부터 세면 π0.5는 시한(120초)의 대부분을 체크포인트 읽는 데 쓰고,
-            # 화면의 남은 시간은 팔이 서 있는 동안 줄어든다.
-            if runtime_phase == "running" and self._phase == "loading":
-                self._started_at = time.time()
-                self._expires_at = self._started_at + (self._max_seconds or 0)
+            # ``started_at`` identifies one rollout from process launch and must never
+            # move. The motion clock has its own field; otherwise a loading -> running
+            # transition makes the app see two trials and leaves the first one open.
+            if runtime_phase == "running" and self._moving_since is None:
+                self._moving_since = time.time()
+                self._expires_at = self._moving_since + (self._max_seconds or 0)
                 if self._launched_at is not None:
-                    self._load_seconds = self._started_at - self._launched_at
-                    self._remember_load_seconds(self._load_seconds)
+                    self._load_seconds = self._moving_since - self._launched_at
+                    if self._remote:
+                        self._remember_load_seconds(self._load_seconds)
             self._phase = str(runtime_phase)
         if error is None and process is not None and process.poll() not in (None, 0):
             error = self._logs[-1] if self._logs else f"Policy process exited with code {process.poll()}"
@@ -333,6 +336,7 @@ class PolicyManager:
             "step": self._step,
             "task": self._task,
             "started_at": self._started_at,
+            "moving_since": self._moving_since,
             "expires_at": self._expires_at,
             "fps_target": self._fps_target,
             "fps_actual": self._fps_actual,

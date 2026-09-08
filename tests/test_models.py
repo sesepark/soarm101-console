@@ -770,12 +770,15 @@ def test_a_stop_during_the_policy_load_is_answered_at_once(policy_settings, monk
     assert client.client.control_loop_ran is False
 
 
-def test_the_trial_clock_starts_when_the_policy_is_loaded(policy_settings, monkeypatch):
+def test_motion_clock_starts_when_the_policy_is_loaded_without_changing_trial_identity(
+    policy_settings, monkeypatch
+):
     """적재를 시행 시간으로 세면 120초짜리 시행이 131초 적재 안에서 끝난다."""
     manager = PolicyManager(_settings())
     manager.runtime_dir = Path(tempfile.mkdtemp())
     manager._max_seconds = 120.0
     manager._started_at = 1_000.0
+    manager._launched_at = 1_000.0
     manager._expires_at = 1_120.0
     manager._phase = "loading"
     (manager.runtime_dir / "status.json").write_text(
@@ -785,9 +788,10 @@ def test_the_trial_clock_starts_when_the_policy_is_loaded(policy_settings, monke
     status = manager.status()
 
     assert status["phase"] == "running"
-    # 적재가 끝난 지금부터 다시 120초다. 시작 시각도 함께 옮겨야 화면의 경과가 맞는다.
-    assert status["expires_at"] - status["started_at"] == 120.0
-    assert status["started_at"] > 1_000.0
+    # 적재가 끝난 지금부터 다시 120초지만 rollout의 identity는 처음 띄운 시각이다.
+    assert status["started_at"] == 1_000.0
+    assert status["moving_since"] > status["started_at"]
+    assert status["expires_at"] - status["moving_since"] == 120.0
 
 
 def test_killing_a_rollout_that_never_moved_says_so(monkeypatch):
@@ -874,6 +878,7 @@ def test_the_measured_load_time_reaches_the_screen(tmp_path):
     manager._max_seconds = 120.0
     manager._launched_at = 1_000.0
     manager._started_at = 1_000.0
+    manager._remote = True
     manager._phase = "loading"
     (tmp_path / "status.json").write_text(json.dumps({"phase": "running"}), encoding="utf-8")
 

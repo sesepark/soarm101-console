@@ -176,6 +176,17 @@ def test_a_state_wider_than_the_arm_is_not_a_problem(model_root):
     assert result["runnable"] is True
 
 
+def test_act_is_runnable_locally_via_sync_inference(model_root):
+    _received_model(model_root, policy="act")
+    models.build_manifest(_settings(), RUN, STEP)
+
+    result = models.describe_model(RUN, STEP)
+
+    assert result["problems"] == []
+    assert result["runnable"] is True
+    assert policying.inference_kind("act") == "sync"
+
+
 def test_weights_larger_than_this_gpu_are_refused_and_point_at_spark(model_root, monkeypatch):
     monkeypatch.setattr(models, "local_accelerator", lambda: (6 * 1024**3, 7.5))
     _received_model(model_root)

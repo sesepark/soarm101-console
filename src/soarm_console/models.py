@@ -273,13 +273,10 @@ def _policy_problem(policy: object) -> str | None:
     try:
         importlib.import_module(f"lerobot.policies.{policy}.configuration_{policy}")
         from lerobot.policies.factory import get_policy_class
-        from lerobot.policies.pretrained import PreTrainedPolicy
 
-        policy_class = get_policy_class(policy)
+        get_policy_class(policy)
     except Exception as exc:  # optional policy dependencies fail in several import-time forms
         return f"Policy type '{policy}' is not supported by this installation: {exc}"
-    if policy_class.supports_rtc is PreTrainedPolicy.supports_rtc:
-        return f"Policy type '{policy}' does not support RTC inference in this LeRobot installation."
     return None
 
 

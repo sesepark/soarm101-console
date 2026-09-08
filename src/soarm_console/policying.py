@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from queue import Empty
 from math import isfinite
 from pathlib import Path
@@ -365,6 +366,10 @@ def build_rollout_config(
 class FailSafeRobotClient:
     """RobotClient adapter that turns the first broken RPC into an immediate hold."""
 
+    #: 우리가 끝내기로 한 뒤인가. 클래스에 두는 이유는 `__init__`을 거치지 않고 만든
+    #: 어댑터(시험이 그렇게 만든다)에서도 이 판단이 성립해야 하기 때문이다.
+    _stopping = False
+
     def __init__(self, config):
         import grpc
         from lerobot.async_inference.robot_client import RobotClient
@@ -372,6 +377,8 @@ class FailSafeRobotClient:
         self.client = RobotClient(config)
         self.client.policy_config.rename_map = dict(config.checkpoint_rename_map)
         self.failure: str | None = None
+        #: 우리가 끝내기로 한 뒤인가. 그 뒤의 취소는 고장이 아니라 우리가 낸 것이다.
+        self._stopping = False
         original_stub = self.client.stub
         owner = self
 
@@ -398,7 +405,15 @@ class FailSafeRobotClient:
             self.abort(f"Remote policy connection became {state.name}")
 
     def abort(self, reason: str) -> None:
-        if self.failure is None:
+        """Record a genuine break — and only a genuine one.
+
+        Shutting the client down cancels its own in-flight RPCs, and both the watched stub and
+        the channel-state callback see that as an error.  Recorded as a failure, a rollout the
+        person stopped on purpose came back as "정책이 실행 오류로 끝났습니다", and the caller
+        treated it as a broken connection: it skipped the return-to-home the stop button
+        promises and left the arm wherever it stood (2026-09-07).
+        """
+        if self.failure is None and not self._stopping:
             self.failure = reason
         self.client.shutdown_event.set()
         with self.client.action_queue_lock:
@@ -408,23 +423,78 @@ class FailSafeRobotClient:
                 except Empty:
                     break
 
-    def run(self, task: str, stop_requested: threading.Event, max_seconds: float) -> None:
-        if not self.client.start():
+    def _start_interruptibly(self, stop_requested: threading.Event) -> bool:
+        """Connect and hand over the checkpoint, staying answerable to a stop the whole time.
+
+        ``RobotClient.start()`` calls ``SendPolicyInstructions``, and the remote server loads
+        the checkpoint onto its GPU inside that one call — over two minutes for PI0.5 the
+        first time.  Called directly, this thread sits inside gRPC for all of it, so the flag
+        our SIGTERM handler sets is read by nobody.  On 2026-09-07 the console waited its 40
+        seconds, sent SIGKILL, and the screen said "cut the power if the arm keeps moving" —
+        about an arm that had never moved at all.
+
+        So the load runs on a thread of its own and this one waits on the stop flag beside it.
+
+        Returns ``True`` when the policy is loaded and the rollout may begin, ``False`` when a
+        stop arrived first — the arm has not moved and there is nothing to unwind.
+        """
+        outcome: dict[str, object] = {}
+
+        def connect() -> None:
+            try:
+                outcome["started"] = self.client.start()
+            except BaseException as exc:  # gRPC fails in several shapes; none should be lost
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=connect, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if stop_requested.wait(0.2):
+                # Do not wait for the server to finish loading. Closing the channel releases
+                # the call that is holding the helper thread, and the helper is a daemon, so
+                # it cannot outlive this process either way.
+                self._stopping = True
+                self.client.channel.close()
+                return False
+        thread.join(timeout=5)
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        if not outcome.get("started"):
             raise RuntimeError(self.failure or "Could not connect to the remote policy server")
+        return True
+
+    def run(
+        self,
+        task: str,
+        stop_requested: threading.Event,
+        max_seconds: float,
+        on_ready: Callable[[], None] | None = None,
+    ) -> None:
+        if not self._start_interruptibly(stop_requested):
+            return
+        # The clock starts here, not at launch. Everything before this line was the server
+        # reading a checkpoint; charging that to the trial is how a 120-second trial expired
+        # during a 131-second load and the arm never got a turn.
+        if on_ready is not None:
+            on_ready()
         receiver = threading.Thread(target=self.client.receive_actions, kwargs={"verbose": True}, daemon=True)
         receiver.start()
 
         def watchdog() -> None:
-            if stop_requested.wait(max_seconds):
-                self.client.shutdown_event.set()
-            else:
-                self.client.shutdown_event.set()
+            # 시한이 다 된 것도, 사람이 누른 것도 **우리가 끝내는 것**이다. 그 뒤에 오는
+            # 취소는 우리가 낸 것이므로 고장으로 적지 않는다.
+            stop_requested.wait(max_seconds)
+            self._stopping = True
+            self.client.shutdown_event.set()
 
         timer = threading.Thread(target=watchdog, daemon=True)
         timer.start()
         try:
             self.client.control_loop(task=task, verbose=True)
         finally:
+            # `stop()`은 채널을 닫아 우리 RPC를 취소한다. 그것을 고장으로 읽지 않는다.
+            self._stopping = True
             self.client.stop()
             receiver.join(timeout=5)
         if self.failure:
@@ -452,7 +522,10 @@ def build_remote_client_config(
         client_device="cpu",
         fps=int(fps),
         chunk_size_threshold=0.5,
-        aggregate_fn_name="weighted_average",
+        # RTC를 쓰는 서버와 짝을 이루는 값이다. 서버가 새 청크를 **앞 계획 위에 이어 붙여**
+        # 내주므로, 클라이언트가 겹치는 구간을 다시 섞으면(`weighted_average`는 0.3*old +
+        # 0.7*new) 이어 붙인 것을 도로 흐린다. 이어 붙은 것을 그대로 쓴다.
+        aggregate_fn_name="latest_only",
     )
     # Keep sending the checkpoint map. The remote RobotConfig already emits policy-named camera keys,
     # so none of its scene/wrist source keys exist and the server-side rename processor is a no-op.
@@ -460,7 +533,7 @@ def build_remote_client_config(
     return config
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리에서 읽는 편이 낫다
     settings = Settings()
     run = os.getenv("SOARM_POLICY_RUN", "")
     step = os.getenv("SOARM_POLICY_STEP", "")
@@ -548,7 +621,10 @@ def main() -> None:
                 config = build_rollout_config(settings, run, step, task, fps, max_seconds)
             if stop_requested.is_set():
                 return
-            phase = "running"
+            # 원격은 서버가 체크포인트를 GPU에 올리는 동안 팔이 아직 아무것도 하지 않는다.
+            # 그 시간을 `running`이라고 적으면 화면은 도는 것처럼 보이고 시한도 그때부터
+            # 세어, 사람은 아무 일도 일어나지 않는 2분을 본다.
+            phase = "loading" if remote_path else "running"
             _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
             if not remote_path:
                 signal.signal(signal.SIGTERM, previous_sigterm)
@@ -557,7 +633,16 @@ def main() -> None:
                 # LeRobot의 ProcessSignalHandler가 running 중 SIGTERM을 받아 rollout을
                 # teardown한다. 자체 복귀는 꺼져 있으므로 teardown 뒤 아래로 내려온다.
                 if remote_path:
-                    FailSafeRobotClient(config).run(task, stop_requested, max_seconds)
+                    def policy_is_loaded() -> None:
+                        nonlocal phase
+                        phase = "running"
+                        _write_status(
+                            phase=phase, home=home or {}, run=run, step=step, task=task
+                        )
+
+                    FailSafeRobotClient(config).run(
+                        task, stop_requested, max_seconds, on_ready=policy_is_loaded
+                    )
                 else:
                     lerobot_rollout.rollout(config)
             except BaseException:

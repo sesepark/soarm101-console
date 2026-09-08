@@ -4,8 +4,12 @@ import dataclasses
 import json
 import os
 import signal
+import subprocess
+import tempfile
 import threading
+import time
 from pathlib import Path
+from queue import Queue
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,7 +17,9 @@ from fastapi.testclient import TestClient
 from soarm_console import models, policying, spark
 from soarm_console.config import Settings
 from soarm_console.datasets import DatasetError
+from soarm_console import policy_manager as policy_manager_module
 from soarm_console.policy_manager import PolicyManager
+from soarm_console.teleop import TeleopError
 from soarm_console.replaying import REPLAY_ALIGNMENT
 
 
@@ -56,7 +62,9 @@ def model_root(tmp_path, monkeypatch):
     return root
 
 
-def _received_model(root: Path, *, policy: str = "smolvla", state_dim: int = 6) -> Path:
+def _received_model(
+    root: Path, *, policy: str = "smolvla", state_dim: int = 6, dtype: str | None = None
+) -> Path:
     pretrained = root / RUN / STEP / "pretrained_model"
     pretrained.mkdir(parents=True)
     config = {
@@ -78,6 +86,8 @@ def _received_model(root: Path, *, policy: str = "smolvla", state_dim: int = 6) 
         "normalization_mapping": {"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
         "vlm_model_name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
     }
+    if dtype is not None:
+        config["dtype"] = dtype
     train = {"dataset": {"repo_id": "soarm101_pick"}, "steps": 20_000}
     (pretrained / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (pretrained / "train_config.json").write_text(json.dumps(train), encoding="utf-8")
@@ -129,6 +139,7 @@ def test_manifest_is_derived_from_the_two_received_configs(model_root):
         ],
         "state_dim": 6,
         "action_dim": 6,
+        "dtype": None,
         "pulled_at": 123.0,
         "source": f"operator@spark-box:outputs/{RUN}/checkpoints/{STEP}/pretrained_model",
         "bytes": sum(path.stat().st_size for path in pretrained.iterdir()),
@@ -144,7 +155,7 @@ def test_camera_map_fills_this_rigs_two_roles_in_model_order():
 
 
 def test_unrunnable_model_always_explains_why(model_root):
-    _received_model(model_root, state_dim=7)
+    _received_model(model_root, state_dim=5)
     models.build_manifest(_settings(), RUN, STEP)
 
     result = models.describe_model(RUN, STEP)
@@ -152,6 +163,57 @@ def test_unrunnable_model_always_explains_why(model_root):
     assert result["runnable"] is False
     assert result["problems"]
     assert any("state dimension" in problem for problem in result["problems"])
+
+
+def test_a_state_wider_than_the_arm_is_not_a_problem(model_root):
+    """PI0.5 declares openpi's padded 32, and the six joints ride inside it."""
+    _received_model(model_root, state_dim=32)
+    models.build_manifest(_settings(), RUN, STEP)
+
+    result = models.describe_model(RUN, STEP)
+
+    assert result["problems"] == []
+    assert result["runnable"] is True
+
+
+def test_weights_larger_than_this_gpu_are_refused_and_point_at_spark(model_root, monkeypatch):
+    monkeypatch.setattr(models, "local_accelerator", lambda: (6 * 1024**3, 7.5))
+    _received_model(model_root)
+    models.build_manifest(_settings(), RUN, STEP)
+    manifest = models.model_dir(RUN, STEP) / models.MANIFEST_NAME
+    manifest.write_text(
+        json.dumps({**json.loads(manifest.read_text()), "bytes": 9 * 1024**3}), encoding="utf-8"
+    )
+
+    result = models.describe_model(RUN, STEP)
+
+    assert result["runnable"] is False
+    assert any("cannot hold the weights" in problem for problem in result["problems"])
+
+
+def test_bfloat16_weights_are_refused_on_a_pre_ampere_gpu(model_root, monkeypatch):
+    monkeypatch.setattr(models, "local_accelerator", lambda: (48 * 1024**3, 7.5))
+    _received_model(model_root, dtype="bfloat16")
+    models.build_manifest(_settings(), RUN, STEP)
+
+    result = models.describe_model(RUN, STEP)
+
+    assert result["runnable"] is False
+    assert any("too old for" in problem for problem in result["problems"])
+
+
+def test_a_machine_without_a_gpu_reading_invents_no_problem(model_root, monkeypatch):
+    monkeypatch.setattr(models, "local_accelerator", lambda: None)
+    _received_model(model_root, dtype="bfloat16")
+    models.build_manifest(_settings(), RUN, STEP)
+
+    assert models.describe_model(RUN, STEP)["problems"] == []
+
+
+def test_weight_budget_is_zero_when_the_gpu_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(models, "local_accelerator", lambda: None)
+
+    assert models.local_weight_budget() == 0
 
 
 def test_model_list_and_delete_report_the_local_copy(model_root):
@@ -650,6 +712,169 @@ def test_remote_connection_failure_discards_every_buffered_action():
     assert adapter.failure == "tunnel broke"
 
 
+def test_a_stop_during_the_policy_load_is_answered_at_once(policy_settings, monkeypatch):
+    """적재는 π0.5에서 2분이 넘는다. 그동안 중지가 안 들으면 콘솔이 SIGKILL로 간다."""
+    import threading
+
+    from soarm_console.policying import FailSafeRobotClient
+
+    stop_requested = threading.Event()
+    started = threading.Event()
+
+    class SlowServer:
+        """`start()`가 gRPC 안에서 오래 붙잡혀 있는 상황 그대로."""
+
+        def __init__(self):
+            self.channel = self
+            self.closed = False
+            self.shutdown_event = threading.Event()
+            self.action_queue_lock = threading.Lock()
+            self.action_queue = Queue()
+            self.control_loop_ran = False
+
+        def start(self):
+            started.set()
+            self.shutdown_event.wait(30)  # 사람이 기다릴 수 있는 시간을 훌쩍 넘긴다
+            return True
+
+        def close(self):
+            self.closed = True
+            self.shutdown_event.set()
+
+        def control_loop(self, **_kwargs):
+            self.control_loop_ran = True
+
+    client = FailSafeRobotClient.__new__(FailSafeRobotClient)
+    client.client = SlowServer()
+    client.failure = None
+
+    waiter = threading.Thread(target=lambda: (started.wait(5), stop_requested.set()))
+    waiter.start()
+    begun = time.monotonic()
+    client.run("Pick up block", stop_requested, max_seconds=120)
+    waiter.join()
+
+    # 적재가 끝나기를 기다리지 않고 곧바로 돌아온다.
+    assert time.monotonic() - begun < 5
+    assert client.client.closed
+    # 팔은 한 번도 움직이지 않았다 — 되돌릴 것이 없다.
+    assert client.client.control_loop_ran is False
+
+
+def test_the_trial_clock_starts_when_the_policy_is_loaded(policy_settings, monkeypatch):
+    """적재를 시행 시간으로 세면 120초짜리 시행이 131초 적재 안에서 끝난다."""
+    manager = PolicyManager(_settings())
+    manager.runtime_dir = Path(tempfile.mkdtemp())
+    manager._max_seconds = 120.0
+    manager._started_at = 1_000.0
+    manager._expires_at = 1_120.0
+    manager._phase = "loading"
+    (manager.runtime_dir / "status.json").write_text(
+        json.dumps({"phase": "running"}), encoding="utf-8"
+    )
+
+    status = manager.status()
+
+    assert status["phase"] == "running"
+    # 적재가 끝난 지금부터 다시 120초다. 시작 시각도 함께 옮겨야 화면의 경과가 맞는다.
+    assert status["expires_at"] - status["started_at"] == 120.0
+    assert status["started_at"] > 1_000.0
+
+
+def test_killing_a_rollout_that_never_moved_says_so(monkeypatch):
+    """"물리 전원을 차단하세요"는 팔이 실제로 움직이던 경우의 말이다."""
+    manager = PolicyManager(_settings())
+    manager._phase = "loading"
+
+    class Stuck:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if timeout and timeout > 5:
+                raise subprocess.TimeoutExpired("rollout", timeout)
+            return -9
+
+    manager._process = Stuck()
+    monkeypatch.setattr(policy_manager_module.os, "killpg", lambda *args: None)
+
+    with pytest.raises(TeleopError) as caught:
+        manager.stop()
+    assert "never moved" in str(caught.value) or "did not move" in str(caught.value)
+
+    manager._phase = "running"
+    manager._process = Stuck()
+    with pytest.raises(TeleopError) as moving:
+        manager.stop()
+    assert "did not stop cleanly" in str(moving.value)
+
+
+def test_a_stop_we_asked_for_is_not_recorded_as_a_broken_connection():
+    """사람이 누른 중지가 "정책이 실행 오류로 끝났습니다"로 돌아왔다(2026-09-07)."""
+    from soarm_console.policying import FailSafeRobotClient
+
+    client = FailSafeRobotClient.__new__(FailSafeRobotClient)
+    client.failure = None
+    client._stopping = False
+
+    class Quiet:
+        shutdown_event = threading.Event()
+        action_queue_lock = threading.Lock()
+        action_queue = Queue()
+
+    client.client = Quiet()
+
+    # 진짜로 끊긴 것은 그대로 적는다.
+    client.abort("Remote policy connection became TRANSIENT_FAILURE")
+    assert client.failure == "Remote policy connection became TRANSIENT_FAILURE"
+
+    # 우리가 끝내기로 한 뒤의 취소는 우리 것이다.
+    calm = FailSafeRobotClient.__new__(FailSafeRobotClient)
+    calm.failure = None
+    calm._stopping = True
+    calm.client = Quiet()
+    calm.abort("Remote policy connection failed: CANCELLED")
+    assert calm.failure is None
+
+
+def test_how_long_the_last_load_took_is_remembered_per_checkpoint(tmp_path):
+    """모델마다 초를 코드에 박지 않는다 — 잰 값을 두었다가 다음에 보여 준다."""
+    manager = PolicyManager(_settings())
+    manager.runtime_dir = tmp_path
+    manager._run, manager._step, manager._remote = RUN, STEP, True
+
+    # 처음 보는 조합에는 지어낼 값이 없다.
+    assert manager._remembered_load_seconds(RUN, STEP, True) is None
+
+    manager._remember_load_seconds(131.6)
+    assert manager._remembered_load_seconds(RUN, STEP, True) == 131.6
+    # 같은 체크포인트라도 어디서 올리느냐에 따라 완전히 다른 시간이다.
+    assert manager._remembered_load_seconds(RUN, STEP, False) is None
+
+    # 캐시가 더워지면 값도 따라 내려가야 한다. 평균을 내면 첫 회가 계속 섞인다.
+    manager._remember_load_seconds(1.8)
+    assert manager._remembered_load_seconds(RUN, STEP, True) == 1.8
+
+
+def test_the_measured_load_time_reaches_the_screen(tmp_path):
+    manager = PolicyManager(_settings())
+    manager.runtime_dir = tmp_path
+    manager._run, manager._step, manager._remote = RUN, STEP, True
+    manager._max_seconds = 120.0
+    manager._launched_at = 1_000.0
+    manager._started_at = 1_000.0
+    manager._phase = "loading"
+    (tmp_path / "status.json").write_text(json.dumps({"phase": "running"}), encoding="utf-8")
+
+    status = manager.status()
+
+    assert status["load_seconds"] is not None and status["load_seconds"] > 0
+    # 다음 시행은 그 값을 미리 알고 시작한다.
+    assert manager._remembered_load_seconds(RUN, STEP, True) == round(status["load_seconds"], 1)
+
+
 def test_remote_connection_failure_holds_in_place_instead_of_returning(
     policy_settings, monkeypatch
 ):
@@ -675,7 +900,7 @@ def test_remote_connection_failure_holds_in_place_instead_of_returning(
         def __init__(self, config):
             pass
 
-        def run(self, task, stop_requested, max_seconds):
+        def run(self, task, stop_requested, max_seconds, on_ready=None):
             raise RuntimeError("Remote policy connection became TRANSIENT_FAILURE")
 
     monkeypatch.setattr(policying, "FailSafeRobotClient", BrokenClient)
@@ -718,7 +943,7 @@ def test_policy_start_refuses_the_motion_gate_without_starting(client, model_roo
 
 
 def test_policy_start_returns_the_reasons_for_an_unrunnable_model(client, model_root):
-    _received_model(model_root, state_dim=7)
+    _received_model(model_root, state_dim=5)
     models.build_manifest(_settings(), RUN, STEP)
 
     response = client.post(

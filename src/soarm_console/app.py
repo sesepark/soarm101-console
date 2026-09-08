@@ -29,7 +29,14 @@ from .datasets import (
     trajectory,
 )
 from .diagnostics import doctor_failure, run_hardware_doctor
-from .models import ModelNotFound, build_manifest, delete_model, describe_model, list_models
+from .models import (
+    ModelNotFound,
+    build_manifest,
+    delete_model,
+    describe_model,
+    list_models,
+    local_weight_budget,
+)
 from .policy_manager import PolicyManager
 from .spark import SparkBusy, SparkError, SparkNotFound
 from .spark import list_datasets as spark_list_datasets
@@ -376,6 +383,10 @@ def status() -> dict[str, object]:
             },
         },
         "software": {"lerobot": version("lerobot")},
+        # 이 기계가 로컬 추론으로 올릴 수 있는 가중치의 크기(바이트, 0이면 모름). 앱은 이
+        # 값보다 큰 체크포인트에 `팔로 가져오기`를 내주지 않는다 — 내려받아도 이 GPU에는
+        # 올라가지 않고, 내려받은 뒤에는 Spark로 돌릴 길만 가려진다.
+        "local_weight_budget": local_weight_budget(),
         "cameras": {name: camera_status(worker, name) for name, worker in cameras.items()},
         # 수집은 프리뷰에서 무엇을 고르든 이 값으로 돌아간다. 화면이 그렇게 말할 수 있도록
         # 값을 숨기지 않고 내보인다.

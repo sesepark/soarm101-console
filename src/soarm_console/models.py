@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import importlib
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,15 @@ from .datasets import NAME_PATTERN, DatasetError
 
 MANIFEST_NAME = "soarm_model.json"
 CAMERA_ROLES = ("scene", "wrist")
+
+#: SO-ARM101 has six joints.  Every width judged below is judged against this.
+JOINTS = 6
+
+#: Room a rollout needs on the GPU beyond the weights themselves: the CUDA context,
+#: the image preprocessing and one forward pass of activations.  Generous on purpose
+#: — a checkpoint that only just fits is a rollout that dies in the middle of a motion,
+#: with the arm wherever it happened to be.
+INFERENCE_HEADROOM = 1024 * 1024 * 1024
 
 
 class ModelNotFound(FileNotFoundError):
@@ -86,6 +97,117 @@ def _directory_bytes(directory: Path) -> int:
     return total
 
 
+@functools.cache
+def local_accelerator() -> tuple[int, float] | None:
+    """``(GPU memory in bytes, compute capability)`` of this machine, or ``None``.
+
+    Read through ``nvidia-smi`` rather than torch on purpose.  ``describe_model``
+    runs on every listing the app polls, and importing torch into the API worker to
+    learn one number would cost more memory than some of the checkpoints it is being
+    asked about.  ``None`` means "could not tell", and every caller treats that as
+    "do not object" — a missing driver must not invent problems.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total,compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = completed.stdout.strip().splitlines()
+    if not lines:
+        return None
+    memory, _, capability = lines[0].partition(",")
+    try:
+        return int(memory.strip()) * 1024 * 1024, float(capability.strip())
+    except ValueError:
+        return None
+
+
+def local_weight_budget() -> int:
+    """Largest checkpoint this machine can host locally, in bytes.  ``0`` means unknown.
+
+    The app reads this before offering to pull a checkpoint down.  Without it the
+    console happily fetched 9.35 GB of PI0.5 weights onto a box whose GPU holds 6 GB,
+    and the download was pure waste of a home network.
+    """
+    accelerator = local_accelerator()
+    if accelerator is None:
+        return 0
+    return max(0, accelerator[0] - INFERENCE_HEADROOM)
+
+
+def _gigabytes(count: object) -> str:
+    if not isinstance(count, (int, float)):
+        return "an unknown amount"
+    return f"{count / 1024 ** 3:.1f} GB"
+
+
+def dimension_problems(state_dim: object, action_dim: object) -> list[str]:
+    """Judge the widths a checkpoint declares against this rig's six joints.
+
+    The two widths are not the same kind of claim.  **The state width is a ceiling.**
+    PI0 and PI0.5 inherit ``observation.state`` of width 32 from ``lerobot/pi05_base``
+    because openpi fits every robot it supports into one 32-slot vector, and PI0.5
+    never projects the state through a layer of its own — it discretises it into the
+    text prompt — so a six-wide state passes through a checkpoint whose config says 32.
+    The normalization statistics saved beside the weights carry the honest width, and
+    for our runs they are six.  Only a ceiling *below* six cannot carry this arm.
+
+    **The action width is exact.**  Every number the head produces is written to a
+    servo, so a head that emits some other count is driving a different robot.
+
+    This judgement lives here alone because it is made twice — once for a checkpoint
+    pulled onto the arm and once for one left on Spark.  It was written out twice for
+    a day, and only the Spark copy learned about PI0.5; the arm copy went on rejecting
+    every π0.5 checkpoint over a number it had misread.
+    """
+    problems: list[str] = []
+    if not isinstance(state_dim, int) or state_dim < JOINTS:
+        problems.append(
+            f"The model state dimension must accommodate {JOINTS} joints, not {state_dim!r}."
+        )
+    if action_dim != JOINTS:
+        problems.append(f"The model action dimension must be {JOINTS}, not {action_dim!r}.")
+    return problems
+
+
+def hosting_problem(manifest: dict[str, Any]) -> str | None:
+    """Whether this machine can actually hold a checkpoint that was pulled onto it.
+
+    A local rollout computes where the arm is, so weights that do not fit in this
+    box's GPU cannot run here however sound the checkpoint itself is.  Saying that in
+    the list beats letting the rollout start and die on an allocation halfway through
+    a motion, and it names the way out: the same checkpoint runs on Spark without
+    moving a byte.
+    """
+    accelerator = local_accelerator()
+    if accelerator is None:
+        return None
+    memory, capability = accelerator
+    weights = manifest.get("bytes")
+    if isinstance(weights, int) and weights > memory - INFERENCE_HEADROOM:
+        return (
+            "This machine's GPU cannot hold the weights: "
+            f"{_gigabytes(weights)} of weights, {_gigabytes(memory)} of GPU memory"
+        )
+    # bfloat16 needs Ampere.  Older cards load such weights only by converting them,
+    # which doubles the memory the check above just measured.
+    if manifest.get("dtype") == "bfloat16" and capability < 8.0:
+        return (
+            "This machine's GPU is too old for the checkpoint's bfloat16 weights: "
+            f"compute capability {capability:g}, needs 8.0"
+        )
+    return None
+
+
 def build_manifest(
     settings: Settings, run: str, step: str, *, pulled_at: float | None = None
 ) -> dict[str, Any]:
@@ -118,6 +240,10 @@ def build_manifest(
         "image_features": image_features,
         "state_dim": _shape_dimension(input_features, "observation.state"),
         "action_dim": _shape_dimension(config.get("output_features"), "action"),
+        # Which numeric type the weights were saved as.  Old checkpoints pulled before
+        # this field existed leave it ``None``, and the hosting check then says nothing
+        # rather than guessing.
+        "dtype": config.get("dtype"),
         "pulled_at": time.time() if pulled_at is None else pulled_at,
         "source": (
             f"{settings.spark_user}@{settings.spark_host}:"
@@ -164,16 +290,18 @@ def describe_model(run: str, step: str) -> dict[str, Any]:
     pretrained = directory / "pretrained_model"
     if pretrained.is_symlink() or not pretrained.is_dir():
         problems.append("The pretrained_model directory is missing.")
-    if manifest.get("state_dim") != 6:
-        problems.append(f"The model state dimension must be 6, not {manifest.get('state_dim')!r}.")
-    if manifest.get("action_dim") != 6:
-        problems.append(f"The model action dimension must be 6, not {manifest.get('action_dim')!r}.")
+    problems.extend(dimension_problems(manifest.get("state_dim"), manifest.get("action_dim")))
     mapping = camera_map(manifest.get("image_features"))
     if not mapping:
         problems.append("None of the model's image features can be mapped to this rig's cameras.")
     policy_problem = _policy_problem(manifest.get("policy"))
     if policy_problem:
         problems.append(policy_problem)
+    # Last, because it is the one problem that is about this machine rather than about
+    # the checkpoint: the same weights are fine, they just have to run on Spark.
+    hosting = hosting_problem(manifest)
+    if hosting:
+        problems.append(hosting)
     return {**manifest, "camera_map": mapping, "runnable": not problems, "problems": problems}
 
 

@@ -130,10 +130,15 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
         print("SERVER_POLICY_LOAD=" + (load_lines[-1] if load_lines else "NOT_FOUND"))
 
         latencies = []
+        # 관측 사이의 간격(프레임). 기본 50은 앞 청크를 남김없이 소진한 상태여서, 서버가
+        # 이어 붙일 꼬리가 없다 — RTC가 걸리지 않는 조건이다. 실제 클라이언트는 큐가 절반이
+        # 되면 요청하므로 24프레임쯤이고, 그때 25프레임쯤이 꼬리로 남는다. 그 조건을 재려면
+        # SOARM_PROBE_STRIDE=24 로 준다.
+        stride = int(os.environ.get("SOARM_PROBE_STRIDE", "50"))
         for index in range(10):
             timed = TimedObservation(
                 timestamp=time.time(),
-                timestep=index * 50,
+                timestep=index * stride,
                 observation=raw_observation,
                 must_go=True,
             )

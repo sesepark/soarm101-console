@@ -45,6 +45,14 @@ class PolicyManager:
         self._started_at: float | None = None
         self._expires_at: float | None = None
         self._fps_target: float | None = None
+        #: 이 시행에 허락된 초. 적재가 끝난 뒤 시한을 다시 세는 데 쓴다.
+        self._max_seconds: float | None = None
+        #: 프로세스를 띄운 시각. 적재가 끝나면 `_started_at`은 옮겨지므로 따로 든다.
+        self._launched_at: float | None = None
+        #: 이 체크포인트를 지난번에 올리는 데 걸린 초. 없으면 처음 올리는 것이다.
+        self._expected_load_seconds: float | None = None
+        #: 이번에 실제로 걸린 초.
+        self._load_seconds: float | None = None
         self._fps_actual: float | None = None
         self._chunk_seconds: float | None = None
         self._chunks: int | None = None
@@ -142,6 +150,10 @@ class PolicyManager:
             now = time.time()
             self._run, self._step, self._task = run, step, task.strip()
             self._started_at, self._expires_at = now, now + max_seconds
+            self._max_seconds = max_seconds
+            self._launched_at = now
+            self._load_seconds = None
+            self._expected_load_seconds = self._remembered_load_seconds(run, step, remote)
             self._fps_target = fps
             self._camera_map = dict(model["camera_map"])
             self._home = dict(home or {})
@@ -221,9 +233,66 @@ class PolicyManager:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
             self._release_locks()
-            raise TeleopError("Policy rollout did not stop cleanly after SIGTERM; it was killed") from exc
+            # 무엇을 죽였는지에 따라 사람이 할 일이 정반대다. 팔을 움직이던 롤아웃을
+            # 강제로 끊은 것이라면 팔이 어중간한 자세로 남았을 수 있어 지켜봐야 하고,
+            # 정책을 아직 올리는 중이었다면 팔은 한 번도 움직인 적이 없다. 둘을 같은
+            # 문장으로 말해서 "물리 전원을 차단하세요"를 읽게 하지 않는다.
+            if self._phase in {"aligning", "loading"}:
+                raise TeleopError(
+                    "Policy rollout was killed before it moved the arm; the arm did not move"
+                ) from exc
+            raise TeleopError(
+                "Policy rollout did not stop cleanly after SIGTERM; it was killed"
+            ) from exc
         self._release_locks()
         self._stop_remote_resources(stop_side=True)
+
+    #: 체크포인트마다 지난번 적재가 몇 초 걸렸는지. 화면이 "얼마나 기다리면 되는지"를
+    #: 모델 이름으로 분기해 적지 않고 여기서 읽는다.
+    #:
+    #: 값을 코드에 박지 않는 이유는 정확도가 아니라 **조건이 늘어나기 때문이다.** 같은
+    #: π0.5도 곁다리가 처음 뜬 회는 130초, 그 뒤로는 2초다. 모델이 늘 때마다, 캐시가
+    #: 켜질 때마다 분기를 더하는 구조는 반드시 어느 하나가 낡은 채로 남는다.
+    LOAD_TIMES_NAME = "load_seconds.json"
+
+    def _load_times_path(self) -> Path:
+        return self.runtime_dir / self.LOAD_TIMES_NAME
+
+    @staticmethod
+    def _load_key(run: str, step: str, remote: bool) -> str:
+        # 같은 체크포인트라도 어디서 올리는지에 따라 완전히 다른 시간이다.
+        return f"{run}/{step}#{'remote' if remote else 'local'}"
+
+    def _read_load_times(self) -> dict[str, float]:
+        try:
+            value = json.loads(self._load_times_path().read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: float(seconds)
+            for key, seconds in value.items()
+            if isinstance(key, str) and isinstance(seconds, (int, float)) and seconds > 0
+        }
+
+    def _remembered_load_seconds(self, run: str, step: str, remote: bool) -> float | None:
+        return self._read_load_times().get(self._load_key(run, step, remote))
+
+    def _remember_load_seconds(self, seconds: float) -> None:
+        """가장 최근 값 하나만 든다. 평균을 내면 캐시가 더워진 뒤에도 첫 회가 계속 섞인다."""
+        if not self._run or not self._step or seconds <= 0:
+            return
+        times = self._read_load_times()
+        times[self._load_key(self._run, self._step, self._remote)] = round(seconds, 1)
+        try:
+            self.runtime_dir.mkdir(parents=True, exist_ok=True)
+            temporary = self._load_times_path().with_suffix(".tmp")
+            temporary.write_text(json.dumps(times, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, self._load_times_path())
+        except OSError:
+            # 기억하지 못해도 이번 시행은 그대로 돈다. 화면이 "아직 모른다"고 말할 뿐이다.
+            pass
 
     def status(self) -> dict[str, object]:
         process = self._process
@@ -237,7 +306,16 @@ class PolicyManager:
         error = runtime.get("error")
         alignment_residual = runtime.get("alignment_residual", {})
         runtime_phase = runtime.get("phase")
-        if runtime_phase in {"aligning", "running", "returning"}:
+        if runtime_phase in {"aligning", "loading", "running", "returning"}:
+            # 적재가 끝나 팔이 실제로 움직이기 시작한 순간이 시행의 시작이다. 프로세스를
+            # 띄운 순간부터 세면 π0.5는 시한(120초)의 대부분을 체크포인트 읽는 데 쓰고,
+            # 화면의 남은 시간은 팔이 서 있는 동안 줄어든다.
+            if runtime_phase == "running" and self._phase == "loading":
+                self._started_at = time.time()
+                self._expires_at = self._started_at + (self._max_seconds or 0)
+                if self._launched_at is not None:
+                    self._load_seconds = self._started_at - self._launched_at
+                    self._remember_load_seconds(self._load_seconds)
             self._phase = str(runtime_phase)
         if error is None and process is not None and process.poll() not in (None, 0):
             error = self._logs[-1] if self._logs else f"Policy process exited with code {process.poll()}"
@@ -257,6 +335,10 @@ class PolicyManager:
             "phase": self._phase,
             "max_relative_target": self.settings.policy_max_relative_target,
             "inference": "remote" if self._remote else "rtc",
+            # 지난번에 이 체크포인트를 올리는 데 걸린 초, 그리고 이번에 실제로 걸린 초.
+            # 화면은 앞의 것으로 기다리는 사람에게 얼마나 남았는지 말한다.
+            "expected_load_seconds": self._expected_load_seconds,
+            "load_seconds": self._load_seconds,
             "remote": self._remote,
             "log_tail": list(self._logs)[-100:],
             "error": error,

@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 runtime/
 models/
+logs/
 config/soarm.env
 data/*
 !data/README.md

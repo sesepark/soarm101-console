@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import Settings
 from .datasets import NAME_PATTERN, DatasetError, data_root
-from .models import model_dir
+from .models import dimension_problems, model_dir
 
 
 class SparkError(RuntimeError):
@@ -319,15 +319,7 @@ def describe_remote_model(settings: Settings, run: str, step: str) -> dict[str, 
         model = _remote_python(settings, _REMOTE_MODEL, path, timeout=30)
     except SparkError as exc:
         raise SparkNotFound(f"No usable remote model: {run}/{step} ({exc})") from exc
-    problems = []
-    # PI0.5 stores its padded maximum (32), not the physical state width (6), in config.json.
-    # The server's processor pads the six joint values, so only a smaller limit is incompatible.
-    if not isinstance(model.get("state_dim"), int) or model["state_dim"] < 6:
-        problems.append(
-            f"The model state dimension must accommodate 6 joints, not {model.get('state_dim')!r}."
-        )
-    if model.get("action_dim") != 6:
-        problems.append(f"The model action dimension must be 6, not {model.get('action_dim')!r}.")
+    problems = dimension_problems(model.get("state_dim"), model.get("action_dim"))
     rename_map = model.get("rename_map")
     expected_sources = {"observation.images.scene", "observation.images.wrist"}
     if not isinstance(rename_map, dict) or not expected_sources.issubset(rename_map):

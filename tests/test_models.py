@@ -519,6 +519,23 @@ def test_policy_status_exposes_alignment_residual_or_empty_object(tmp_path):
     assert manager.status()["alignment_residual"] == {}
 
 
+def test_policy_status_has_a_dedicated_read_only_endpoint(client, monkeypatch):
+    from soarm_console import app as app_module
+
+    expected = {
+        "running": False,
+        "started_at": 1_000.0,
+        "moving_since": 1_160.4,
+        "inference": "remote",
+    }
+    monkeypatch.setattr(app_module.policy_manager, "status", lambda: expected)
+
+    response = client.get("/api/policy")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
 @pytest.mark.parametrize("requested_home", [HOME, None])
 def test_policy_main_returns_to_requested_or_captured_home(
     policy_settings, monkeypatch, requested_home

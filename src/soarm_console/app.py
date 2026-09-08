@@ -1083,6 +1083,12 @@ def stop_replay() -> dict[str, object]:
     return replayer.status()
 
 
+@app.get("/api/policy")
+def policy_status() -> dict[str, object]:
+    """Return rollout state without requiring the full console status payload."""
+    return policy_manager.status()
+
+
 @app.post("/api/policy/start")
 def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
     """Run a local model through LeRobot rollout after every motion gate passes."""

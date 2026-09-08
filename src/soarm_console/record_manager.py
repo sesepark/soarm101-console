@@ -465,7 +465,6 @@ class RecordManager:
         with self._lock:
             if self._process is process and self._owner_locks is owner_locks:
                 self._owner_locks = None
-        owner_locks.release()
         if teleop_source == "virtual" and self.on_virtual_exit is not None:
             try:
                 self.on_virtual_exit()
@@ -473,3 +472,7 @@ class RecordManager:
                 # Cleanup failure must remain visible, but it cannot strand the
                 # recording's owner lock or kill this watcher before it finishes.
                 self._logs.append(f"Could not stop virtual leader relay: {exc}")
+        # Keep the follower lock until relay cleanup is complete. Otherwise a new
+        # direct virtual-leader start can slip into this gap and be force-stopped
+        # by the old recording's watcher.
+        owner_locks.release()

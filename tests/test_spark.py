@@ -318,6 +318,7 @@ def test_remote_model_uses_the_checkpoint_saved_camera_map(monkeypatch):
             "dataset": "pick",
             "state_dim": 32,
             "action_dim": 6,
+            "bytes": 1234,
             "rename_map": {
                 "observation.images.scene": "observation.images.base_0_rgb",
                 "observation.images.wrist": "observation.images.left_wrist_0_rgb",
@@ -334,3 +335,24 @@ def test_remote_model_uses_the_checkpoint_saved_camera_map(monkeypatch):
         "observation.images.base_0_rgb": "scene",
         "observation.images.left_wrist_0_rgb": "wrist",
     }
+    assert model["bytes"] == 1234
+
+
+def test_remote_model_script_counts_checkpoint_bytes(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "act",
+                "input_features": {"observation.state": {"shape": [6]}},
+                "output_features": {"action": {"shape": [6]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "train_config.json").write_text('{"dataset": {}}', encoding="utf-8")
+    (tmp_path / "policy_preprocessor.json").write_text('{"steps": []}', encoding="utf-8")
+    (tmp_path / "weights.bin").write_bytes(b"weights")
+
+    result = _run_remote_script(spark._REMOTE_MODEL, str(tmp_path))
+
+    assert result["bytes"] == sum(path.stat().st_size for path in tmp_path.iterdir())

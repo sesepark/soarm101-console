@@ -1018,6 +1018,30 @@ def test_model_rest_contract_lists_and_deletes(client, model_root):
     assert deleted.json()["freed_bytes"] > 0
 
 
+def test_remote_model_rest_contract_returns_one_spark_checkpoint(client, monkeypatch):
+    from soarm_console import app as app_module
+
+    expected = {
+        "policy": "pi05",
+        "state_dim": 32,
+        "action_dim": 6,
+        "rename_map": {"observation.images.scene": "observation.images.base_0_rgb"},
+        "camera_map": {"observation.images.base_0_rgb": "scene"},
+        "bytes": 9_350_000_000,
+        "problems": [],
+    }
+    monkeypatch.setattr(
+        app_module,
+        "spark_describe_remote_model",
+        lambda settings, run, step: expected,
+    )
+
+    response = client.get(f"/api/spark/models/{RUN}/{STEP}")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
 def test_model_pull_rest_contract_writes_manifest_and_returns_one_row(client, model_root, monkeypatch):
     from soarm_console import app as app_module
 

@@ -127,6 +127,12 @@ inputs = config.get("input_features") or {}
 images = [name for name, value in inputs.items()
           if (value or {}).get("type") == "VISUAL" or name.startswith("observation.images.")]
 dataset = train.get("dataset") or {}
+total_bytes = 0
+for directory, _, files in os.walk(root, followlinks=False):
+    for name in files:
+        path = os.path.join(directory, name)
+        if not os.path.islink(path):
+            total_bytes += os.path.getsize(path)
 print(json.dumps({
     "policy": config.get("type"), "dataset": dataset.get("repo_id"),
     "trained_steps": train.get("steps"), "chunk_size": config.get("chunk_size"),
@@ -134,6 +140,7 @@ print(json.dumps({
     "state_dim": dim(inputs, "observation.state"),
     "action_dim": dim(config.get("output_features") or {}, "action"),
     "rename_map": rename_map,
+    "bytes": total_bytes,
 }))
 """
 
@@ -324,6 +331,7 @@ def describe_remote_model(settings: Settings, run: str, step: str) -> dict[str, 
     expected_sources = {"observation.images.scene", "observation.images.wrist"}
     if not isinstance(rename_map, dict) or not expected_sources.issubset(rename_map):
         problems.append("The checkpoint does not preserve the scene/wrist camera rename map.")
+    usable_rename_map = rename_map if isinstance(rename_map, dict) else {}
     return {
         **model,
         "run": run,
@@ -332,7 +340,7 @@ def describe_remote_model(settings: Settings, run: str, step: str) -> dict[str, 
         "source": path,
         "camera_map": {
             feature: source.removeprefix("observation.images.")
-            for source, feature in (rename_map or {}).items()
+            for source, feature in usable_rename_map.items()
         },
         "runnable": not problems,
         "problems": problems,

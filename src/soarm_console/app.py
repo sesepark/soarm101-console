@@ -39,6 +39,7 @@ from .models import (
 )
 from .policy_manager import PolicyManager
 from .spark import SparkBusy, SparkError, SparkNotFound
+from .spark import describe_remote_model as spark_describe_remote_model
 from .spark import list_datasets as spark_list_datasets
 from .spark import probe as spark_probe
 from .spark import pull_checkpoint as spark_pull_checkpoint
@@ -592,6 +593,19 @@ def spark_train_stop(run: str) -> dict[str, object]:
 @app.get("/api/models")
 def models() -> list[dict[str, object]]:
     return list_models()
+
+
+@app.get("/api/spark/models/{run}/{step}")
+def remote_model(run: str, step: str) -> dict[str, object]:
+    """Describe one Spark checkpoint on demand; callers should not poll it."""
+    try:
+        return spark_describe_remote_model(settings, run, step)
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SparkNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SparkError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/models/{run}/{step}")

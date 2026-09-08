@@ -260,11 +260,62 @@ def build_manifest(
     return manifest
 
 
-def camera_map(image_features: object) -> dict[str, str]:
-    if not isinstance(image_features, list):
-        return {}
-    names = [name for name in image_features if isinstance(name, str)]
-    return dict(zip(names, CAMERA_ROLES, strict=False))
+def camera_map(image_features: object, rename_map: object = None) -> dict[str, str]:
+    """Which rig camera feeds each of the policy's image inputs.  ``{policy key: role}``.
+
+    Both rollout paths ask this question — the copy pulled onto the arm and the one left on
+    Spark — and for a day they answered it with different rules.  The remote path demanded a
+    non-empty rename map and refused without one; the local path ignored the map entirely and
+    zipped by position.  A GR00T checkpoint is fine by the second rule and rejected by the
+    first, so the same weights ran on the arm and were blocked on Spark (2026-09-08).  One
+    function now, three grounds, strongest first.
+
+    **1. The checkpoint's own rename map.**  Policies whose config hard-codes camera names
+    (SmolVLA's ``camera1/2/3``, PI0.5's ``base_0_rgb`` …) were trained with a map from this
+    rig's keys to those names, and it is saved beside the weights.  Inverted, it is the
+    authoritative answer.
+
+    **2. The feature name itself.**  GR00T reads its camera keys from the dataset instead of a
+    hard-coded config, so its inputs already *are* ``observation.images.scene``/``wrist`` and
+    its saved map is an empty dict — there was nothing to rename.  Matching by name is exact.
+
+    **3. Position, last.**  ``zip`` silently swaps scene and wrist if ``input_features`` ever
+    comes back in the other order, so it is the fallback for names we cannot recognise, not
+    the first rule.  Only features left over after 1 and 2 reach it, and only roles left over
+    are handed out.
+    """
+    # An absent feature list is not an absent answer: the saved rename map alone can say which
+    # rig camera became which policy input, and grounds 2 and 3 simply have nothing to work
+    # with.  Returning early here made the map unreachable for exactly those checkpoints.
+    names = [name for name in image_features if isinstance(name, str)] if isinstance(
+        image_features, list
+    ) else []
+    mapping: dict[str, str] = {}
+
+    if isinstance(rename_map, dict):
+        for source, feature in rename_map.items():
+            if not isinstance(source, str) or not isinstance(feature, str):
+                continue
+            role = source.removeprefix("observation.images.")
+            # The map is authoritative on its own — it is not cross-checked against
+            # ``input_features``.  GR00T shows why the two can disagree: it never reads its
+            # camera keys from the config at all.  Requiring the target to also appear in the
+            # feature list would refuse a checkpoint whose map is the only honest record of
+            # what the policy consumes.
+            if role in CAMERA_ROLES:
+                mapping[feature] = role
+
+    for name in names:
+        role = name.removeprefix("observation.images.")
+        if name not in mapping and role in CAMERA_ROLES and role not in mapping.values():
+            mapping[name] = role
+
+    spare = [role for role in CAMERA_ROLES if role not in mapping.values()]
+    for name in names:
+        if name in mapping or not spare:
+            continue
+        mapping[name] = spare.pop(0)
+    return mapping
 
 
 def _policy_problem(policy: object) -> str | None:

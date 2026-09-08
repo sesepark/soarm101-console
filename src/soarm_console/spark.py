@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import Settings
 from .datasets import NAME_PATTERN, DatasetError, data_root
-from .models import dimension_problems, model_dir
+from .models import camera_map, dimension_problems, model_dir
 
 
 class SparkError(RuntimeError):
@@ -327,21 +327,21 @@ def describe_remote_model(settings: Settings, run: str, step: str) -> dict[str, 
     except SparkError as exc:
         raise SparkNotFound(f"No usable remote model: {run}/{step} ({exc})") from exc
     problems = dimension_problems(model.get("state_dim"), model.get("action_dim"))
-    rename_map = model.get("rename_map")
-    expected_sources = {"observation.images.scene", "observation.images.wrist"}
-    if not isinstance(rename_map, dict) or not expected_sources.issubset(rename_map):
-        problems.append("The checkpoint does not preserve the scene/wrist camera rename map.")
-    usable_rename_map = rename_map if isinstance(rename_map, dict) else {}
+    # Ask the same question the local path asks, with the same function.  Demanding a rename
+    # map here was a rule about *some* policies mistaken for a rule about all of them: GR00T
+    # reads its camera keys from the dataset, so its saved map is an empty dict and there is
+    # nothing to preserve.  What actually has to be true is that this rig's two cameras can be
+    # connected to the policy's inputs, and only that is worth refusing over.
+    mapping = camera_map(model.get("image_features"), model.get("rename_map"))
+    if not mapping:
+        problems.append("None of the model's image features can be mapped to this rig's cameras.")
     return {
         **model,
         "run": run,
         "step": step,
         "remote": True,
         "source": path,
-        "camera_map": {
-            feature: source.removeprefix("observation.images.")
-            for source, feature in usable_rename_map.items()
-        },
+        "camera_map": mapping,
         "runnable": not problems,
         "problems": problems,
     }

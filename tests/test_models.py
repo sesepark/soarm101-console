@@ -1182,3 +1182,48 @@ def test_removed_spark_run_routes_are_not_registered():
     assert ("/api/spark/runs", "GET") not in methods
     assert ("/api/spark/runs/{run}/{step}", "POST") not in methods
     assert ("/api/spark/runs/{run}/stop", "POST") in methods
+
+
+def test_camera_map_prefers_the_checkpoint_rename_map():
+    """SmolVLA and PI0.5 hard-code camera names, and the map saved beside the weights is the
+    only thing that says which rig camera became which of them."""
+    mapping = models.camera_map(
+        [
+            "observation.images.base_0_rgb",
+            "observation.images.left_wrist_0_rgb",
+            "observation.images.right_wrist_0_rgb",
+        ],
+        {
+            "observation.images.scene": "observation.images.base_0_rgb",
+            "observation.images.wrist": "observation.images.left_wrist_0_rgb",
+        },
+    )
+    assert mapping == {
+        "observation.images.base_0_rgb": "scene",
+        "observation.images.left_wrist_0_rgb": "wrist",
+    }
+
+
+def test_camera_map_matches_by_name_when_the_policy_never_renamed():
+    """GR00T reads its camera keys from the dataset, so its inputs already are this rig's keys
+    and its saved rename map is an empty dict.  Demanding a map here blocked a sound
+    checkpoint from running on Spark while the same weights ran on the arm (2026-09-08)."""
+    features = ["observation.images.scene", "observation.images.wrist"]
+    assert models.camera_map(features, {}) == {
+        "observation.images.scene": "scene",
+        "observation.images.wrist": "wrist",
+    }
+    # Position is the last resort, not the first rule: the answer must survive a flipped order.
+    assert models.camera_map(list(reversed(features)), {}) == {
+        "observation.images.scene": "scene",
+        "observation.images.wrist": "wrist",
+    }
+
+
+def test_camera_map_falls_back_to_position_for_names_it_cannot_read():
+    assert models.camera_map(["camera.a", "camera.b", "camera.c"]) == {
+        "camera.a": "scene",
+        "camera.b": "wrist",
+    }
+    assert models.camera_map([]) == {}
+    assert models.camera_map(None) == {}

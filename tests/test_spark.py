@@ -356,3 +356,55 @@ def test_remote_model_script_counts_checkpoint_bytes(tmp_path):
     result = _run_remote_script(spark._REMOTE_MODEL, str(tmp_path))
 
     assert result["bytes"] == sum(path.stat().st_size for path in tmp_path.iterdir())
+
+
+def test_remote_model_accepts_a_policy_that_never_renamed_its_cameras(monkeypatch):
+    """GR00T keeps the dataset camera keys, so its rename map is empty and nothing needs
+    preserving.  The gate used to read that as a broken checkpoint and refused it."""
+    monkeypatch.setattr(
+        spark,
+        "_remote_python",
+        lambda settings, script, *args, **kwargs: {
+            "policy": "groot",
+            "dataset": "pick",
+            "state_dim": 6,
+            "action_dim": 6,
+            "bytes": 12_576_244_332,
+            "rename_map": {},
+            "image_features": [
+                "observation.images.scene",
+                "observation.images.wrist",
+            ],
+        },
+    )
+
+    model = spark.describe_remote_model(Settings(), "run", "last")
+
+    assert model["problems"] == []
+    assert model["runnable"] is True
+    assert model["camera_map"] == {
+        "observation.images.scene": "scene",
+        "observation.images.wrist": "wrist",
+    }
+    # The map sent to the policy server stays exactly what the checkpoint holds.
+    assert model["rename_map"] == {}
+
+
+def test_remote_model_refuses_when_no_camera_can_be_connected(monkeypatch):
+    monkeypatch.setattr(
+        spark,
+        "_remote_python",
+        lambda settings, script, *args, **kwargs: {
+            "policy": "act",
+            "dataset": "pick",
+            "state_dim": 6,
+            "action_dim": 6,
+            "rename_map": {},
+            "image_features": [],
+        },
+    )
+
+    model = spark.describe_remote_model(Settings(), "run", "last")
+
+    assert model["runnable"] is False
+    assert any("image features" in problem for problem in model["problems"])

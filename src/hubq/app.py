@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -16,9 +18,34 @@ from .claims import decide_claim
 from .jobs import JobConflict, JobError, JobRegistry
 
 
-app = FastAPI(title="HUBq", version="0.1.0")
+logger = logging.getLogger(__name__)
 jobs = JobRegistry()
 registrations: dict[str, dict[str, object]] = {}
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    stopped = threading.Event()
+
+    def expire_abandoned_jobs() -> None:
+        while not stopped.wait(1.0):
+            try:
+                jobs.expire_due()
+            except Exception:
+                # A single raced or malformed durable record must not permanently remove
+                # the last-resort expiry guard from every other hardware job.
+                logger.exception("HUBq abandoned-job expiry pass failed")
+
+    watcher = threading.Thread(target=expire_abandoned_jobs, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        watcher.join(timeout=2)
+
+
+app = FastAPI(title="HUBq", version="0.1.0", lifespan=lifespan)
 
 
 class ClaimRequest(BaseModel):
@@ -98,6 +125,11 @@ def describe_job(job_id: str) -> dict[str, object]:
         return jobs.describe(job_id)
     except JobError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/heartbeat")
+def heartbeat() -> dict[str, int]:
+    return {"renewed": jobs.heartbeat()}
 
 
 @app.post("/jobs/{job_id}/stop")

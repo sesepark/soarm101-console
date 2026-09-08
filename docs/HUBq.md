@@ -46,6 +46,15 @@ kernel locks alive. The unit therefore uses `KillMode=process`; `ExecStop` asks 
 instead of killing the whole cgroup. Job logs go to files rather than daemon-owned pipes for the
 same reason.
 
+Teleoperation and open-ended recording add an abandoned-session deadline. Their kind files declare
+`limit_seconds: 3600`; the other three self-terminating kinds have no deadline. A dedicated console
+heartbeat renews every running limited job to `now + limit_seconds`, independently of whether a Mac
+or phone currently has the status screen open. There is deliberately no absolute extension cap:
+this is an owner-liveness guard, not a usage quota. If the console heartbeat disappears while HUBq
+stays alive, HUBq sends the kind's existing graceful `stop_signal` when the last renewed deadline
+passes and retains its existing `stop_timeout`/`kill_after_timeout` policy. The deadline and expiry
+request time live in the durable job record and survive HUBq reconciliation.
+
 The console shutdown hook no longer stops these five jobs. A newly started console discovers active
 jobs by kind and restores manager metadata from HUBq. Stop calls go through HUBq, with a direct
 process-group signal only as the safety escape hatch when HUBq cannot be reached; stopping an arm

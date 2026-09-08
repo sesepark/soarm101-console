@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import version
@@ -128,18 +129,32 @@ def _unregister_hardware(name: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
-    # 다섯 독립 잡의 수명은 HUBq 소유다. 콘솔 배포·재시작이 도는 잡을 죽이지 않는다.
-    # 가상 리더만 여전히 이 프로세스의 스레드이므로 아래에서 직접 정리한다.
-    perception.close()
-    for worker in cameras.values():
-        worker.stop()
-    # 가상 리더가 팔로워 serial을 쥐고 있으면 여기서 놓는다. `force=True`인 이유는
-    # 프로세스가 내려가는 자리라 사람에게 물어볼 수 없기 때문이다 — 토크는 그대로 두고
-    # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
-    with suppress(Exception):
-        vleader.stop(force=True)
-    _unregister_hardware("virtual-leader")
+    heartbeat_stopped = threading.Event()
+
+    def keep_owned_jobs_alive() -> None:
+        while not heartbeat_stopped.is_set():
+            with suppress(hubq_client.HubQError):
+                hubq_client.heartbeat()
+            heartbeat_stopped.wait(30)
+
+    heartbeat_thread = threading.Thread(target=keep_owned_jobs_alive, daemon=True)
+    heartbeat_thread.start()
+    try:
+        yield
+    finally:
+        heartbeat_stopped.set()
+        heartbeat_thread.join(timeout=2)
+        # 다섯 독립 잡의 수명은 HUBq 소유다. 콘솔 배포·재시작이 도는 잡을 죽이지 않는다.
+        # 가상 리더만 여전히 이 프로세스의 스레드이므로 아래에서 직접 정리한다.
+        perception.close()
+        for worker in cameras.values():
+            worker.stop()
+        # 가상 리더가 팔로워 serial을 쥐고 있으면 여기서 놓는다. `force=True`인 이유는
+        # 프로세스가 내려가는 자리라 사람에게 물어볼 수 없기 때문이다 — 토크는 그대로 두고
+        # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
+        with suppress(Exception):
+            vleader.stop(force=True)
+        _unregister_hardware("virtual-leader")
 
 
 app = FastAPI(title="SO-ARM101 Console", version="0.1.0", lifespan=lifespan)

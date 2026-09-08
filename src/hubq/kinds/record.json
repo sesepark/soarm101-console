@@ -8,5 +8,6 @@
   "log": "runtime/record/record.log",
   "stop_signal": "SIGINT",
   "stop_timeout": 10,
-  "kill_after_timeout": false
+  "kill_after_timeout": false,
+  "limit_seconds": 3600
 }

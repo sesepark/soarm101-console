@@ -7,5 +7,6 @@
   "log": "runtime/teleop/teleop.log",
   "stop_signal": "SIGINT",
   "stop_timeout": 8,
-  "kill_after_timeout": false
+  "kill_after_timeout": false,
+  "limit_seconds": 3600
 }

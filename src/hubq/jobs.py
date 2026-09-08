@@ -41,6 +41,7 @@ class KindSpec:
     stop_signal: int
     stop_timeout: float
     kill_after_timeout: bool
+    limit_seconds: float | None
 
 
 def load_kinds(directory: Path = KINDS_DIR) -> dict[str, KindSpec]:
@@ -57,11 +58,20 @@ def load_kinds(directory: Path = KINDS_DIR) -> dict[str, KindSpec]:
             stop_timeout = float(body["stop_timeout"])
             already_running = str(body["already_running"])
             kill_after_timeout = bool(body["kill_after_timeout"])
+            limit_seconds = (
+                float(body["limit_seconds"]) if body.get("limit_seconds") is not None else None
+            )
             raw_log = Path(str(body["log"]))
             log = raw_log if raw_log.is_absolute() else PROJECT_ROOT / raw_log
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise JobError(f"Invalid HUBq kind file: {path.name}") from exc
-        if not command or not owners or not roles or stop_timeout <= 0:
+        if (
+            not command
+            or not owners
+            or not roles
+            or stop_timeout <= 0
+            or (limit_seconds is not None and limit_seconds <= 0)
+        ):
             raise JobError(f"Invalid HUBq kind file: {path.name}")
         result[path.stem] = KindSpec(
             name=path.stem,
@@ -76,6 +86,7 @@ def load_kinds(directory: Path = KINDS_DIR) -> dict[str, KindSpec]:
             stop_signal=stop_signal,
             stop_timeout=stop_timeout,
             kill_after_timeout=kill_after_timeout,
+            limit_seconds=limit_seconds,
         )
     return result
 
@@ -135,6 +146,14 @@ class JobRegistry:
                     self._write(record)
                 elif record.get("state") == "running":
                     record["reconciled"] = True
+                    spec = self.kinds.get(str(record.get("kind")))
+                    if spec is not None and spec.limit_seconds is not None:
+                        # Records created before abandoned-session limits existed get a full
+                        # grace period on the first upgraded HUBq start. Do not expire a live
+                        # arm merely because its old durable record lacks the new field.
+                        record.setdefault("limit_seconds", spec.limit_seconds)
+                        record.setdefault("lease_expires_at", time.time() + spec.limit_seconds)
+                        record.setdefault("expiry_stop_requested_at", None)
                     self._write(record)
                 self._records[record["id"]] = record
 
@@ -212,6 +231,11 @@ class JobRegistry:
                 "return_code": None,
                 "log_path": str(log_path),
                 "reconciled": False,
+                "limit_seconds": spec.limit_seconds,
+                "lease_expires_at": (
+                    time.time() + spec.limit_seconds if spec.limit_seconds is not None else None
+                ),
+                "expiry_stop_requested_at": None,
                 "sidecars": [],
             }
             self._write(record)
@@ -307,6 +331,65 @@ class JobRegistry:
     def _refresh_all(self) -> None:
         for record in self._records.values():
             self._refresh(record)
+
+    def heartbeat(self) -> int:
+        """Renew every expiring job while its console owner is alive and reachable."""
+        renewed = 0
+        now = time.time()
+        with self._lock:
+            self._refresh_all()
+            for record in self._records.values():
+                if record["state"] != "running" or record.get("expiry_stop_requested_at") is not None:
+                    continue
+                spec = self.kinds.get(str(record.get("kind")))
+                if spec is None or spec.limit_seconds is None:
+                    continue
+                record["limit_seconds"] = spec.limit_seconds
+                record["lease_expires_at"] = now + spec.limit_seconds
+                self._write(record)
+                renewed += 1
+        return renewed
+
+    def expire_due(self) -> list[str]:
+        """Request the configured graceful stop for abandoned, expired jobs."""
+        now = time.time()
+        due: list[str] = []
+        with self._lock:
+            self._refresh_all()
+            for job_id, record in self._records.items():
+                expires_at = record.get("lease_expires_at")
+                if (
+                    record["state"] == "running"
+                    and isinstance(expires_at, (int, float))
+                    and expires_at <= now
+                    and record.get("expiry_stop_requested_at") is None
+                ):
+                    record["expiry_stop_requested_at"] = now
+                    self._write(record)
+                    due.append(job_id)
+        for job_id in due:
+            # stop() waits outside the registry lock and starts with the kind's normal
+            # stop signal. Its existing kill_after_timeout policy remains authoritative.
+            try:
+                result = self.stop(job_id)
+            except Exception:
+                with self._lock:
+                    record = self._records.get(job_id)
+                    if record is not None and record["state"] == "running":
+                        record["expiry_stop_requested_at"] = None
+                        record["lease_expires_at"] = time.time() + 1
+                        self._write(record)
+                raise
+            if result["state"] == "running":
+                # No-SIGKILL kinds may still be flushing data. Give them another normal stop
+                # interval, then retry the graceful signal instead of abandoning the guard.
+                with self._lock:
+                    record = self._records[job_id]
+                    spec = self._spec(str(record["kind"]))
+                    record["expiry_stop_requested_at"] = None
+                    record["lease_expires_at"] = time.time() + spec.stop_timeout
+                    self._write(record)
+        return due
 
     def describe(self, job_id: str) -> dict[str, Any]:
         with self._lock:

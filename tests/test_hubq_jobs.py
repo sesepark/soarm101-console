@@ -12,7 +12,13 @@ from soarm_console import hubq_client
 from soarm_console.owner_lock import LOCK_DIR_ENV, read_lock_ledger
 
 
-def _kind(directory: Path, command: list[str], *, kill_after_timeout: bool = True) -> None:
+def _kind(
+    directory: Path,
+    command: list[str],
+    *,
+    kill_after_timeout: bool = True,
+    limit_seconds: float | None = None,
+) -> None:
     directory.mkdir()
     (directory / "teleop.json").write_text(
         json.dumps(
@@ -26,6 +32,7 @@ def _kind(directory: Path, command: list[str], *, kill_after_timeout: bool = Tru
                 "stop_signal": "SIGTERM",
                 "stop_timeout": 2,
                 "kill_after_timeout": kill_after_timeout,
+                "limit_seconds": limit_seconds,
             }
         ),
         encoding="utf-8",
@@ -38,6 +45,63 @@ def test_five_deployed_kinds_declare_commands_devices_and_motion() -> None:
     assert set(kinds) == {"teleop", "record", "replay", "policy", "calibration"}
     assert all(spec.command and spec.device_roles for spec in kinds.values())
     assert all(spec.motion for spec in kinds.values())
+    assert kinds["teleop"].limit_seconds == 3600
+    assert kinds["record"].limit_seconds == 3600
+    assert all(
+        kinds[name].limit_seconds is None for name in {"replay", "policy", "calibration"}
+    )
+
+
+def test_expired_job_gets_its_graceful_signal(tmp_path: Path, monkeypatch) -> None:
+    kinds = tmp_path / "kinds"
+    marker = tmp_path / "stopped"
+    _kind(
+        kinds,
+        ["/bin/sh", "-c", f"trap 'touch {marker}; exit 0' TERM; while :; do sleep 0.02; done"],
+        limit_seconds=0.05,
+    )
+    monkeypatch.setenv(LOCK_DIR_ENV, str(tmp_path / "locks"))
+    registry = JobRegistry(tmp_path / "state", kinds)
+    job = registry.start(
+        kind="teleop",
+        owner="physical-leader-teleop",
+        devices={"leader": str(tmp_path / "leader"), "follower": str(tmp_path / "follower")},
+        env={},
+        metadata={},
+        confirmed=True,
+    )
+
+    time.sleep(0.08)
+    assert registry.expire_due() == [job["id"]]
+    assert marker.exists()
+    assert registry.describe(str(job["id"]))["state"] != "running"
+
+
+def test_heartbeat_renews_an_expiring_job(tmp_path: Path, monkeypatch) -> None:
+    kinds = tmp_path / "kinds"
+    _kind(
+        kinds,
+        ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.02; done"],
+        limit_seconds=0.12,
+    )
+    monkeypatch.setenv(LOCK_DIR_ENV, str(tmp_path / "locks"))
+    registry = JobRegistry(tmp_path / "state", kinds)
+    job = registry.start(
+        kind="teleop",
+        owner="physical-leader-teleop",
+        devices={"leader": str(tmp_path / "leader"), "follower": str(tmp_path / "follower")},
+        env={},
+        metadata={},
+        confirmed=True,
+    )
+    try:
+        for _ in range(4):
+            time.sleep(0.05)
+            assert registry.heartbeat() == 1
+            assert registry.expire_due() == []
+        assert registry.describe(str(job["id"]))["state"] == "running"
+    finally:
+        registry.stop(str(job["id"]))
 
 
 def test_job_inherits_locks_and_reconcile_finds_it_after_registry_restart(

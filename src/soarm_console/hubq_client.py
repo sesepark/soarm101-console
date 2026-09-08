@@ -182,6 +182,13 @@ def unregister(name: str) -> None:
     _request("DELETE", f"/registrations/{name}")
 
 
+def heartbeat() -> int:
+    value = _request("POST", "/heartbeat", timeout=1.0)
+    if not isinstance(value, dict) or not isinstance(value.get("renewed"), int):
+        raise HubQError("HUBq returned an invalid heartbeat response")
+    return int(value["renewed"])
+
+
 def emergency_stop(process: JobProcess, stop_signal: int, timeout: float) -> bool:
     """Safety escape hatch when HUBq is unreachable; never gate a stop on the scheduler."""
     try:

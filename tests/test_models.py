@@ -485,6 +485,15 @@ def test_policy_status_exposes_used_home_and_phase(tmp_path):
     assert returning["running"] is True
 
 
+@pytest.mark.parametrize("inference", ["remote", "rtc", "sync"])
+def test_policy_status_exposes_the_selected_inference_engine(tmp_path, inference):
+    manager = PolicyManager(_settings())
+    manager.runtime_dir = tmp_path
+    manager._inference = inference
+
+    assert manager.status()["inference"] == inference
+
+
 def test_policy_status_exposes_alignment_residual_or_empty_object(tmp_path):
     manager = PolicyManager(_settings())
     manager.runtime_dir = tmp_path

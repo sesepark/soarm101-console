@@ -323,6 +323,13 @@ def _inference_config(policy_type: str):
     return RTCInferenceConfig(rtc=RTCConfig(execution_horizon=RTC_EXECUTION_HORIZON))
 
 
+def inference_kind(policy_type: str) -> str:
+    """The local inference mode selected by the rollout configuration."""
+    from lerobot.rollout.inference import SyncInferenceConfig
+
+    return "sync" if isinstance(_inference_config(policy_type), SyncInferenceConfig) else "rtc"
+
+
 def build_rollout_config(
     settings: Settings,
     run: str,

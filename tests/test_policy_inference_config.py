@@ -46,12 +46,17 @@ def test_act_falls_back_to_sync_instead_of_dying():
     from lerobot.rollout.inference import SyncInferenceConfig
 
     assert isinstance(policying._inference_config("act"), SyncInferenceConfig)
+    assert policying.inference_kind("act") == "sync"
 
 
 def test_an_unknown_policy_type_falls_back_to_sync():
     from lerobot.rollout.inference import SyncInferenceConfig
 
     assert isinstance(policying._inference_config("no_such_policy"), SyncInferenceConfig)
+
+
+def test_smolvla_reports_the_rtc_engine_the_rollout_uses():
+    assert policying.inference_kind("smolvla") == "rtc"
 
 
 def test_the_horizon_fits_in_the_chunk_the_policy_actually_emits():

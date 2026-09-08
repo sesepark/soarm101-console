@@ -17,6 +17,7 @@ from .config import Settings
 from .models import describe_model
 from .datasets import DatasetError
 from .owner_lock import DeviceLockError, DeviceLockSet
+from .policying import inference_kind
 from .spark import (
     SparkError,
     describe_remote_model,
@@ -64,6 +65,7 @@ class PolicyManager:
         self._home: dict[str, float] = {}
         self._phase = "running"
         self._remote = False
+        self._inference = "rtc"
         self._remote_side_active = False
         self._tunnel: subprocess.Popen[str] | None = None
         self.other_mode_problem: Callable[[], str | None] | None = None
@@ -163,6 +165,7 @@ class PolicyManager:
             self._home = dict(home or {})
             self._phase = "aligning" if home is not None else "running"
             self._remote = remote
+            self._inference = "remote" if remote else inference_kind(str(model["policy"]))
             env = os.environ.copy()
             env.update(
                 {
@@ -339,7 +342,7 @@ class PolicyManager:
             "home": dict(self._home),
             "phase": self._phase,
             "max_relative_target": self.settings.policy_max_relative_target,
-            "inference": "remote" if self._remote else "rtc",
+            "inference": self._inference,
             # 지난번에 이 체크포인트를 올리는 데 걸린 초, 그리고 이번에 실제로 걸린 초.
             # 화면은 앞의 것으로 기다리는 사람에게 얼마나 남았는지 말한다.
             "expected_load_seconds": self._expected_load_seconds,

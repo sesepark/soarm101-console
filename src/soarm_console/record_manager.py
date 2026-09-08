@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 from .calibration import validate_calibration
@@ -123,6 +124,9 @@ class RecordManager:
         #: 이 회를 시작하기 직전의 하드웨어 진단. `app`이 넘겨 준다 — 가상 리더로 찍을
         #: 때는 진단을 돌리지 않으므로 `None`이다. `soarm_provenance.json`에 함께 적힌다.
         self._doctor: dict[str, object] | None = None
+        # The app owns the virtual-leader object; the manager only signals that
+        # a relay-backed recording has relinquished the follower.
+        self.on_virtual_exit: Callable[[], None] | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/record"
         self.log_path = self.runtime_dir / "record.log"
 
@@ -251,7 +255,9 @@ class RecordManager:
             self._owner_locks = owner_locks
             threading.Thread(target=self._collect_logs, daemon=True).start()
             threading.Thread(
-                target=self._watch_exit, args=(self._process, owner_locks), daemon=True
+                target=self._watch_exit,
+                args=(self._process, owner_locks, teleop_source),
+                daemon=True,
             ).start()
 
     def preview_path(self, role: str) -> Path:
@@ -448,10 +454,22 @@ class RecordManager:
         except (OSError, TypeError):
             pass
 
-    def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
+    def _watch_exit(
+        self,
+        process: subprocess.Popen[str],
+        owner_locks: DeviceLockSet,
+        teleop_source: str = "leader",
+    ) -> None:
         process.wait()
         self._archive_log()
         with self._lock:
             if self._process is process and self._owner_locks is owner_locks:
                 self._owner_locks = None
         owner_locks.release()
+        if teleop_source == "virtual" and self.on_virtual_exit is not None:
+            try:
+                self.on_virtual_exit()
+            except Exception as exc:
+                # Cleanup failure must remain visible, but it cannot strand the
+                # recording's owner lock or kill this watcher before it finishes.
+                self._logs.append(f"Could not stop virtual leader relay: {exc}")

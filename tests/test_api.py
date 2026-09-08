@@ -755,6 +755,32 @@ def test_first_slow_tick_after_each_episode_banner_is_not_a_warning():
     assert manager._slow_loop_warnings == 2
 
 
+@pytest.mark.parametrize("teleop_source, expected_stops", [("virtual", 1), ("leader", 0)])
+def test_record_exit_stops_only_the_virtual_leader_relay(
+    tmp_path, monkeypatch, teleop_source, expected_stops
+):
+    from soarm_console.config import Settings
+    from soarm_console.record_manager import RecordManager
+
+    manager = RecordManager(Settings())
+    manager.runtime_dir = tmp_path
+    manager.log_path = tmp_path / "record.log"
+    stops = []
+    manager.on_virtual_exit = lambda: stops.append(True)
+
+    class Finished:
+        def wait(self):
+            return 0
+
+    class Locks:
+        def release(self):
+            pass
+
+    manager._watch_exit(Finished(), Locks(), teleop_source)
+
+    assert len(stops) == expected_stops
+
+
 def _finished_recording(tmp_path, monkeypatch, name: str, *, resumed: bool, warnings: int):
     from soarm_console.config import Settings
     from soarm_console.record_manager import RecordManager

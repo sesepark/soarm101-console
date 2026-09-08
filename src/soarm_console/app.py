@@ -87,6 +87,7 @@ cameras = {
     "wrist": CameraWorker(settings.wrist_camera),
 }
 vleader = VirtualLeader(settings)
+recorder.on_virtual_exit = lambda: vleader.stop(force=True)
 calibrator = PerceptionManager(settings)
 # 추정기는 모드가 아니다. 장치를 모르는 채로 **프레임을 쥔 쪽**이 넣어 주는 것만 받는다.
 # 아무 모드도 안 돌 때는 아래에서 `CameraWorker`가 넣고, 모드가 돌 때는 그 자식이 넣는다.

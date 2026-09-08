@@ -37,7 +37,11 @@ class PolicyManager:
         self.settings = settings
         self._process: subprocess.Popen[str] | None = None
         self._logs: deque[str] = deque(maxlen=400)
-        self._lock = threading.Lock()
+        # ``start()`` holds this through remote-side startup, which can take up to
+        # 120 seconds. ``stop()`` must join that serialization before reading
+        # ``_process`` or it can release the new rollout's device locks. Cleanup
+        # calls ``_release_locks()``, so this lock must be re-entrant.
+        self._lock = threading.RLock()
         self._owner_locks: DeviceLockSet | None = None
         self._run: str | None = None
         self._step: str | None = None
@@ -218,34 +222,35 @@ class PolicyManager:
             threading.Thread(target=self._watch_exit, args=(self._process, owner_locks), daemon=True).start()
 
     def stop(self, timeout: float = 40.0) -> None:
-        process = self._process
-        if process is None or process.poll() is not None:
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                self._release_locks()
+                self._stop_remote_resources(stop_side=True)
+                return
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                # Rollout gets the full timeout to run teardown and let the console return the arm. A stuck
+                # child cannot be left commanding hardware indefinitely, so SIGKILL is the
+                # final safety cutoff only after that graceful path failed.
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+                self._release_locks()
+                # 무엇을 죽였는지에 따라 사람이 할 일이 정반대다. 팔을 움직이던 롤아웃을
+                # 강제로 끊은 것이라면 팔이 어중간한 자세로 남았을 수 있어 지켜봐야 하고,
+                # 정책을 아직 올리는 중이었다면 팔은 한 번도 움직인 적이 없다. 둘을 같은
+                # 문장으로 말해서 "물리 전원을 차단하세요"를 읽게 하지 않는다.
+                if self._phase in {"aligning", "loading"}:
+                    raise TeleopError(
+                        "Policy rollout was killed before it moved the arm; the arm did not move"
+                    ) from exc
+                raise TeleopError(
+                    "Policy rollout did not stop cleanly after SIGTERM; it was killed"
+                ) from exc
             self._release_locks()
             self._stop_remote_resources(stop_side=True)
-            return
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            # Rollout gets the full timeout to run teardown and let the console return the arm. A stuck
-            # child cannot be left commanding hardware indefinitely, so SIGKILL is the
-            # final safety cutoff only after that graceful path failed.
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
-            self._release_locks()
-            # 무엇을 죽였는지에 따라 사람이 할 일이 정반대다. 팔을 움직이던 롤아웃을
-            # 강제로 끊은 것이라면 팔이 어중간한 자세로 남았을 수 있어 지켜봐야 하고,
-            # 정책을 아직 올리는 중이었다면 팔은 한 번도 움직인 적이 없다. 둘을 같은
-            # 문장으로 말해서 "물리 전원을 차단하세요"를 읽게 하지 않는다.
-            if self._phase in {"aligning", "loading"}:
-                raise TeleopError(
-                    "Policy rollout was killed before it moved the arm; the arm did not move"
-                ) from exc
-            raise TeleopError(
-                "Policy rollout did not stop cleanly after SIGTERM; it was killed"
-            ) from exc
-        self._release_locks()
-        self._stop_remote_resources(stop_side=True)
 
     #: 체크포인트마다 지난번 적재가 몇 초 걸렸는지. 화면이 "얼마나 기다리면 되는지"를
     #: 모델 이름으로 분기해 적지 않고 여기서 읽는다.

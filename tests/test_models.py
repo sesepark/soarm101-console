@@ -1036,6 +1036,54 @@ def test_policy_stop_uses_sigterm(monkeypatch):
     assert signals == [(123, signal.SIGTERM)]
 
 
+def test_policy_stop_waits_for_start_before_reading_the_process(monkeypatch):
+    """A stop arriving during remote startup must stop the rollout startup creates."""
+    manager = PolicyManager(_settings())
+    start_holds_lock = threading.Event()
+    let_start_finish = threading.Event()
+    stopped = threading.Event()
+    signals = []
+
+    class StartingProcess:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            stopped.set()
+            return 0
+
+    def finish_start():
+        with manager._lock:
+            start_holds_lock.set()
+            assert let_start_finish.wait(5)
+            manager._process = StartingProcess()
+
+    starter = threading.Thread(target=finish_start)
+    starter.start()
+    assert start_holds_lock.wait(5)
+    monkeypatch.setattr(
+        policy_manager_module.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    stopper = threading.Thread(target=manager.stop)
+    stopper.start()
+
+    # ``stop`` is serialized behind startup and cannot inspect the old ``None``
+    # process or touch resources belonging to the pending rollout.
+    assert not stopped.wait(0.1)
+    let_start_finish.set()
+    starter.join(timeout=5)
+    stopper.join(timeout=5)
+
+    assert not starter.is_alive()
+    assert not stopper.is_alive()
+    assert signals == [(4242, signal.SIGTERM)]
+    assert stopped.is_set()
+
+
 def test_mode_stop_stops_policy_before_every_other_process(monkeypatch):
     from soarm_console import app as app_module
 

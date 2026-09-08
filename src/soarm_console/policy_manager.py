@@ -31,6 +31,12 @@ from .teleop import TeleopError
 _RTC_LATENCY = re.compile(r"RTC inference latency=([0-9.]+)s")
 _REMOTE_LATENCY = re.compile(r"Network latency \(server->client\): ([0-9.]+)ms")
 _ACTUAL_FPS = re.compile(r"running slower \(([0-9.]+) Hz\)")
+#: The remote client never prints that warning.  It reports the rate it is actually
+#: achieving on every observation instead — ``Obs #2664 | Avg FPS: 5.42 | Target: 30.00``.
+#: Without this pattern ``fps_actual`` stayed None for every remote rollout, so the app
+#: could not say the loop was behind and a person had to feel the arm stutter and then
+#: open this log to find out it was running at 5.4 Hz instead of 30 (2026-09-08).
+_REMOTE_FPS = re.compile(r"Avg FPS: ([0-9.]+) \| Target: ([0-9.]+)")
 
 
 class PolicyManager:
@@ -377,6 +383,13 @@ class PolicyManager:
                     self._chunks = (self._chunks or 0) + 1
                 if match := _ACTUAL_FPS.search(text):
                     self._fps_actual = float(match.group(1))
+                if match := _REMOTE_FPS.search(text):
+                    # The client's own running average.  Ignore the warm-up zero so the screen
+                    # does not flash "0.0 fps" for the first second of every remote rollout.
+                    rate = float(match.group(1))
+                    if rate > 0:
+                        self._fps_actual = rate
+                        self._fps_target = float(match.group(2))
                 if handle is not None:
                     print(text, file=handle, flush=True)
         finally:

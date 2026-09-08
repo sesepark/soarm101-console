@@ -1227,3 +1227,25 @@ def test_camera_map_falls_back_to_position_for_names_it_cannot_read():
     }
     assert models.camera_map([]) == {}
     assert models.camera_map(None) == {}
+
+
+def test_remote_client_loop_rate_is_read_from_its_own_log_line():
+    """The remote client never prints ``running slower``; it prints the rate it is achieving.
+
+    While only the local warning was matched, ``fps_actual`` stayed None for every remote
+    rollout, so nothing could say the control loop was behind.  A person felt the arm stutter
+    and had to open this log to learn it was running at 5.4 Hz against a 30 Hz target
+    (2026-09-08).
+    """
+    from soarm_console.policy_manager import _ACTUAL_FPS, _REMOTE_FPS
+
+    line = "INFO t_client.py:443 Obs #2664 | Avg FPS: 5.42 | Target: 30.00"
+    assert _ACTUAL_FPS.search(line) is None
+    match = _REMOTE_FPS.search(line)
+    assert match is not None
+    assert float(match.group(1)) == 5.42
+    assert float(match.group(2)) == 30.00
+
+    # The local rollout keeps its own line.
+    local = "WARNING rollout is running slower (24.5 Hz) than the target"
+    assert float(_ACTUAL_FPS.search(local).group(1)) == 24.5

@@ -384,24 +384,6 @@ def stop_policy_side(settings: Settings) -> None:
         _queue_request(settings, "DELETE", "/api/side")
 
 
-def policy_tunnel_command(settings: Settings) -> list[str]:
-    port = settings.remote_policy_port
-    return [
-        "ssh",
-        *SSH_OPTIONS,
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "ServerAliveInterval=2",
-        "-o",
-        "ServerAliveCountMax=2",
-        "-N",
-        "-L",
-        f"{port}:127.0.0.1:{port}",
-        _target(settings),
-    ]
-
-
 def _remote_dataset_root(settings: Settings) -> str:
     # `~`를 남겨 두면 rsync는 셸을 거치므로 확장되지만 `python3 -` 인자로는 확장되지 않는다.
     # 양쪽에서 같은 경로를 가리키도록 여기서 한 번만 다듬는다.

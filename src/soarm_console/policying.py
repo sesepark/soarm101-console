@@ -524,7 +524,9 @@ def build_remote_client_config(
         robot=_robot_config(settings, fps, camera_rename_map=rename_map),
         actions_per_chunk=50,
         task=task.strip(),
-        server_address=f"127.0.0.1:{settings.remote_policy_port}",
+        # 터널이 아니라 tailnet 주소로 바로 붙는다. 이유는
+        # `Settings.effective_remote_policy_host`와 docs/원격_추론_끊김_진단_2026-09-08.md §5-5.
+        server_address=f"{settings.effective_remote_policy_host}:{settings.remote_policy_port}",
         policy_device="cuda",
         client_device="cpu",
         fps=int(fps),

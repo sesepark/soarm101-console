@@ -19,7 +19,6 @@ from .spark import (
     SparkError,
     describe_remote_model,
     ensure_policy_side,
-    policy_tunnel_command,
     stop_policy_side,
 )
 from .teleop import TeleopError
@@ -220,14 +219,12 @@ class PolicyManager:
                     }
                 )
             try:
-                sidecars: dict[str, list[str]] = {}
                 if remote:
                     try:
                         ensure_policy_side(self.settings)
                     except SparkError as exc:
                         raise TeleopError(str(exc)) from exc
                     self._remote_side_active = True
-                    sidecars["policy-tunnel"] = policy_tunnel_command(self.settings)
                 self._process = hubq_client.start_job(
                     "policy",
                     "policy",
@@ -255,7 +252,8 @@ class PolicyManager:
                         "inference": self._inference,
                     },
                     True,
-                    sidecars,
+                    # 곁다리는 없다. 정책 gRPC는 tailnet으로 직접 간다.
+                    {},
                 )
             except hubq_client.HubQError as exc:
                 self._stop_remote_resources(stop_side=remote)

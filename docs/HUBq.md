@@ -33,8 +33,9 @@ runtime status; they now use the internal job API instead of acquiring locks or 
 
 `POST /jobs` acquires one `DeviceLockSet`, writes the job record atomically, launches a new process
 session with `pass_fds` and `SOARM_OWNER_LOCK_FDS`, and writes stdout directly to the fixed runtime
-log declared by its kind. The remote-policy SSH tunnel is a declared policy sidecar owned by the same job, so a
-console restart does not tear the transport out from under the rollout. `GET /jobs`,
+log declared by its kind. The policy job declares no sidecars: remote inference now dials Spark's
+tailnet address directly, because an SSH tunnel added ~47ms per round trip regardless of payload size
+and could not meet the 30Hz control budget (measured 2026-09-08). `GET /jobs`,
 `GET /jobs/{id}`, and `POST /jobs/{id}/stop` are loopback-only internal APIs. Virtual leader remains
 a console thread and uses `/registrations/virtual-leader` only to register/release its ownership.
 

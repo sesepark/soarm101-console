@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import pickle  # nosec: 양쪽 다 SSH 터널 안의 신뢰된 LeRobot 설치다
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -36,7 +35,6 @@ from soarm_console.policying import build_remote_client_config
 from soarm_console.spark import (
     describe_remote_model,
     ensure_policy_side,
-    policy_tunnel_command,
     stop_policy_side,
 )
 
@@ -44,7 +42,6 @@ from verify_remote_policy_pipeline import (  # noqa: E402 — 위의 경로 조�
     RUN,
     STEP,
     TASK,
-    stop_tunnel,
     synthetic_observation,
 )
 
@@ -58,7 +55,7 @@ def probe(settings: Settings, model: dict[str, object]) -> None:
     # 같은 시점에 시연자 자신은 어디에 있었나. 이것이 기준선이다.
     human_ahead = data["ahead_pan"] if "ahead_pan" in data else states[:, 0]
 
-    address = f"127.0.0.1:{settings.remote_policy_port}"
+    address = f"{settings.effective_remote_policy_host}:{settings.remote_policy_port}"
     channel = grpc.insecure_channel(address, grpc_channel_options(initial_backoff="0.0333s"))
     stub = services_pb2_grpc.AsyncInferenceStub(channel)
     rename_map = dict(model["rename_map"])
@@ -159,21 +156,16 @@ def main() -> int:
     model = describe_remote_model(settings, RUN, STEP)
     print("CHECKPOINT=" + str(model["source"]))
     print("ROBOT_CONNECTION=DISABLED (합성 gRPC 관측; 돌려받은 액션은 버린다)")
-    tunnel = None
     side_started = False
     try:
         side = ensure_policy_side(settings)
         side_started = True
         print(f"SIDE_ID={side['id']}")
-        tunnel = subprocess.Popen(
-            policy_tunnel_command(settings),
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
-        time.sleep(0.5)
+        # 터널은 없다. tailnet 주소로 바로 붙는다 (docs/원격_추론_끊김_진단_2026-09-08.md §5-5).
+        print(f"DIRECT={settings.effective_remote_policy_host}:{settings.remote_policy_port}")
         probe(settings, model)
         return 0
     finally:
-        stop_tunnel(tunnel)
         if side_started:
             stop_policy_side(settings)
 

@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import json
 import os
-import pickle  # nosec: both endpoints are the trusted SSH-tunnelled LeRobot installation
+import pickle  # nosec: both endpoints are the same trusted LeRobot installation on the tailnet
 import re
-import signal
 import statistics
 import subprocess
 import sys
@@ -38,7 +37,6 @@ from soarm_console.spark import (
     _queue_request,
     describe_remote_model,
     ensure_policy_side,
-    policy_tunnel_command,
     stop_policy_side,
 )
 
@@ -93,7 +91,7 @@ def synthetic_observation(robot_config) -> tuple[dict[str, dict], dict[str, obje
 
 
 def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -> list[float]:
-    address = f"127.0.0.1:{settings.remote_policy_port}"
+    address = f"{settings.effective_remote_policy_host}:{settings.remote_policy_port}"
     channel = grpc.insecure_channel(address, grpc_channel_options(initial_backoff="0.0333s"))
     stub = services_pb2_grpc.AsyncInferenceStub(channel)
     rename_map = dict(model["rename_map"])
@@ -208,15 +206,6 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
         channel.close()
 
 
-def stop_tunnel(tunnel: subprocess.Popen[str] | None) -> None:
-    if tunnel is None or tunnel.poll() is not None:
-        return
-    os.killpg(tunnel.pid, signal.SIGTERM)
-    try:
-        tunnel.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        os.killpg(tunnel.pid, signal.SIGKILL)
-        tunnel.wait(timeout=5)
 
 
 def main() -> int:
@@ -228,7 +217,6 @@ def main() -> int:
     print(remote_snapshot(settings))
 
     side_started = False
-    tunnel: subprocess.Popen[str] | None = None
     try:
         side = ensure_policy_side(settings)
         side_started = True
@@ -239,26 +227,16 @@ def main() -> int:
         ready_lines = [
             line
             for line in side_log(settings, side_id)
-            if "PolicyServer started on 127.0.0.1:8091" in line
+            if "PolicyServer started on " in line
         ]
         print("SERVER_READY=" + (ready_lines[-1] if ready_lines else "NOT_FOUND"))
 
-        tunnel = subprocess.Popen(
-            policy_tunnel_command(settings),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        time.sleep(0.5)
-        if tunnel.poll() is not None:
-            detail = tunnel.stderr.read().strip() if tunnel.stderr else ""
-            raise RuntimeError(f"Tunnel failed: {detail or tunnel.returncode}")
-        print(f"TUNNEL=OPEN 127.0.0.1:{settings.remote_policy_port}")
+        # 터널은 없다. tailnet 주소로 바로 붙는다 — 터널은 크기와 무관하게 왕복마다 ~47ms를
+        # 더해 30Hz 제어를 못 맞춘다 (docs/원격_추론_끊김_진단_2026-09-08.md §5-5).
+        print(f"DIRECT={settings.effective_remote_policy_host}:{settings.remote_policy_port}")
         run_grpc_probe(settings, model, side_id)
         return 0
     finally:
-        stop_tunnel(tunnel)
         if side_started:
             stop_policy_side(settings)
         print("\n=== AFTER SIDE STOP ===")

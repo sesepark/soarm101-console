@@ -86,6 +86,19 @@ class Settings:
     remote_policy_port: int = field(
         default_factory=lambda: int(os.getenv("SOARM_REMOTE_POLICY_PORT", "8091"))
     )
+    remote_policy_host: str = field(
+        default_factory=lambda: os.getenv("SOARM_REMOTE_POLICY_HOST", "")
+    )
+
+    @property
+    def effective_remote_policy_host(self) -> str:
+        """원격 추론 gRPC가 붙는 곳. 비워 두면 학습 서버의 tailnet 이름을 쓴다.
+
+        예전에는 여기가 `127.0.0.1`이었고 SSH 터널이 그 뒤를 이었다. 터널은 보내는 크기와
+        거의 무관하게 왕복마다 ~47ms를 더해서(2026-09-08 실측) 33.3ms 예산의 제어 루프를
+        맞출 수 없었다. tailnet으로 바로 붙으면 같은 관측이 18.2ms에 간다.
+        """
+        return self.remote_policy_host or self.spark_host
 
     @property
     def effective_max_relative_target(self) -> float | None:

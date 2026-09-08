@@ -43,8 +43,8 @@ from soarm_console.spark import (
 )
 
 
-RUN = "soarm101_cube104_dn_strat__pi05__b67e"
-STEP = "002000"
+RUN = os.environ.get("SOARM_PROBE_RUN", "soarm101_cube104_dn_strat__pi05__b67e")
+STEP = os.environ.get("SOARM_PROBE_STEP", "002000")
 TASK = "Pick up the orange cube and place it in the yellow square area."
 LOAD_LINE = re.compile(r"Time taken to put policy on cuda: ([0-9.]+) seconds")
 SERVER_TOTAL_LINE = re.compile(r"Observation \d+ \| Total time: ([0-9.]+)ms")
@@ -130,6 +130,7 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
         print("SERVER_POLICY_LOAD=" + (load_lines[-1] if load_lines else "NOT_FOUND"))
 
         latencies = []
+        sends: list[float] = []
         # 관측 사이의 간격(프레임). 기본 50은 앞 청크를 남김없이 소진한 상태여서, 서버가
         # 이어 붙일 꼬리가 없다 — RTC가 걸리지 않는 조건이다. 실제 클라이언트는 큐가 절반이
         # 되면 요청하므로 24프레임쯤이고, 그때 25프레임쯤이 꼬리로 남는다. 그 조건을 재려면
@@ -142,21 +143,35 @@ def run_grpc_probe(settings: Settings, model: dict[str, object], side_id: str) -
                 observation=raw_observation,
                 must_go=True,
             )
+            payload = pickle.dumps(timed)
+            # **보내기와 받기를 따로 잰다.** 제어 루프를 실제로 붙잡는 것은 `SendObservations`
+            # 하나뿐이다 — 행동은 별도 스레드(`receive_actions`)가 받는다. 둘을 묶어서 재면
+            # 틱을 막는 값이 추론 시간에 묻혀, 무엇을 줄여야 하는지 알 수 없다.
             started = time.perf_counter()
             iterator = send_bytes_in_chunks(
-                pickle.dumps(timed), services_pb2.Observation, log_prefix="[PROBE]", silent=True
+                payload, services_pb2.Observation, log_prefix="[PROBE]", silent=True
             )
             stub.SendObservations(iterator, timeout=30)
+            send_ms = (time.perf_counter() - started) * 1000
             response = stub.GetActions(services_pb2.Empty(), timeout=60)
             elapsed_ms = (time.perf_counter() - started) * 1000
+            sends.append(send_ms)
             if not response.data:
                 raise RuntimeError(f"Inference {index + 1} returned an empty response")
             actions = pickle.loads(response.data)  # nosec
             if not actions:
                 raise RuntimeError(f"Inference {index + 1} returned no actions")
             latencies.append(elapsed_ms)
-            print(f"INFERENCE_{index + 1:02d}_MS={elapsed_ms:.2f} ACTIONS={len(actions)}")
+            print(
+                f"INFERENCE_{index + 1:02d}_MS={elapsed_ms:.2f} "
+                f"SEND_MS={send_ms:.2f} ACTIONS={len(actions)}"
+            )
         print(f"INFERENCE_MEDIAN_MS={statistics.median(latencies):.2f}")
+        print(f"OBSERVATION_BYTES={len(payload)}")
+        print(f"SEND_MEDIAN_MS={statistics.median(sends):.2f}")
+        print(f"SEND_MAX_MS={max(sends):.2f}")
+        # 제어 루프의 예산은 33.3ms다. 보내기가 그 안에 들어가지 못하면 주기가 처진다.
+        print(f"SEND_BUDGET_33MS={'OK' if statistics.median(sends) < 33.3 else 'OVER'}")
 
         logs = side_log(settings, side_id)
         server_latencies = [

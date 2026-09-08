@@ -29,6 +29,7 @@ from .datasets import (
     trajectory,
 )
 from .diagnostics import doctor_failure, run_hardware_doctor
+from . import hubq_client
 from .models import (
     ModelNotFound,
     build_manifest,
@@ -95,23 +96,19 @@ perception = PerceptionHub()
 for _role, _worker in cameras.items():
     _worker.observer = (lambda role: lambda image, at: perception.offer(role, image, at))(_role)
     _worker.on_release = (lambda role: lambda: perception.forget(role))(_role)
-policy_manager.other_mode_problem = lambda: (
-    "Stop the running mode before starting a policy"
-    if recorder.running or teleop.running or replayer.running or vleader.running or calibrator.running
-    else None
-)
-calibrator.other_mode_problem = lambda: (
-    "Stop the running mode before starting calibration"
-    if recorder.running or teleop.running or replayer.running or vleader.running or policy_manager.running
-    else None
-)
-vleader.external_mode_problem = lambda: (
-    "Stop the policy before starting the virtual leader: the follower has one owner"
-    if policy_manager.running
-    else None
-)
 last_doctor: dict[str, object] | None = None
 static_dir = Path(__file__).with_name("static")
+
+
+def _claim_hardware(kind: str, devices: list[str]) -> None:
+    try:
+        hubq_client.claim(kind, devices)
+    except hubq_client.HubQConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except hubq_client.HubQError as exc:
+        # Starting without the scheduler's answer would recreate the split-brain this service exists
+        # to remove. A dead HUBq therefore fails closed, but is not a resource conflict.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @asynccontextmanager
@@ -180,7 +177,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # 3D 뷰어는 한 번만 만들고 서버가 서빙한다. 맥 앱이 `WKWebView`로 품는 화면과 폰의
 # 조작 화면이 같은 파일을 쓴다 — 구현이 둘이면 두 기기의 동작이 반드시 어긋난다.
 app.mount("/viewer", StaticFiles(directory=static_dir / "viewer", html=True), name="viewer")
-app.include_router(build_router(vleader))
+app.include_router(build_router(vleader, claim_hardware=_claim_hardware))
 
 
 class MotionRequest(BaseModel):
@@ -420,6 +417,7 @@ def camera_stream(name: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="Unknown camera")
     if not Path(worker.path).exists():
         raise HTTPException(status_code=503, detail=f"Camera is not connected: {worker.path}")
+    _claim_hardware("camera-preview", [worker.path])
     worker.acquire()
     return StreamingResponse(
         worker.frames(),
@@ -439,14 +437,7 @@ def configure_camera(name: str, request: CameraSettingsRequest) -> dict[str, obj
     worker = cameras.get(name)
     if worker is None:
         raise HTTPException(status_code=404, detail="Unknown camera")
-    if recorder.running:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Recording fixes every camera at "
-                f"{RECORDING_PROFILE.width}x{RECORDING_PROFILE.height}@{RECORDING_PROFILE.fps}"
-            ),
-        )
+    _claim_hardware("camera-config", [worker.path])
     profile = CameraProfile(width=request.width, height=request.height, fps=request.fps)
     if profile.fps < 1 or profile.width < 1 or profile.height < 1:
         raise HTTPException(status_code=400, detail="Camera settings must be positive")
@@ -657,8 +648,7 @@ def spark_train(
 @app.post("/api/doctor")
 def doctor() -> dict[str, object]:
     global last_doctor
-    if teleop.running or recorder.running or vleader.running or policy_manager.running or calibrator.running:
-        raise HTTPException(status_code=409, detail="Cannot inspect serial buses during an active mode")
+    _claim_hardware("hardware-doctor", [settings.leader_port, settings.follower_port])
     last_doctor = run_hardware_doctor(settings)
     return last_doctor
 
@@ -683,14 +673,8 @@ def release_torque(request: Request, body: TorqueReleaseRequest) -> dict[str, ob
     _authorise_motion(_token_from(request))
     if body.confirmation != RELEASE_CONFIRMATION:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if (
-        teleop.running or recorder.running or vleader.running
-        or policy_manager.running or calibrator.running
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the running mode before releasing torque",
-        )
+    device = settings.leader_port if body.arm == "leader" else settings.follower_port
+    _claim_hardware("torque-release", [device])
     try:
         return release_torque_on(settings, body.arm)
     except TorqueError as exc:
@@ -702,28 +686,9 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
     global last_doctor
     if request.confirmation != "START SOARM101":
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if recorder.running:
-        raise HTTPException(status_code=409, detail="Stop recording before teleoperation")
-    if replayer.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the replay before teleoperation: the follower has one owner",
-        )
-    if calibrator.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the camera calibration before teleoperation: the follower has one owner",
-        )
-    if policy_manager.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the policy before teleoperation: the follower has one owner",
-        )
-    if vleader.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the virtual leader before physical-leader teleoperation: the follower has one owner",
-        )
+    _claim_hardware(
+        "physical-leader-teleop", [settings.leader_port, settings.follower_port]
+    )
     last_doctor = run_hardware_doctor(settings)
     if not last_doctor["healthy"]:
         # 토크가 걸려 있는지는 더 이상 묻지 않는다 — `diagnostics.run_hardware_doctor`가
@@ -791,32 +756,16 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
     global last_doctor
     if request.confirmation != "RECORD SOARM101":
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if teleop.running:
-        raise HTTPException(status_code=409, detail="Stop teleoperation before recording")
-    if replayer.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the replay before recording: the follower has one owner",
-        )
-    if calibrator.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the camera calibration before recording: the follower and cameras have one owner",
-        )
-    if policy_manager.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the policy before recording: the follower and cameras have one owner",
-        )
+    kind = "record-virtual" if request.teleop == "virtual" else "record-leader"
+    devices = [settings.follower_port, settings.scene_camera, settings.wrist_camera]
+    if kind == "record-leader":
+        devices.append(settings.leader_port)
+    _claim_hardware(kind, devices)
     if request.teleop not in {"leader", "virtual"}:
         raise HTTPException(status_code=400, detail="teleop must be 'leader' or 'virtual'")
     if request.resume:
         _check_resumable(request.dataset, request.task)
     if request.teleop == "leader":
-        if vleader.running:
-            raise HTTPException(
-                status_code=409, detail="Stop the virtual leader before recording with the physical leader"
-            )
         last_doctor = run_hardware_doctor(settings)
         if not last_doctor["healthy"]:
             raise HTTPException(
@@ -910,10 +859,7 @@ def delete_dataset(name: str) -> dict[str, object]:
     목록에서 사라지는 것으로 충분하고, 디스크를 실제로 비우는 것은 사람이
     `rm -rf data/.trash`로 한다.
     """
-    if recorder.running or replayer.running or policy_manager.running:
-        raise HTTPException(
-            status_code=409, detail="Cannot delete while recording or replaying"
-        )
+    _claim_hardware("dataset-delete", [settings.follower_port])
     try:
         moved = move_to_trash(name)
     except FileNotFoundError as exc:
@@ -930,10 +876,7 @@ def delete_dataset_episode(name: str, episode_index: int) -> dict[str, object]:
     찍다 만 회차가 데이터셋 안에서 온전한 시연인 척하는 것을 고치는 길이다. 앞으로
     찍는 것은 `abort`가 막지만, 이미 들어 있는 것을 꺼낼 자리도 있어야 한다.
     """
-    if recorder.running or replayer.running or policy_manager.running:
-        raise HTTPException(
-            status_code=409, detail="Cannot delete while recording or replaying"
-        )
+    _claim_hardware("dataset-delete", [settings.follower_port])
     try:
         return delete_episode(name, episode_index)
     except FileNotFoundError as exc:
@@ -955,18 +898,7 @@ def replay_preview(dataset: str, episode: int = 0) -> dict[str, object]:
     팔로워 serial을 읽으므로 다른 모드가 돌고 있으면 거절한다. 장치 하나에 소유자는
     하나다.
     """
-    if (
-        recorder.running
-        or teleop.running
-        or vleader.running
-        or replayer.running
-        or policy_manager.running
-        or calibrator.running
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the running mode before reading the follower: it has one owner",
-        )
+    _claim_hardware("replay-preflight", [settings.follower_port])
     try:
         goal = episode_first_pose(dataset, episode)
     except FileNotFoundError as exc:
@@ -1018,33 +950,7 @@ def start_replay(request: ReplayRequest) -> dict[str, object]:
     """
     if request.confirmation != REPLAY_CONFIRMATION:
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
-    if replayer.running:
-        raise HTTPException(status_code=409, detail="Stop the replay that is already running")
-    if calibrator.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the camera calibration before replaying: the follower has one owner",
-        )
-    if policy_manager.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the policy before replaying: the follower has one owner",
-        )
-    if recorder.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop recording before replaying: the follower has one owner",
-        )
-    if teleop.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop teleoperation before replaying: the follower has one owner",
-        )
-    if vleader.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the virtual leader before replaying: the follower has one owner",
-        )
+    _claim_hardware("replay", [settings.follower_port])
     if not settings.motion_enabled:
         raise HTTPException(
             status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
@@ -1112,10 +1018,9 @@ def start_policy(request: Request, body: PolicyRequest) -> dict[str, object]:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not model["runnable"]:
             raise HTTPException(status_code=400, detail="; ".join(model["problems"]))
-    if policy_manager.running:
-        raise HTTPException(status_code=409, detail="A policy rollout is already running")
-    if recorder.running or teleop.running or replayer.running or vleader.running or calibrator.running:
-        raise HTTPException(status_code=409, detail="Stop the running mode before starting a policy")
+    _claim_hardware(
+        "policy", [settings.follower_port, settings.scene_camera, settings.wrist_camera]
+    )
     if not settings.motion_enabled:
         raise HTTPException(
             status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
@@ -1170,8 +1075,7 @@ def start_intrinsics(body: IntrinsicsRequest) -> dict[str, object]:
     """
     if body.camera not in cameras:
         raise HTTPException(status_code=404, detail="Unknown camera")
-    if calibrator.running or recorder.running or policy_manager.running:
-        raise HTTPException(status_code=409, detail="Stop the running mode before collecting board views")
+    _claim_hardware("intrinsics", [cameras[body.camera].path])
     try:
         perception.start_collect(body.camera, body.target_views)
     except (ValueError, RuntimeError) as exc:
@@ -1216,10 +1120,10 @@ def start_extrinsics(request: Request, body: CalibrationRequest) -> dict[str, ob
         raise HTTPException(
             status_code=400, detail="SOARM_ENABLE_MOTION=1 is required before the arm may move"
         )
-    if calibrator.running:
-        raise HTTPException(status_code=409, detail="Calibration is already running")
-    if recorder.running or teleop.running or replayer.running or vleader.running or policy_manager.running:
-        raise HTTPException(status_code=409, detail="Stop the running mode before starting calibration")
+    _claim_hardware(
+        "rig-calibration",
+        [settings.follower_port, settings.scene_camera, settings.wrist_camera],
+    )
     rig = perception_store.load()
     missing = [role for role in perception_store.ROLES if role not in rig.intrinsics]
     if missing:

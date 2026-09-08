@@ -53,7 +53,7 @@ def console(tmp_path, monkeypatch):
 
     vleader = VirtualLeader(Settings())
     app = FastAPI()
-    app.include_router(build_router(vleader))
+    app.include_router(build_router(vleader, claim_hardware=lambda *_: None))
     with TestClient(app) as client:
         yield client, vleader
     vleader.stop(force=True)

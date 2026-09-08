@@ -998,11 +998,18 @@ def test_policy_start_returns_the_reasons_for_an_unrunnable_model(client, model_
 
 def test_policy_start_refuses_another_running_mode(client, model_root, monkeypatch):
     from soarm_console import app as app_module
+    from soarm_console import hubq_client
 
     _received_model(model_root)
     models.build_manifest(_settings(), RUN, STEP)
     monkeypatch.setattr(app_module, "settings", dataclasses.replace(app_module.settings, motion_enabled=True))
-    monkeypatch.setattr(app_module.teleop, "_process", type("Running", (), {"poll": lambda self: None})())
+    monkeypatch.setattr(
+        hubq_client,
+        "claim",
+        lambda *_: (_ for _ in ()).throw(
+            hubq_client.HubQConflict("Stop the running mode before starting a policy")
+        ),
+    )
 
     response = client.post(
         "/api/policy/start", json=_policy_body(), headers={"X-SOARM-Motion-Token": "secret"}
@@ -1012,9 +1019,16 @@ def test_policy_start_refuses_another_running_mode(client, model_root, monkeypat
 
 def test_teleoperation_refuses_while_policy_is_marked_running(monkeypatch):
     from soarm_console import app as app_module
+    from soarm_console import hubq_client
 
     monkeypatch.setattr(
-        app_module.policy_manager, "_process", type("Running", (), {"poll": lambda self: None})()
+        hubq_client,
+        "claim",
+        lambda *_: (_ for _ in ()).throw(
+            hubq_client.HubQConflict(
+                "Stop the policy before teleoperation: the follower has one owner"
+            )
+        ),
     )
     response = TestClient(app_module.app).post(
         "/api/teleoperation/start", json={"confirmation": "START SOARM101"}

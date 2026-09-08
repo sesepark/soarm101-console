@@ -150,7 +150,6 @@ class VirtualLeader:
         #: 마지막으로 실제로 읽은 관절 자세. 수집으로 넘어갈 때의 출발점이다.
         self.last_known_position: dict[str, float] = {}
         self.last_known_at = 0.0
-        self.external_mode_problem: Callable[[], str | None] | None = None
         #: 텔레메트리를 듣는 쪽. **여기**가 들고 있어야 한다. 제어 루프가 들고 있으면,
         #: 루프가 뜨기 전에 붙은 연결은 영영 아무것도 받지 못한다 — 화면을 먼저 열고
         #: 조작 권한을 나중에 받는 것이 정상적인 순서인데도 그렇다.
@@ -251,8 +250,6 @@ class VirtualLeader:
     def start(self) -> dict[str, object]:
         if self.running:
             raise HardwareError("Virtual leader is already running")
-        if self.external_mode_problem is not None and (problem := self.external_mode_problem()):
-            raise HardwareError(problem)
         # 루프가 죽은 채로 남아 있는 소유자를 먼저 치운다.
         #
         # 죽은 루프는 참조만 남기고 사라지는데, 그 참조가 있는 한 상태 화면은 마지막
@@ -428,7 +425,9 @@ def _token_from(request: Request) -> str | None:
     return request.headers.get("x-soarm-motion-token") or request.query_params.get("token")
 
 
-def build_router(vleader: VirtualLeader) -> APIRouter:
+def build_router(
+    vleader: VirtualLeader, *, claim_hardware: Callable[[str, list[str]], None]
+) -> APIRouter:
     router = APIRouter(prefix="/api/vleader", tags=["virtual-leader"])
 
     @router.get("")
@@ -452,6 +451,7 @@ def build_router(vleader: VirtualLeader) -> APIRouter:
         확인 문구를 요구하지 않는 이유: 여기서는 아무것도 움직이지 않는다. 게이트는 토크를
         거는 자리에 있고, 게이트를 여러 개 늘어놓으면 하나하나가 가벼워진다.
         """
+        claim_hardware("virtual-leader", [vleader.settings.follower_port])
         try:
             return vleader.start()
         except (HardwareError, SpecError) as exc:

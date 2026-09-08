@@ -15,8 +15,6 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable
-
 from .calibration import validate_calibration
 from .config import Settings
 from .owner_lock import DeviceLockError, DeviceLockSet
@@ -36,7 +34,6 @@ class PerceptionManager:
         self._owner_locks: DeviceLockSet | None = None
         self._started_at: float | None = None
         self._poses = 0
-        self.other_mode_problem: Callable[[], str | None] | None = None
         self.runtime_dir = store.RUNTIME_DIR
 
     @property
@@ -60,8 +57,6 @@ class PerceptionManager:
         missing = [role for role in store.ROLES if role not in rig.intrinsics]
         if missing:
             problems.append(f"Intrinsics are missing for {', '.join(missing)}")
-        if self.other_mode_problem is not None and (problem := self.other_mode_problem()):
-            problems.append(problem)
         return problems
 
     def start(self, poses: int) -> None:

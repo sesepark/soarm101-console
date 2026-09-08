@@ -306,20 +306,23 @@ def test_replay_refuses_while_the_motion_gate_is_shut(monkeypatch, episode, near
 
 
 @pytest.mark.parametrize(
-    ("owner", "expected"),
+    ("detail", "expected"),
     [
-        ("soarm_console.record_manager.RecordManager", "Stop recording"),
-        ("soarm_console.teleop.TeleopManager", "Stop teleoperation"),
-        ("soarm_console.vleader.api.VirtualLeader", "Stop the virtual leader"),
-        ("soarm_console.replay_manager.ReplayManager", "Stop the replay that is already running"),
+        ("Stop recording before replaying: the follower has one owner", "Stop recording"),
+        ("Stop teleoperation before replaying: the follower has one owner", "Stop teleoperation"),
+        ("Stop the virtual leader before replaying: the follower has one owner", "Stop the virtual leader"),
+        ("Stop the replay that is already running", "Stop the replay that is already running"),
     ],
 )
 def test_replay_refuses_while_another_mode_owns_the_arm(
-    client, episode, near, started, monkeypatch, owner, expected
+    client, episode, near, started, monkeypatch, detail, expected
 ):
-    module_name, _, class_name = owner.rpartition(".")
-    module = __import__(module_name, fromlist=[class_name])
-    monkeypatch.setattr(getattr(module, class_name), "running", True)
+    from soarm_console import hubq_client
+
+    def refuse(_kind, _devices):
+        raise hubq_client.HubQConflict(detail)
+
+    monkeypatch.setattr(hubq_client, "claim", refuse)
 
     response = client.post("/api/replay/start", json=_body())
 
@@ -374,9 +377,14 @@ def test_replay_starts_from_eighty_degrees_away_and_the_preview_says_so(
 def test_replay_preview_refuses_while_another_mode_owns_the_arm(
     client, episode, near, monkeypatch
 ):
-    from soarm_console.record_manager import RecordManager
+    from soarm_console import hubq_client
 
-    monkeypatch.setattr(RecordManager, "running", True)
+    def refuse(_kind, _devices):
+        raise hubq_client.HubQConflict(
+            "Stop the running mode before reading the follower: it has one owner"
+        )
+
+    monkeypatch.setattr(hubq_client, "claim", refuse)
     response = client.get("/api/replay/preview", params={"dataset": "soarm101_pick"})
     assert response.status_code == 409
     assert "one owner" in response.json()["detail"]

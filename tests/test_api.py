@@ -723,9 +723,12 @@ def test_deleting_a_dataset_that_is_not_there_is_not_found(deletable):
 def test_nothing_is_deleted_while_the_arm_is_using_the_data(deletable, monkeypatch, owner):
     """수집은 그 폴더에 쓰는 중이고, 재생은 그 파케이를 읽는 중이다."""
     client, root = deletable
-    module_name, _, class_name = owner.rpartition(".")
-    module = __import__(module_name, fromlist=[class_name])
-    monkeypatch.setattr(getattr(module, class_name), "running", True)
+    from soarm_console import hubq_client
+
+    def refuse(_kind, _devices):
+        raise hubq_client.HubQConflict("Cannot delete while recording or replaying")
+
+    monkeypatch.setattr(hubq_client, "claim", refuse)
 
     dataset = client.request("DELETE", "/api/datasets/soarm101_pick")
     episode = client.request("DELETE", "/api/datasets/soarm101_pick/episodes/0")

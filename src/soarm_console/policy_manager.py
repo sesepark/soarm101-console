@@ -10,8 +10,6 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable
-
 from .calibration import validate_calibration
 from .config import Settings
 from .models import describe_model
@@ -75,7 +73,6 @@ class PolicyManager:
         self._inference = "rtc"
         self._remote_side_active = False
         self._tunnel: subprocess.Popen[str] | None = None
-        self.other_mode_problem: Callable[[], str | None] | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/policy"
         self.log_path = self.runtime_dir / "policy.log"
 
@@ -106,8 +103,6 @@ class PolicyManager:
         ):
             if not Path(path).exists():
                 problems.append(f"Missing {label}: {path}")
-        if self.other_mode_problem is not None and (problem := self.other_mode_problem()):
-            problems.append(problem)
         if remote and (not self.settings.spark_host or not self.settings.spark_user):
             problems.append("SOARM_SPARK_HOST and SOARM_SPARK_USER are required for remote inference")
         if not remote and run is not None and step is not None:

@@ -19,3 +19,10 @@ Stage 1 is observation-only. `GET /status` reads lock-file metadata and checks t
 device/inode entries in `/proc/locks`; it never acquires a device lock. Metadata from an unlocked
 file is historical and is therefore reported with `locked: false`, `owner: null`, and `pid: null`.
 Later job stages must persist job state and reconcile it with live processes after HUBq restarts.
+
+Stage 2 adds `POST /claim {kind, devices}`. A claim is a read-only scheduling decision; the console
+still acquires every `DeviceLockSet` and launches every process. HUBq returns a structured 409 with
+the console's established English `detail` text so existing Mac and phone translation tables keep
+working. Unknown kinds and an unreadable scheduler fail closed rather than starting a hardware job.
+The console retains checks that are not ownership decisions: whether a requested model is the active
+policy's model, whether a recording/calibration preview exists, and the ordered stop sequence.

@@ -1,0 +1,12 @@
+{
+  "command": ["scripts/record.sh"],
+  "owners": ["record-leader", "record-virtual"],
+  "device_roles": ["follower", "scene", "wrist"],
+  "optional_device_roles": ["leader"],
+  "motion": true,
+  "already_running": "Recording is already running",
+  "log": "runtime/record/record.log",
+  "stop_signal": "SIGINT",
+  "stop_timeout": 10,
+  "kill_after_timeout": false
+}

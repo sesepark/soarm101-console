@@ -1,0 +1,11 @@
+{
+  "command": ["scripts/replay.sh"],
+  "owners": ["replay"],
+  "device_roles": ["follower"],
+  "motion": true,
+  "already_running": "A replay is already running",
+  "log": "runtime/replay/replay.log",
+  "stop_signal": "SIGINT",
+  "stop_timeout": 10,
+  "kill_after_timeout": false
+}

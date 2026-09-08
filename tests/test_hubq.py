@@ -9,7 +9,8 @@ import hubq.app as hubq_app
 from soarm_console.owner_lock import LOCK_DIR_ENV, DeviceLockSet, read_lock_ledger
 
 
-def _proc_lock_line(path: Path, pid: int = 4321) -> str:
+def _proc_lock_line(path: Path, pid: int | None = None) -> str:
+    pid = os.getpid() if pid is None else pid
     details = path.stat()
     return (
         f"1: FLOCK ADVISORY WRITE {pid} "
@@ -52,7 +53,7 @@ def test_lock_ledger_reports_only_a_kernel_held_lock(tmp_path: Path, monkeypatch
 
     assert status[0]["locked"] is True
     assert status[0]["owner"] == "policy"
-    assert status[0]["pid"] == 4321
+    assert status[0]["pid"] == os.getpid()
     assert isinstance(status[0]["acquired_at"], float)
 
 
@@ -105,3 +106,5 @@ def test_units_share_one_explicit_lock_directory() -> None:
     assert "/usr/bin/sg dialout" in hubq
     assert "Environment=HUBQ_STATE_DIR=%h/.local/state/hubq" in hubq
     assert "HUBQ_STATE_DIR" not in console
+    assert "KillMode=process" in hubq
+    assert "ExecStop=" in hubq

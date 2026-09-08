@@ -1,0 +1,11 @@
+{
+  "command": ["scripts/teleoperate.sh"],
+  "owners": ["physical-leader-teleop"],
+  "device_roles": ["leader", "follower"],
+  "motion": true,
+  "already_running": "Teleoperation is already running",
+  "log": "runtime/teleop/teleop.log",
+  "stop_signal": "SIGINT",
+  "stop_timeout": 8,
+  "kill_after_timeout": false
+}

@@ -773,18 +773,16 @@ def test_record_exit_stops_only_the_virtual_leader_relay(
     manager.on_virtual_exit = lambda: (stops.append(True), events.append("relay stopped"))
 
     class Finished:
+        logs = []
+
         def wait(self):
             return 0
 
-    class Locks:
-        def release(self):
-            events.append("record lock released")
-
-    manager._watch_exit(Finished(), Locks(), teleop_source)
+    manager._watch_exit(Finished(), teleop_source)
 
     assert len(stops) == expected_stops
     if teleop_source == "virtual":
-        assert events == ["relay stopped", "record lock released"]
+        assert events == ["relay stopped"]
 
 
 def _finished_recording(tmp_path, monkeypatch, name: str, *, resumed: bool, warnings: int):

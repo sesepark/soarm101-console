@@ -80,3 +80,14 @@ def test_record_child_can_validate_inherited_descriptors(tmp_path: Path, monkeyp
         assert not inherited_locks_cover([*devices, tmp_path / "unexpected"])
     finally:
         locks.release()
+
+
+def test_lock_ledger_metadata_can_follow_the_inheriting_child(tmp_path: Path):
+    locks = DeviceLockSet.acquire([tmp_path / "follower"], "policy")
+    try:
+        locks.mark_inherited_owner(12345, ["worker", "--run"])
+        metadata = json.loads(locks.locks[0].path.read_text(encoding="utf-8"))
+        assert metadata["pid"] == 12345
+        assert metadata["command"] == ["worker", "--run"]
+    finally:
+        locks.release()

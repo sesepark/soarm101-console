@@ -111,15 +111,26 @@ def _claim_hardware(kind: str, devices: list[str]) -> None:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _register_hardware(name: str, owner: str, devices: list[str]) -> None:
+    try:
+        hubq_client.register(name, owner, devices)
+    except hubq_client.HubQError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _unregister_hardware(name: str) -> None:
+    try:
+        hubq_client.unregister(name)
+    except hubq_client.HubQError:
+        # Release paths stay fail-open: a dead scheduler must never trap a live arm mode.
+        pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
-    # 정책은 예측한 목표로 혼자 움직이는 모드다. 서버 종료에서도 가장 먼저 세워 rollout
-    # teardown 뒤 콘솔의 s-curve 복귀가 기준 자세로 돌아갈 기회를 준다.
-    with suppress(TeleopError):
-        policy_manager.stop()
-    with suppress(TeleopError):
-        calibrator.stop()
+    # 다섯 독립 잡의 수명은 HUBq 소유다. 콘솔 배포·재시작이 도는 잡을 죽이지 않는다.
+    # 가상 리더만 여전히 이 프로세스의 스레드이므로 아래에서 직접 정리한다.
     perception.close()
     for worker in cameras.values():
         worker.stop()
@@ -128,14 +139,7 @@ async def lifespan(_: FastAPI):
     # 루프만 세운다. 팔은 마지막 자세를 유지한 채 남는다.
     with suppress(Exception):
         vleader.stop(force=True)
-    # 재생도 팔을 움직이는 중일 수 있다. 서버가 내려가면서 그것을 두고 가면 아무도
-    # 멈출 수 없는 팔이 남는다. 멈추기만 하고 토크는 그대로 둔다.
-    with suppress(TeleopError):
-        replayer.stop()
-    with suppress(TeleopError):
-        recorder.stop()
-    with suppress(TeleopError):
-        teleop.stop()
+    _unregister_hardware("virtual-leader")
 
 
 app = FastAPI(title="SO-ARM101 Console", version="0.1.0", lifespan=lifespan)
@@ -177,7 +181,14 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # 3D 뷰어는 한 번만 만들고 서버가 서빙한다. 맥 앱이 `WKWebView`로 품는 화면과 폰의
 # 조작 화면이 같은 파일을 쓴다 — 구현이 둘이면 두 기기의 동작이 반드시 어긋난다.
 app.mount("/viewer", StaticFiles(directory=static_dir / "viewer", html=True), name="viewer")
-app.include_router(build_router(vleader, claim_hardware=_claim_hardware))
+app.include_router(
+    build_router(
+        vleader,
+        claim_hardware=_claim_hardware,
+        register_hardware=_register_hardware,
+        unregister_hardware=_unregister_hardware,
+    )
+)
 
 
 class MotionRequest(BaseModel):
@@ -778,6 +789,7 @@ def start_recording(request: RecordRequest) -> dict[str, object]:
         # 여는 일이고, 가상 리더가 이미 열어 두고 읽고 있었다.
         try:
             vleader.start_relay()
+            _unregister_hardware("virtual-leader")
         except HardwareError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     for worker in cameras.values():

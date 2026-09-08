@@ -426,7 +426,11 @@ def _token_from(request: Request) -> str | None:
 
 
 def build_router(
-    vleader: VirtualLeader, *, claim_hardware: Callable[[str, list[str]], None]
+    vleader: VirtualLeader,
+    *,
+    claim_hardware: Callable[[str, list[str]], None],
+    register_hardware: Callable[[str, str, list[str]], None] = lambda *_: None,
+    unregister_hardware: Callable[[str], None] = lambda *_: None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/vleader", tags=["virtual-leader"])
 
@@ -453,7 +457,19 @@ def build_router(
         """
         claim_hardware("virtual-leader", [vleader.settings.follower_port])
         try:
-            return vleader.start()
+            result = vleader.start()
+            try:
+                register_hardware(
+                    "virtual-leader", "virtual-leader", [vleader.settings.follower_port]
+                )
+            except BaseException:
+                # Registration is part of startup. If it fails, leave neither an
+                # unregistered control loop nor its follower lock behind.
+                vleader.stop(force=True)
+                raise
+            return result
+        except HTTPException:
+            raise
         except (HardwareError, SpecError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 이유 없는 500만은 내보내지 않는다
@@ -472,6 +488,7 @@ def build_router(
             vleader.stop(force=force)
         except HardwareError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        unregister_hardware("virtual-leader")
         return vleader.status()
 
     @router.post("/arm")

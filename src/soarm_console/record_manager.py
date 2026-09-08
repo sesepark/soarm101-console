@@ -4,17 +4,16 @@ import json
 import os
 import re
 import shutil
-import signal
-import subprocess
 import threading
 import time
+import signal
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
 from .calibration import validate_calibration
 from .config import Settings
-from .owner_lock import DeviceLockError, DeviceLockSet
+from . import hubq_client
 from .teleop import TeleopError
 from .v4l2_controls import apply_recording_controls
 
@@ -113,10 +112,10 @@ def preview_path(runtime_dir: Path, role: str) -> Path:
 class RecordManager:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._process: subprocess.Popen[str] | None = None
+        self._process: hubq_client.JobProcess | None = None
         self._logs: deque[str] = deque(maxlen=400)
         self._lock = threading.Lock()
-        self._owner_locks: DeviceLockSet | None = None
+        self._watching_job_id: str | None = None
         self._camera_controls: dict[str, dict[str, object]] = {}
         self._slow_loop_warnings = 0
         self._ignore_first_slow_loop_warning = False
@@ -132,7 +131,26 @@ class RecordManager:
 
     @property
     def running(self) -> bool:
+        if self._process is None:
+            self._adopt_active()
         return self._process is not None and self._process.poll() is None
+
+    def _adopt_active(self) -> None:
+        try:
+            process = hubq_client.active_job("record")
+        except hubq_client.HubQError:
+            return
+        if process is None:
+            return
+        self._process = process
+        metadata = process.metadata
+        self._resumed = bool(metadata.get("resumed", False))
+        controls = metadata.get("camera_controls")
+        if isinstance(controls, dict):
+            self._camera_controls = controls
+        doctor = metadata.get("doctor")
+        self._doctor = doctor if isinstance(doctor, dict) else None
+        self._start_watcher(str(metadata.get("teleop_source", "leader")))
 
     def preflight(self, teleop_source: str = "leader") -> list[str]:
         """수집을 막는 것들.
@@ -211,22 +229,6 @@ class RecordManager:
                 env["SOARM_DATASET_NAME"] = dataset
                 env["SOARM_RESUME"] = "1"
             self._resumed = resume
-            devices = [
-                self.settings.follower_port,
-                self.settings.scene_camera,
-                self.settings.wrist_camera,
-            ]
-            if teleop_source == "leader":
-                devices.append(self.settings.leader_port)
-            try:
-                owner_locks = DeviceLockSet.acquire(
-                    devices, f"record-{teleop_source}"
-                )
-            except DeviceLockError as exc:
-                raise TeleopError(str(exc)) from exc
-            # record child도 같은 열린 file description을 물려받는다. parent가 죽어도 child가
-            # 장치를 쓰는 동안 flock이 남아야 한다.
-            env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
             # LeRobot OpenCVCamera가 장치를 열기 전에 넣어야 한다. V4L2 컨트롤은 장치에
             # 남으므로 여기서 닫은 뒤 record child가 열어도 되며, 지원하지 않는 컨트롤은
             # 카메라 교체 시 생길 수 있으므로 경고만 남기고 수집은 계속한다.
@@ -236,29 +238,30 @@ class RecordManager:
             }
             self._camera_controls = camera_controls
             self._doctor = doctor
-            command = [str(Path(__file__).parents[2] / "scripts/record.sh")]
             try:
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=Path(__file__).parents[2],
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                    pass_fds=owner_locks.file_descriptors,
+                device_map = {
+                    "follower": self.settings.follower_port,
+                    "scene": self.settings.scene_camera,
+                    "wrist": self.settings.wrist_camera,
+                }
+                if teleop_source == "leader":
+                    device_map["leader"] = self.settings.leader_port
+                self._process = hubq_client.start_job(
+                    "record",
+                    f"record-{teleop_source}",
+                    device_map,
+                    {key: value for key, value in env.items() if key.startswith("SOARM_")},
+                    {
+                        "teleop_source": teleop_source,
+                        "resumed": resume,
+                        "camera_controls": camera_controls,
+                        "doctor": doctor,
+                    },
+                    True,
                 )
-            except BaseException:
-                owner_locks.release()
-                raise
-            self._owner_locks = owner_locks
-            threading.Thread(target=self._collect_logs, daemon=True).start()
-            threading.Thread(
-                target=self._watch_exit,
-                args=(self._process, owner_locks, teleop_source),
-                daemon=True,
-            ).start()
+            except hubq_client.HubQError as exc:
+                raise TeleopError(str(exc)) from exc
+            self._start_watcher(teleop_source)
 
     def preview_path(self, role: str) -> Path:
         return preview_path(self.runtime_dir, role)
@@ -277,23 +280,18 @@ class RecordManager:
     def stop(self, timeout: float = 10.0) -> None:
         process = self._process
         if process is None or process.poll() is not None:
-            with self._lock:
-                owner_locks, self._owner_locks = self._owner_locks, None
-            if owner_locks is not None:
-                owner_locks.release()
             return
-        os.killpg(process.pid, signal.SIGINT)
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
+            result = hubq_client.stop_job(process, timeout)
+        except hubq_client.HubQError as exc:
+            if hubq_client.emergency_stop(process, signal.SIGINT, timeout):
+                return
             raise TeleopError("Recording did not stop cleanly after SIGINT") from exc
-        else:
-            with self._lock:
-                owner_locks, self._owner_locks = self._owner_locks, None
-            if owner_locks is not None:
-                owner_locks.release()
+        if result.get("state") == "running":
+            raise TeleopError("Recording did not stop cleanly after SIGINT")
 
     def status(self) -> dict[str, object]:
+        running = self.running
         process = self._process
         status_path = self.runtime_dir / "status.json"
         runtime = None
@@ -301,12 +299,17 @@ class RecordManager:
             runtime = json.loads(status_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
+        logs = list(getattr(process, "logs", self._logs))
+        self._slow_loop_warnings = 0
+        self._ignore_first_slow_loop_warning = False
+        for line in logs:
+            self._observe_log_line(line)
         return {
-            "running": self.running,
-            "pid": process.pid if self.running and process else None,
+            "running": running,
+            "pid": process.pid if running and process else None,
             "return_code": process.poll() if process else None,
             "runtime": runtime,
-            "logs": list(self._logs)[-100:],
+            "logs": logs[-100:],
             # 이 회차가 30Hz를 지켰는지. 0이 아니면 데이터가 주장하는 fps와 실제로 찍힌
             # 속도가 다르다는 뜻이고, 그 데이터로 배운 정책은 시연보다 빠르게 움직인다.
             "slow_loop_warnings": self._slow_loop_warnings,
@@ -324,28 +327,14 @@ class RecordManager:
                 "failures": list(state["failures"]),
             }
 
-    def _collect_logs(self) -> None:
-        process = self._process
-        if process is None or process.stdout is None:
-            return
-        # 메모리에만 담으면 회차가 끝나는 순간 증거가 사라진다. 수집이 정말 30Hz로
-        # 돌았는지는 데이터셋 파일만 봐서는 알 수 없으므로(SLOW_LOOP_MARKER 설명 참고),
-        # 이 출력은 디스크에 남아야 한다.
+    def _materialize_log(self, lines: list[str]) -> None:
         try:
-            handle = self.log_path.open("w", encoding="utf-8")
+            self.runtime_dir.mkdir(parents=True, exist_ok=True)
+            self.log_path.write_text(
+                "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
+            )
         except OSError:
-            handle = None
-        try:
-            for line in process.stdout:
-                text = line.rstrip()
-                self._logs.append(text)
-                self._observe_log_line(text)
-                if handle is not None:
-                    # 곧바로 흘려 보낸다. 수집이 중간에 죽어도 그때까지의 경고는 남는다.
-                    print(text, file=handle, flush=True)
-        finally:
-            if handle is not None:
-                handle.close()
+            pass
 
     def _observe_log_line(self, text: str) -> None:
         """Count genuine slow ticks, excluding LeRobot's episode-transition tick."""
@@ -454,17 +443,25 @@ class RecordManager:
         except (OSError, TypeError):
             pass
 
+    def _start_watcher(self, teleop_source: str) -> None:
+        process = self._process
+        if process is None or self._watching_job_id == process.job_id:
+            return
+        self._watching_job_id = process.job_id
+        threading.Thread(
+            target=self._watch_exit, args=(process, teleop_source), daemon=True
+        ).start()
+
     def _watch_exit(
-        self,
-        process: subprocess.Popen[str],
-        owner_locks: DeviceLockSet,
-        teleop_source: str = "leader",
+        self, process: hubq_client.JobProcess, teleop_source: str = "leader"
     ) -> None:
         process.wait()
+        self._materialize_log(process.logs)
+        self._slow_loop_warnings = 0
+        self._ignore_first_slow_loop_warning = False
+        for line in process.logs:
+            self._observe_log_line(line)
         self._archive_log()
-        with self._lock:
-            if self._process is process and self._owner_locks is owner_locks:
-                self._owner_locks = None
         if teleop_source == "virtual" and self.on_virtual_exit is not None:
             try:
                 self.on_virtual_exit()
@@ -472,7 +469,3 @@ class RecordManager:
                 # Cleanup failure must remain visible, but it cannot strand the
                 # recording's owner lock or kill this watcher before it finishes.
                 self._logs.append(f"Could not stop virtual leader relay: {exc}")
-        # Keep the follower lock until relay cleanup is complete. Otherwise a new
-        # direct virtual-leader start can slip into this gap and be force-stopped
-        # by the old recording's watcher.
-        owner_locks.release()

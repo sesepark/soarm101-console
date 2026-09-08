@@ -25,13 +25,16 @@ def test_settings_read_environment_at_instantiation(monkeypatch):
     assert settings.leader_id == "dynamic_leader"
 
 
-def test_teleop_runs_our_own_module_not_the_lerobot_binary():
+def test_hubq_teleop_kind_runs_our_own_module_not_the_lerobot_binary():
     """텔레옵 자식은 `scripts/teleoperate.sh`다.
 
     `lerobot-teleoperate` 바이너리로는 붙는 순간의 목표 동기화도 루프 앞의 자세 정렬도
     부탁할 수 없다. 그 둘이 없으면 시작할 때마다 팔이 뛴다.
     """
-    command = TeleopManager(Settings()).command()
+    import json
+
+    kind = Path(__file__).parents[1] / "src/hubq/kinds/teleop.json"
+    command = json.loads(kind.read_text(encoding="utf-8"))["command"]
     assert len(command) == 1
     script = Path(command[0])
     assert script.name == "teleoperate.sh"

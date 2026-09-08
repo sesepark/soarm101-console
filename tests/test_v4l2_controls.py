@@ -97,16 +97,12 @@ def test_record_manager_applies_both_cameras_before_starting_lerobot(
     manager.runtime_dir = tmp_path
     events: list[str] = []
 
-    class FakeLocks:
-        inherited_spec = "{}"
-        file_descriptors = ()
-
-        def release(self):
-            pass
-
     class FakeProcess:
         pid = 123
         stdout = None
+        job_id = "job"
+        metadata = {}
+        logs = []
 
         def poll(self):
             return None
@@ -122,18 +118,15 @@ def test_record_manager_applies_both_cameras_before_starting_lerobot(
         events.append(path)
         return {"values": {"power_line_frequency": 2}, "failures": []}
 
-    def fake_popen(*args, **kwargs):
-        events.append("popen")
+    def fake_start_job(*args, **kwargs):
+        events.append("hubq")
         return FakeProcess()
 
     monkeypatch.setattr(manager, "preflight", lambda teleop_source: [])
-    monkeypatch.setattr(
-        record_manager_module.DeviceLockSet, "acquire", lambda devices, owner: FakeLocks()
-    )
     monkeypatch.setattr(record_manager_module, "apply_recording_controls", fake_apply)
-    monkeypatch.setattr(record_manager_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(record_manager_module.hubq_client, "start_job", fake_start_job)
     monkeypatch.setattr(record_manager_module.threading, "Thread", FakeThread)
 
     manager.start("pick", 1, 5)
 
-    assert events == ["/stable/scene", "/stable/wrist", "popen"]
+    assert events == ["/stable/scene", "/stable/wrist", "hubq"]

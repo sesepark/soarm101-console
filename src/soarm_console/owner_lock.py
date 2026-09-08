@@ -125,12 +125,26 @@ def read_lock_ledger(
             continue
         kernel_pid = held.get((file_details.st_dev, file_details.st_ino))
         locked = (file_details.st_dev, file_details.st_ino) in held
+        reported_pid = kernel_pid
+        # Linux keeps the PID that first acquired an inherited flock in /proc/locks even after
+        # that parent has exited. HUBq rewrites metadata to the exact inheriting child; prefer it
+        # only when the kernel PID is gone and boot/start ticks prove that child identity is live.
+        if locked and (kernel_pid is None or not Path(f"/proc/{kernel_pid}").exists()):
+            metadata_pid = metadata.get("pid")
+            metadata_ticks = metadata.get("process_start_ticks")
+            if (
+                isinstance(metadata_pid, int)
+                and isinstance(metadata_ticks, int)
+                and metadata.get("boot_id") == _boot_id()
+                and _process_start_ticks(metadata_pid) == metadata_ticks
+            ):
+                reported_pid = metadata_pid
         devices.append(
             {
                 "device": metadata["device"],
                 "locked": locked,
                 "owner": metadata.get("owner") if locked else None,
-                "pid": kernel_pid if locked else None,
+                "pid": reported_pid if locked else None,
                 "acquired_at": metadata.get("acquired_at") if locked else None,
             }
         )
@@ -269,6 +283,22 @@ class DeviceLockSet:
     @property
     def devices(self) -> list[str]:
         return [lock.device for lock in self.locks]
+
+    def mark_inherited_owner(self, pid: int, command: list[str]) -> None:
+        """Point ledger metadata at the child that now keeps these descriptors alive."""
+        for lock in self.locks:
+            lock.metadata.update(
+                pid=pid,
+                process_start_ticks=_process_start_ticks(pid),
+                command=command,
+            )
+            encoded = (
+                json.dumps(lock.metadata, ensure_ascii=False, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            os.ftruncate(lock.file_descriptor, 0)
+            os.lseek(lock.file_descriptor, 0, os.SEEK_SET)
+            os.write(lock.file_descriptor, encoded)
+            os.fsync(lock.file_descriptor)
 
     def release(self) -> None:
         with self._release_lock:

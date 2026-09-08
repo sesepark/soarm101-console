@@ -839,7 +839,16 @@ def test_killing_a_rollout_that_never_moved_says_so(monkeypatch):
             return -9
 
     manager._process = Stuck()
-    monkeypatch.setattr(policy_manager_module.os, "killpg", lambda *args: None)
+    monkeypatch.setattr(
+        policy_manager_module.hubq_client,
+        "stop_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            policy_manager_module.hubq_client.HubQError("stop failed")
+        ),
+    )
+    monkeypatch.setattr(
+        policy_manager_module.hubq_client, "emergency_stop", lambda *_args: False
+    )
 
     with pytest.raises(TeleopError) as caught:
         manager.stop()
@@ -1093,7 +1102,7 @@ def test_model_pull_rest_contract_writes_manifest_and_returns_one_row(client, mo
     assert (model_root / RUN / STEP / models.MANIFEST_NAME).is_file()
 
 
-def test_policy_stop_uses_sigterm(monkeypatch):
+def test_policy_stop_is_delegated_to_hubq(monkeypatch):
     manager = PolicyManager(_settings())
 
     class Process:
@@ -1106,14 +1115,16 @@ def test_policy_stop_uses_sigterm(monkeypatch):
             return 0
 
     manager._process = Process()
-    signals = []
-    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    stopped = []
+    monkeypatch.setattr(
+        policy_manager_module.hubq_client,
+        "stop_job",
+        lambda process, timeout: stopped.append((process, timeout)) or {"state": "exited"},
+    )
 
     manager.stop()
 
-    import signal
-
-    assert signals == [(123, signal.SIGTERM)]
+    assert stopped == [(manager._process, 40.0)]
 
 
 def test_policy_stop_waits_for_start_before_reading_the_process(monkeypatch):
@@ -1122,7 +1133,6 @@ def test_policy_stop_waits_for_start_before_reading_the_process(monkeypatch):
     start_holds_lock = threading.Event()
     let_start_finish = threading.Event()
     stopped = threading.Event()
-    signals = []
 
     class StartingProcess:
         pid = 4242
@@ -1144,9 +1154,9 @@ def test_policy_stop_waits_for_start_before_reading_the_process(monkeypatch):
     starter.start()
     assert start_holds_lock.wait(5)
     monkeypatch.setattr(
-        policy_manager_module.os,
-        "killpg",
-        lambda pid, sig: signals.append((pid, sig)),
+        policy_manager_module.hubq_client,
+        "stop_job",
+        lambda process, timeout: stopped.set() or {"state": "exited"},
     )
     stopper = threading.Thread(target=manager.stop)
     stopper.start()
@@ -1160,7 +1170,6 @@ def test_policy_stop_waits_for_start_before_reading_the_process(monkeypatch):
 
     assert not starter.is_alive()
     assert not stopper.is_alive()
-    assert signals == [(4242, signal.SIGTERM)]
     assert stopped.is_set()
 
 

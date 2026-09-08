@@ -18,7 +18,10 @@ Restart=on-failure
 RestartSec=2
 NoNewPrivileges=false
 TimeoutStopSec=15
-KillMode=control-group
+# ExecStop asks uvicorn itself to leave. Only the sg wrapper is the systemd MainPID;
+# killing the whole cgroup here would also kill independently-owned hardware jobs.
+ExecStop=/usr/bin/curl --fail --silent --max-time 5 --request POST http://127.0.0.1:8094/shutdown
+KillMode=process
 
 [Install]
 WantedBy=default.target

@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import json
 import os
-import signal
-import subprocess
 import threading
 import time
+import signal
 from collections import deque
 from pathlib import Path
+from . import hubq_client
 from .calibration import validate_calibration
 from .config import Settings
-from .owner_lock import DeviceLockError, DeviceLockSet
 from .perception import store
 from .teleop import TeleopError
 
@@ -28,16 +27,25 @@ CONFIRMATION = "CALIBRATE SOARM101"
 class PerceptionManager:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._process: subprocess.Popen[str] | None = None
+        self._process: hubq_client.JobProcess | None = None
         self._logs: deque[str] = deque(maxlen=200)
         self._lock = threading.Lock()
-        self._owner_locks: DeviceLockSet | None = None
         self._started_at: float | None = None
         self._poses = 0
         self.runtime_dir = store.RUNTIME_DIR
 
     @property
     def running(self) -> bool:
+        if self._process is None:
+            try:
+                process = hubq_client.active_job("calibration")
+            except hubq_client.HubQError:
+                process = None
+            if process is not None:
+                self._process = process
+                self._poses = int(process.metadata.get("poses", 0))
+                started = process.metadata.get("started_at")
+                self._started_at = float(started) if isinstance(started, (int, float)) else None
         return self._process is not None and self._process.poll() is None
 
     def preflight(self) -> list[str]:
@@ -74,63 +82,38 @@ class PerceptionManager:
             self._poses = poses
             self._started_at = time.time()
 
-            env = os.environ.copy()
-            env["SOARM_CALIB_POSES"] = str(poses)
-            devices = [
-                self.settings.follower_port,
-                self.settings.scene_camera,
-                self.settings.wrist_camera,
-            ]
             try:
-                owner_locks = DeviceLockSet.acquire(devices, "calibration")
-            except DeviceLockError as exc:
-                raise TeleopError(str(exc)) from exc
-            env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
-            project_root = Path(__file__).parents[2]
-            command = [
-                str(project_root / ".venv/bin/python"),
-                "-m",
-                "soarm_console.perception.calibrating",
-            ]
-            try:
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=project_root,
-                    env={**env, "PYTHONPATH": str(project_root / "src")},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                    pass_fds=owner_locks.file_descriptors,
+                self._process = hubq_client.start_job(
+                    "calibration",
+                    "calibration",
+                    {
+                        "follower": self.settings.follower_port,
+                        "scene": self.settings.scene_camera,
+                        "wrist": self.settings.wrist_camera,
+                    },
+                    {"SOARM_CALIB_POSES": str(poses)},
+                    {"poses": poses, "started_at": self._started_at},
+                    True,
                 )
-            except BaseException:
-                owner_locks.release()
-                raise
-            self._owner_locks = owner_locks
-            threading.Thread(target=self._collect_logs, daemon=True).start()
-            threading.Thread(
-                target=self._watch_exit, args=(self._process, owner_locks), daemon=True
-            ).start()
+            except hubq_client.HubQError as exc:
+                raise TeleopError(str(exc)) from exc
 
     def stop(self, timeout: float = 60.0) -> None:
         process = self._process
         if process is None or process.poll() is not None:
-            self._release_locks()
             return
-        os.killpg(process.pid, signal.SIGTERM)
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            # 자식은 시작 자세로 되돌아가는 시간까지 다 받는다. 팔을 아무 데나 두고 끝내는
-            # 것보다 조금 기다리는 편이 낫다. 그래도 안 서면 그때가 마지막 안전선이다.
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
-            self._release_locks()
+            result = hubq_client.stop_job(process, timeout)
+        except hubq_client.HubQError as exc:
+            if hubq_client.emergency_stop(process, signal.SIGTERM, timeout):
+                return
+            hubq_client.emergency_stop(process, signal.SIGKILL, 5)
             raise TeleopError("Calibration did not stop cleanly after SIGTERM; it was killed") from exc
-        self._release_locks()
+        if result.get("state") == "running":
+            raise TeleopError("Calibration did not stop cleanly after SIGTERM; it was killed")
 
     def status(self) -> dict[str, object]:
+        running = self.running
         process = self._process
         runtime: dict[str, object] = {}
         try:
@@ -143,33 +126,13 @@ class PerceptionManager:
         if error is None and process is not None and process.poll() not in (None, 0):
             error = self._logs[-1] if self._logs else f"Calibration exited with code {process.poll()}"
         return {
-            "running": self.running,
-            "pid": process.pid if process is not None and self.running else None,
+            "running": running,
+            "pid": process.pid if process is not None and running else None,
             "phase": runtime.get("phase", "idle"),
             "pose": runtime.get("pose", 0),
             "total_poses": runtime.get("total_poses", self._poses),
             "detected": runtime.get("detected", {}),
             "started_at": self._started_at,
-            "log_tail": list(self._logs)[-40:],
+            "log_tail": list(getattr(process, "logs", self._logs))[-40:],
             "error": error,
         }
-
-    def _collect_logs(self) -> None:
-        process = self._process
-        if process is None or process.stdout is None:
-            return
-        for line in process.stdout:
-            self._logs.append(line.rstrip())
-
-    def _release_locks(self) -> None:
-        with self._lock:
-            owner_locks, self._owner_locks = self._owner_locks, None
-        if owner_locks is not None:
-            owner_locks.release()
-
-    def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
-        process.wait()
-        with self._lock:
-            if self._process is process and self._owner_locks is owner_locks:
-                self._owner_locks = None
-        owner_locks.release()

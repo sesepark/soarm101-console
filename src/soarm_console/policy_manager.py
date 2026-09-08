@@ -4,17 +4,16 @@ import json
 import math
 import os
 import re
-import signal
-import subprocess
 import threading
 import time
+import signal
 from collections import deque
 from pathlib import Path
 from .calibration import validate_calibration
 from .config import Settings
+from . import hubq_client
 from .models import describe_model
 from .datasets import DatasetError
-from .owner_lock import DeviceLockError, DeviceLockSet
 from .policying import inference_kind
 from .spark import (
     SparkError,
@@ -40,14 +39,14 @@ _REMOTE_FPS = re.compile(r"Avg FPS: ([0-9.]+) \| Target: ([0-9.]+)")
 class PolicyManager:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._process: subprocess.Popen[str] | None = None
+        self._process: hubq_client.JobProcess | None = None
         self._logs: deque[str] = deque(maxlen=400)
         # ``start()`` holds this through remote-side startup, which can take up to
         # 120 seconds. ``stop()`` must join that serialization before reading
         # ``_process`` or it can release the new rollout's device locks. Cleanup
         # calls ``_release_locks()``, so this lock must be re-entrant.
         self._lock = threading.RLock()
-        self._owner_locks: DeviceLockSet | None = None
+        self._watching_job_id: str | None = None
         self._run: str | None = None
         self._step: str | None = None
         self._task: str | None = None
@@ -72,13 +71,45 @@ class PolicyManager:
         self._remote = False
         self._inference = "rtc"
         self._remote_side_active = False
-        self._tunnel: subprocess.Popen[str] | None = None
         self.runtime_dir = Path(__file__).parents[2] / "runtime/policy"
         self.log_path = self.runtime_dir / "policy.log"
 
     @property
     def running(self) -> bool:
+        if self._process is None:
+            self._adopt_active()
         return self._process is not None and self._process.poll() is None
+
+    def _adopt_active(self) -> None:
+        try:
+            process = hubq_client.active_job("policy")
+        except hubq_client.HubQError:
+            return
+        if process is None:
+            return
+        self._process = process
+        metadata = process.metadata
+        self._run = str(metadata.get("run")) if metadata.get("run") is not None else None
+        self._step = str(metadata.get("step")) if metadata.get("step") is not None else None
+        self._task = str(metadata.get("task")) if metadata.get("task") is not None else None
+        for attribute, key in (
+            ("_started_at", "started_at"),
+            ("_moving_since", "moving_since"),
+            ("_expires_at", "expires_at"),
+            ("_fps_target", "fps_target"),
+            ("_max_seconds", "max_seconds"),
+            ("_launched_at", "launched_at"),
+            ("_expected_load_seconds", "expected_load_seconds"),
+        ):
+            value = metadata.get(key)
+            setattr(self, attribute, float(value) if isinstance(value, (int, float)) else None)
+        self._camera_map = dict(metadata.get("camera_map", {}))
+        self._home = dict(metadata.get("home", {}))
+        self._phase = str(metadata.get("phase", "running"))
+        self._remote = bool(metadata.get("remote", False))
+        self._remote_side_active = self._remote
+        self._inference = str(metadata.get("inference", "rtc"))
+        self._start_watcher()
 
     def preflight(
         self, run: str | None = None, step: str | None = None, *, remote: bool = False
@@ -188,62 +219,69 @@ class PolicyManager:
                         "SOARM_REMOTE_RENAME_MAP": json.dumps(model["rename_map"]),
                     }
                 )
-            devices = [
-                self.settings.follower_port,
-                self.settings.scene_camera,
-                self.settings.wrist_camera,
-            ]
             try:
-                owner_locks = DeviceLockSet.acquire(devices, "policy")
-            except DeviceLockError as exc:
-                raise TeleopError(str(exc)) from exc
-            env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
-            project_root = Path(__file__).parents[2]
-            command = [str(project_root / ".venv/bin/python"), "-m", "soarm_console.policying"]
-            try:
+                sidecars: dict[str, list[str]] = {}
                 if remote:
                     try:
                         ensure_policy_side(self.settings)
                     except SparkError as exc:
                         raise TeleopError(str(exc)) from exc
                     self._remote_side_active = True
-                    self._start_tunnel()
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=Path(__file__).parents[2],
-                    env={**env, "PYTHONPATH": str(project_root / "src")},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                    pass_fds=owner_locks.file_descriptors,
+                    sidecars["policy-tunnel"] = policy_tunnel_command(self.settings)
+                self._process = hubq_client.start_job(
+                    "policy",
+                    "policy",
+                    {
+                        "follower": self.settings.follower_port,
+                        "scene": self.settings.scene_camera,
+                        "wrist": self.settings.wrist_camera,
+                    },
+                    {key: value for key, value in env.items() if key.startswith("SOARM_")},
+                    {
+                        "run": self._run,
+                        "step": self._step,
+                        "task": self._task,
+                        "started_at": self._started_at,
+                        "moving_since": self._moving_since,
+                        "expires_at": self._expires_at,
+                        "fps_target": self._fps_target,
+                        "max_seconds": self._max_seconds,
+                        "launched_at": self._launched_at,
+                        "expected_load_seconds": self._expected_load_seconds,
+                        "camera_map": self._camera_map,
+                        "home": self._home,
+                        "phase": self._phase,
+                        "remote": self._remote,
+                        "inference": self._inference,
+                    },
+                    True,
+                    sidecars,
                 )
-            except BaseException:
-                owner_locks.release()
+            except hubq_client.HubQError as exc:
+                self._stop_remote_resources(stop_side=remote)
+                raise TeleopError(str(exc)) from exc
+            except TeleopError:
                 self._stop_remote_resources(stop_side=remote)
                 raise
-            self._owner_locks = owner_locks
-            threading.Thread(target=self._collect_logs, daemon=True).start()
-            threading.Thread(target=self._watch_exit, args=(self._process, owner_locks), daemon=True).start()
+            self._start_watcher()
 
     def stop(self, timeout: float = 40.0) -> None:
         with self._lock:
             process = self._process
             if process is None or process.poll() is not None:
-                self._release_locks()
                 self._stop_remote_resources(stop_side=True)
                 return
-            os.killpg(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
+                result = hubq_client.stop_job(process, timeout)
+            except hubq_client.HubQError as exc:
+                stopped = hubq_client.emergency_stop(process, signal.SIGTERM, timeout)
+                if stopped:
+                    self._stop_remote_resources(stop_side=True)
+                    return
+                hubq_client.emergency_stop(process, signal.SIGKILL, 5)
                 # Rollout gets the full timeout to run teardown and let the console return the arm. A stuck
                 # child cannot be left commanding hardware indefinitely, so SIGKILL is the
                 # final safety cutoff only after that graceful path failed.
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-                self._release_locks()
                 # 무엇을 죽였는지에 따라 사람이 할 일이 정반대다. 팔을 움직이던 롤아웃을
                 # 강제로 끊은 것이라면 팔이 어중간한 자세로 남았을 수 있어 지켜봐야 하고,
                 # 정책을 아직 올리는 중이었다면 팔은 한 번도 움직인 적이 없다. 둘을 같은
@@ -255,7 +293,8 @@ class PolicyManager:
                 raise TeleopError(
                     "Policy rollout did not stop cleanly after SIGTERM; it was killed"
                 ) from exc
-            self._release_locks()
+            if result.get("state") == "running":
+                raise TeleopError("Policy rollout did not stop cleanly after SIGTERM; it was killed")
             self._stop_remote_resources(stop_side=True)
 
     #: 체크포인트마다 지난번 적재가 몇 초 걸렸는지. 화면이 "얼마나 기다리면 되는지"를
@@ -306,6 +345,7 @@ class PolicyManager:
             pass
 
     def status(self) -> dict[str, object]:
+        running = self.running
         process = self._process
         runtime: dict[str, object] = {}
         try:
@@ -329,10 +369,28 @@ class PolicyManager:
                     if self._remote:
                         self._remember_load_seconds(self._load_seconds)
             self._phase = str(runtime_phase)
+        logs = list(getattr(process, "logs", self._logs))
+        self._fps_actual = None
+        self._chunk_seconds = None
+        self._chunks = None
+        for text in logs:
+            if match := _RTC_LATENCY.search(text):
+                self._chunk_seconds = float(match.group(1))
+                self._chunks = (self._chunks or 0) + 1
+            if match := _REMOTE_LATENCY.search(text):
+                self._chunk_seconds = float(match.group(1)) / 1000
+                self._chunks = (self._chunks or 0) + 1
+            if match := _ACTUAL_FPS.search(text):
+                self._fps_actual = float(match.group(1))
+            if match := _REMOTE_FPS.search(text):
+                rate = float(match.group(1))
+                if rate > 0:
+                    self._fps_actual = rate
+                    self._fps_target = float(match.group(2))
         if error is None and process is not None and process.poll() not in (None, 0):
-            error = self._logs[-1] if self._logs else f"Policy process exited with code {process.poll()}"
+            error = logs[-1] if logs else f"Policy process exited with code {process.poll()}"
         return {
-            "running": self.running,
+            "running": running,
             "run": self._run,
             "step": self._step,
             "task": self._task,
@@ -353,87 +411,27 @@ class PolicyManager:
             "expected_load_seconds": self._expected_load_seconds,
             "load_seconds": self._load_seconds,
             "remote": self._remote,
-            "log_tail": list(self._logs)[-100:],
+            "log_tail": logs[-100:],
             "error": error,
             "alignment_residual": alignment_residual,
         }
 
-    def _collect_logs(self) -> None:
+    def _start_watcher(self) -> None:
         process = self._process
-        if process is None or process.stdout is None:
+        if process is None or self._watching_job_id == process.job_id:
             return
-        try:
-            handle = self.log_path.open("w", encoding="utf-8")
-        except OSError:
-            handle = None
-        try:
-            for line in process.stdout:
-                text = line.rstrip()
-                self._logs.append(text)
-                if match := _RTC_LATENCY.search(text):
-                    self._chunk_seconds = float(match.group(1))
-                    self._chunks = (self._chunks or 0) + 1
-                if match := _REMOTE_LATENCY.search(text):
-                    self._chunk_seconds = float(match.group(1)) / 1000
-                    self._chunks = (self._chunks or 0) + 1
-                if match := _ACTUAL_FPS.search(text):
-                    self._fps_actual = float(match.group(1))
-                if match := _REMOTE_FPS.search(text):
-                    # The client's own running average.  Ignore the warm-up zero so the screen
-                    # does not flash "0.0 fps" for the first second of every remote rollout.
-                    rate = float(match.group(1))
-                    if rate > 0:
-                        self._fps_actual = rate
-                        self._fps_target = float(match.group(2))
-                if handle is not None:
-                    print(text, file=handle, flush=True)
-        finally:
-            if handle is not None:
-                handle.close()
+        self._watching_job_id = process.job_id
+        threading.Thread(target=self._watch_exit, args=(process,), daemon=True).start()
 
-    def _release_locks(self) -> None:
-        with self._lock:
-            owner_locks, self._owner_locks = self._owner_locks, None
-        if owner_locks is not None:
-            owner_locks.release()
-
-    def _watch_exit(self, process: subprocess.Popen[str], owner_locks: DeviceLockSet) -> None:
+    def _watch_exit(self, process: hubq_client.JobProcess) -> None:
         returncode = process.wait()
         with self._lock:
-            if self._process is process and self._owner_locks is owner_locks:
-                self._owner_locks = None
+            if self._process is process:
                 # Keep cleanup and the next start mutually exclusive. Otherwise an old watch thread
-                # can close the tunnel belonging to a rollout started just after poll() saw it exit.
+                # can clean up the remote side belonging to a newer rollout.
                 self._stop_remote_resources(stop_side=returncode != 0)
-        owner_locks.release()
-
-    def _start_tunnel(self) -> None:
-        try:
-            tunnel = subprocess.Popen(
-                policy_tunnel_command(self.settings),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise TeleopError(f"Could not start the remote policy tunnel: {exc}") from exc
-        time.sleep(0.2)
-        if tunnel.poll() is not None:
-            detail = tunnel.stderr.read().strip() if tunnel.stderr is not None else ""
-            raise TeleopError(f"Could not start the remote policy tunnel: {detail or tunnel.returncode}")
-        self._tunnel = tunnel
 
     def _stop_remote_resources(self, *, stop_side: bool) -> None:
-        tunnel, self._tunnel = self._tunnel, None
-        if tunnel is not None and tunnel.poll() is None:
-            try:
-                os.killpg(tunnel.pid, signal.SIGTERM)
-                tunnel.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                if tunnel.poll() is None:
-                    os.killpg(tunnel.pid, signal.SIGKILL)
-                    tunnel.wait(timeout=5)
         if stop_side and self._remote_side_active:
             try:
                 stop_policy_side(self.settings)

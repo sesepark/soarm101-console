@@ -1,0 +1,12 @@
+{
+  "command": [".venv/bin/python", "-m", "soarm_console.policying"],
+  "owners": ["policy"],
+  "device_roles": ["follower", "scene", "wrist"],
+  "sidecars": ["policy-tunnel"],
+  "motion": true,
+  "already_running": "A policy rollout is already running",
+  "log": "runtime/policy/policy.log",
+  "stop_signal": "SIGTERM",
+  "stop_timeout": 40,
+  "kill_after_timeout": true
+}

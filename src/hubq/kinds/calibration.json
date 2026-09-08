@@ -1,0 +1,11 @@
+{
+  "command": [".venv/bin/python", "-m", "soarm_console.perception.calibrating"],
+  "owners": ["calibration"],
+  "device_roles": ["follower", "scene", "wrist"],
+  "motion": true,
+  "already_running": "Calibration is already running",
+  "log": "runtime/perception/calibration.log",
+  "stop_signal": "SIGTERM",
+  "stop_timeout": 60,
+  "kill_after_timeout": true
+}

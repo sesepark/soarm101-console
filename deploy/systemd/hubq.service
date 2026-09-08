@@ -1,0 +1,24 @@
+[Unit]
+Description=HUBq local hardware ownership and job scheduler
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/deploy/Project/so-arm-101
+# HUBq's future children open the same serial devices as console children.
+ExecStart=/usr/bin/sg dialout -c /home/deploy/Project/so-arm-101/scripts/run_hubq.sh
+EnvironmentFile=/home/deploy/Project/so-arm-101/config/soarm.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HUBQ_PORT=8094
+Environment=HUBQ_STATE_DIR=%h/.local/state/hubq
+# This directory is the one intentional rendezvous between the two services.
+Environment=SOARM_OWNER_LOCK_DIR=%t/soarm-console/owner-locks
+UMask=0077
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=false
+TimeoutStopSec=15
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

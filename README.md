@@ -220,6 +220,7 @@ src/soarm_console/        FastAPI app, teleop, recording, replay, policy, diagno
   policying.py              로컬 rollout · 원격 RobotClient · 연결 장애 즉시 정지
   static/                   데스크톱 콘솔 페이지
   static/viewer/            3D 조작 화면(맥·폰 공용). three.js r160 자체 호스팅, URDF 로더 직접 작성
+src/hubq/                 독립 소유권·스케줄링 프로세스(1단계: 읽기 전용 락 원장)
 scripts/                  calibration, doctor, web, teleoperation, recording, service installation
 config/                   로컬 runtime 설정 template (커밋하지 않음)
 models/                   회수한 pretrained_model과 soarm_model.json (커밋하지 않음)
@@ -248,6 +249,7 @@ ADR/                      Architecture Decision Records
 | [RUNBOOK.md](RUNBOOK.md) | calibration, teleoperation, recording, recovery 현장 절차 |
 | [SAFETY.md](SAFETY.md) | 시스템이 보장하는 것과 보장하지 않는 것 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 두 종류의 소유권(hardware ownership · command authority)과 확장 방향 |
+| [docs/HUBq.md](docs/HUBq.md) | 독립 HUBq 프로세스의 책임 경계와 공유 owner lock 계약 |
 | [PROTOCOL.md](PROTOCOL.md) | observation/action contract (가상 리더 경로에서 구현되어 돌고 있음) |
 | [FAILURE_MODES.md](FAILURE_MODES.md) | 예상 장애와 운영자 대응 |
 | [hardware.md](hardware.md) | USB/camera 식별과 검증된 역할 매핑 |

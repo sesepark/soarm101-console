@@ -35,14 +35,17 @@ def canonical_device(device: str | Path) -> str:
     return str(Path(device).expanduser().resolve(strict=False))
 
 
-def lock_root() -> Path:
+def _configured_lock_root() -> Path:
     configured = os.getenv(LOCK_DIR_ENV)
     if configured:
-        root = Path(configured).expanduser()
-    elif runtime := os.getenv("XDG_RUNTIME_DIR"):
-        root = Path(runtime) / "soarm-console/owner-locks"
-    else:
-        root = Path("/tmp") / f"soarm-console-{os.getuid()}/owner-locks"
+        return Path(configured).expanduser()
+    if runtime := os.getenv("XDG_RUNTIME_DIR"):
+        return Path(runtime) / "soarm-console/owner-locks"
+    return Path("/tmp") / f"soarm-console-{os.getuid()}/owner-locks"
+
+
+def lock_root() -> Path:
+    root = _configured_lock_root()
     existed = root.exists()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     details = root.stat()
@@ -55,6 +58,83 @@ def lock_root() -> Path:
         # 새 leaf는 umask가 느슨하더라도 고정한다.
         root.chmod(0o700)
     return root
+
+
+def _kernel_flocks(path: Path = Path("/proc/locks")) -> dict[tuple[int, int], int | None]:
+    """현재 커널이 보유 중인 flock을 ``(st_dev, st_ino)``로 돌려준다.
+
+    락 파일의 JSON은 마지막 소유자가 놓은 뒤에도 남는다. 현재 소유 여부를 알려면 파일
+    내용이 아니라 커널 원장과 inode를 대조해야 한다. 여기서는 조회 중 잠깐이라도 장치 락을
+    얻지 않도록 ``LOCK_NB`` probe 대신 Linux의 ``/proc/locks``를 읽는다.
+    """
+    held: dict[tuple[int, int], int | None] = {}
+    # 읽을 수 없을 때 빈 원장으로 가장하면 실제 소유자를 "없음"으로 보고한다. 조회 실패를
+    # 그대로 올려 API가 fail closed 하게 둔다.
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        fields = line.split()
+        # 대기 중인 행에는 lock id 뒤에 ``->``가 붙는다. 보유 중인 FLOCK만 센다.
+        if len(fields) < 6 or fields[1] != "FLOCK":
+            continue
+        try:
+            major, minor, inode = fields[5].split(":", 2)
+            device = os.makedev(int(major, 16), int(minor, 16))
+            pid = int(fields[4])
+            held[(device, int(inode))] = pid if pid >= 0 else None
+        except (ValueError, OSError, OverflowError):
+            continue
+    return held
+
+
+def read_lock_ledger(
+    *, proc_locks_path: Path = Path("/proc/locks")
+) -> list[dict[str, object]]:
+    """락 디렉터리를 바꾸지 않고 현재 장치 소유 원장을 읽는다.
+
+    잠기지 않은 파일의 metadata는 과거 기록일 뿐이다. 그런 장치도 알려 주되 현재 owner와
+    pid는 ``None``으로 답해 stale 기록을 살아 있는 소유자로 오인하지 않게 한다.
+    """
+    root = _configured_lock_root()
+    try:
+        details = root.stat()
+    except OSError:
+        return []
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise PermissionError(f"Owner lock directory is not a private directory: {root}")
+
+    held = _kernel_flocks(proc_locks_path)
+    devices: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.lock")):
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            file_descriptor = os.open(path, flags)
+            try:
+                file_details = os.fstat(file_descriptor)
+                metadata = _read_metadata(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+        except OSError:
+            continue
+        if not metadata or not isinstance(metadata.get("device"), str):
+            continue
+        kernel_pid = held.get((file_details.st_dev, file_details.st_ino))
+        locked = (file_details.st_dev, file_details.st_ino) in held
+        devices.append(
+            {
+                "device": metadata["device"],
+                "locked": locked,
+                "owner": metadata.get("owner") if locked else None,
+                "pid": kernel_pid if locked else None,
+                "acquired_at": metadata.get("acquired_at") if locked else None,
+            }
+        )
+    return sorted(devices, key=lambda item: str(item["device"]))
 
 
 def lock_path_for(device: str | Path) -> Path:

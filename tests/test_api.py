@@ -27,6 +27,25 @@ def test_status_is_observation_only_and_exposes_all_subsystems():
     assert "doctor" in payload
 
 
+def test_status_exposes_virtual_recording_preflight_without_replacing_the_legacy_field(
+    monkeypatch,
+):
+    from soarm_console.app import recorder
+
+    calls = []
+    monkeypatch.setattr(
+        recorder,
+        "preflight",
+        lambda source="leader": calls.append(source) or [f"{source} problem"],
+    )
+
+    payload = status()
+
+    assert payload["record_preflight"] == ["leader problem"]
+    assert payload["record_preflight_virtual"] == ["virtual problem"]
+    assert calls == ["leader", "virtual"]
+
+
 def test_status_exposes_only_read_back_recording_camera_controls(monkeypatch):
     from soarm_console.app import recorder
 

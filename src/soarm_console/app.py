@@ -396,6 +396,7 @@ def status() -> dict[str, object]:
         "preflight": teleop.preflight(),
         "teleop_preflight": teleop.preflight(),
         "record_preflight": recorder.preflight(),
+        "record_preflight_virtual": recorder.preflight("virtual"),
         "teleoperation": teleop.status(),
         "recording": recorder.status(),
         "replay": replayer.status(),

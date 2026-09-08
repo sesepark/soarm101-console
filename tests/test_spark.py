@@ -291,6 +291,24 @@ def test_policy_side_refuses_to_replace_an_unrelated_side_job(monkeypatch):
         spark.ensure_policy_side(_settings())
 
 
+def test_policy_side_disappearing_during_startup_fails_immediately(monkeypatch):
+    replies = iter(
+        [
+            {"side": {"kind": "soarm-policy", "stream_ready": False}},
+            {},
+        ]
+    )
+    monkeypatch.setattr(
+        spark,
+        "_queue_request",
+        lambda settings, method, path, payload=None: next(replies) if path == "/api/queue" else {},
+    )
+    monkeypatch.setattr(spark.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(spark.SparkError, match="stopped before becoming ready"):
+        spark.ensure_policy_side(_settings())
+
+
 def test_remote_model_uses_the_checkpoint_saved_camera_map(monkeypatch):
     monkeypatch.setattr(
         spark,

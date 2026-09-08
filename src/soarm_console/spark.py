@@ -359,7 +359,12 @@ def ensure_policy_side(settings: Settings, *, timeout: float = 120.0) -> dict[st
         if time.monotonic() >= deadline:
             raise SparkError(f"The remote policy server was not ready within {timeout:g} seconds")
         time.sleep(0.25)
-        side = (_queue_request(settings, "GET", "/api/queue").get("side") or {})
+        side = _queue_request(settings, "GET", "/api/queue").get("side")
+        # Older sparkq versions omit ``live`` from side_view(). If the side job
+        # disappears altogether, that is still an unambiguous death signal and
+        # must not be converted to an empty live-by-default object for 120 seconds.
+        if side is None:
+            raise SparkError("The remote policy server stopped before becoming ready")
     return side
 
 

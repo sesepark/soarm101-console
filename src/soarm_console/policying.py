@@ -31,6 +31,8 @@ from .vleader.spec import JOINT_ORDER, SpecError, load_joint_specs
 
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/policy"
 STATUS_PATH = RUNTIME_DIR / "status.json"
+#: 시행마다 덮어쓴다. 한 줄이 한 제어 틱이고, 첫 줄은 관절 순서다.
+TRACE_PATH = RUNTIME_DIR / "trace.jsonl"
 ALIGNMENT_ARRIVAL_TIMEOUT_S = 30.0
 ALIGNMENT_SETTLE_S = 2.0
 # 이 팔에서 잰 정상상태 오차 최대 1.06도의 약 3배이며, 8도 follow-error 경계보다
@@ -267,6 +269,68 @@ def _write_status(**values: object) -> None:
 #:   `_normalize_prev_actions_length`가 **0으로 채운다.** 정규화된 공간에서 0은 "움직이지
 #:   않음"이 아니라 데이터셋의 평균 자세라, 엉뚱한 자리로 유도하게 된다.
 RTC_EXECUTION_HORIZON = 25
+
+
+
+def _start_motion_trace() -> Callable[[], None]:
+    """팔이 매 틱 어디를 명령받았고 실제로 어디에 있었는지 남긴다.
+
+    `so_follower.send_action`은 `max_relative_target`이 설정돼 있으면 이미
+    `Present_Position`을 읽어 `ensure_safe_goal_position`에 `{관절: (목표, 현재)}`로
+    넘긴다. 그 자리를 감싸면 **버스를 한 번도 더 읽지 않고** 명령과 실제 위치를 함께 얻는다.
+
+    이것이 없던 동안 "팔이 끊긴다"를 잴 수 있는 창은 클램프 경고뿐이었다. 그래서
+    2026-09-09에 리미터를 12°에서 40°로 올려 그 경고가 사라지자, 고쳤는지 확인할 눈도
+    함께 사라졌다 — 사람이 "잘 모르겠다"고 할 때 댈 숫자가 없었다. 추종 오차와 저크는
+    상시로 남겨야 비교가 된다.
+
+    실패해도 롤아웃을 멈추지 않는다. 계기가 팔을 세우는 일은 없어야 한다.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        from lerobot.robots.so_follower import so_follower as follower_module
+
+        original = follower_module.ensure_safe_goal_position
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        handle = TRACE_PATH.open("w", buffering=1 << 16)
+        started = time.perf_counter()
+    except Exception:
+        logger.warning("동작 기록을 열지 못했습니다. 기록 없이 진행합니다.", exc_info=True)
+        return lambda: None
+
+    names: list[str] = []
+
+    def traced(goal_present_pos, max_relative_target):
+        try:
+            nonlocal names
+            if not names:
+                names = sorted(goal_present_pos)
+                handle.write(json.dumps({"joints": names}) + "\n")
+            if set(goal_present_pos) == set(names):
+                handle.write(
+                    json.dumps(
+                        {
+                            "t": round(time.perf_counter() - started, 4),
+                            "g": [round(goal_present_pos[n][0], 3) for n in names],
+                            "p": [round(goal_present_pos[n][1], 3) for n in names],
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        return original(goal_present_pos, max_relative_target)
+
+    follower_module.ensure_safe_goal_position = traced
+
+    def stop() -> None:
+        follower_module.ensure_safe_goal_position = original
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    return stop
 
 
 def _robot_config(
@@ -700,4 +764,10 @@ def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리�
 
 
 if __name__ == "__main__":
-    main()
+    # 정렬·롤아웃·복귀까지 한 시행의 모든 움직임이 한 파일에 들어간다. 복귀는
+    # 우리가 만든 매끄러운 궤적이라, 같은 파일 안의 비교 기준이 되기도 한다.
+    _stop_motion_trace = _start_motion_trace()
+    try:
+        main()
+    finally:
+        _stop_motion_trace()

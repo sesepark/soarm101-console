@@ -27,7 +27,6 @@ from .teleop import TeleopError
 
 _RTC_LATENCY = re.compile(r"RTC inference latency=([0-9.]+)s")
 _REMOTE_LATENCY = re.compile(r"Network latency \(server->client\): ([0-9.]+)ms")
-_ACTUAL_FPS = re.compile(r"running slower \(([0-9.]+) Hz\)")
 #: 원격 클라이언트는 그 경고를 찍지 않는다. 대신 관측마다 이런 줄을 남긴다 —
 #: ``Obs #2664 | Avg FPS: 5.42 | Target: 30.00``.
 #:
@@ -51,6 +50,7 @@ _REMOTE_TICK = re.compile(
 #: 이보다 짧은 구간에서는 재지 않는다. 로그의 시각이 초 단위라 5초 창에서는 참값 29Hz가
 #: 25Hz로 나온다(2026-09-09 실측). 틀린 숫자를 보여 주는 것보다 비워 두는 편이 낫다.
 _RATE_MIN_SPAN_SECONDS = 10
+_LOCAL_TRACE_TAIL_LINES = 600
 
 
 def _rate_from_ticks(ticks: Sequence[tuple[int, int]]) -> float | None:
@@ -72,6 +72,39 @@ def _rate_from_ticks(ticks: Sequence[tuple[int, int]]) -> float | None:
     if denominator <= 0:
         return None
     slope = sum((p[0] - mean_t) * (p[1] - mean_i) for p in points) / denominator
+    return slope if slope > 0 else None
+
+
+def _rate_from_trace(path: Path, tail_lines: int = _LOCAL_TRACE_TAIL_LINES) -> float | None:
+    """마지막 로컬 롤아웃 틱의 perf_counter 시각으로 실제 제어율을 잰다."""
+    lines: deque[str] = deque(maxlen=tail_lines)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            lines.extend(handle)
+    except OSError:
+        return None
+    times: list[float] = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            elapsed = float(row["t"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        # 새 기록은 정렬·복귀 틱을 명시적으로 제외한다. rollout 필드가 없던 과거
+        # 기록과 합성 시험 자료는 모두 정책 틱으로 간주해 호환성을 지킨다.
+        if row.get("rollout", True) and math.isfinite(elapsed):
+            times.append(elapsed)
+    if len(times) < 2 or times[-1] - times[0] < _RATE_MIN_SPAN_SECONDS:
+        return None
+    mean_t = sum(times) / len(times)
+    mean_i = (len(times) - 1) / 2
+    denominator = sum((elapsed - mean_t) ** 2 for elapsed in times)
+    if denominator <= 0:
+        return None
+    slope = sum(
+        (elapsed - mean_t) * (index - mean_i)
+        for index, elapsed in enumerate(times)
+    ) / denominator
     return slope if slope > 0 else None
 
 
@@ -99,7 +132,7 @@ class PolicyManager:
         self._ticks: deque[tuple[int, int]] = deque(maxlen=2000)
         #: 이 시행에 허락된 초. 적재가 끝난 뒤 시한을 다시 세는 데 쓴다.
         self._max_seconds: float | None = None
-        #: 프로세스를 띄운 시각. 원격 적재 시간을 재기 위해 둔다.
+        #: 프로세스를 띄운 시각. 정책 적재 시간을 재기 위해 둔다.
         self._launched_at: float | None = None
         #: 이 체크포인트를 지난번에 올리는 데 걸린 초. 없으면 처음 올리는 것이다.
         self._expected_load_seconds: float | None = None
@@ -241,7 +274,7 @@ class PolicyManager:
             self._fps_target = fps
             self._camera_map = dict(model["camera_map"])
             self._home = dict(home or {})
-            self._phase = "aligning" if home is not None else "running"
+            self._phase = "aligning" if home is not None else "loading"
             self._remote = remote
             self._inference = "remote" if remote else inference_kind(str(model["policy"]))
             env = os.environ.copy()
@@ -253,6 +286,7 @@ class PolicyManager:
                     "SOARM_POLICY_FPS": f"{fps:g}",
                     "SOARM_POLICY_MAX_SECONDS": f"{max_seconds:g}",
                     "SOARM_POLICY_HOME": json.dumps(home) if home is not None else "",
+                    "SOARM_POLICY_STARTED_AT": f"{self._started_at:.6f}",
                 }
             )
             if remote:
@@ -409,8 +443,7 @@ class PolicyManager:
                 self._expires_at = self._moving_since + (self._max_seconds or 0)
                 if self._launched_at is not None:
                     self._load_seconds = self._moving_since - self._launched_at
-                    if self._remote:
-                        self._remember_load_seconds(self._load_seconds)
+                    self._remember_load_seconds(self._load_seconds)
             self._phase = str(runtime_phase)
         logs = list(getattr(process, "logs", self._logs))
         self._fps_actual = None
@@ -423,8 +456,6 @@ class PolicyManager:
             if match := _REMOTE_LATENCY.search(text):
                 self._chunk_seconds = float(match.group(1)) / 1000
                 self._chunks = (self._chunks or 0) + 1
-            if match := _ACTUAL_FPS.search(text):
-                self._fps_actual = float(match.group(1))
             if match := _REMOTE_TICK.search(text):
                 h, m, s, index, target = match.groups()
                 sample = (int(h) * 3600 + int(m) * 60 + int(s), int(index))
@@ -432,7 +463,10 @@ class PolicyManager:
                 if not self._ticks or sample[1] > self._ticks[-1][1]:
                     self._ticks.append(sample)
                 self._fps_target = float(target)
-        self._fps_actual = _rate_from_ticks(self._ticks)
+        if self._remote:
+            self._fps_actual = _rate_from_ticks(self._ticks)
+        elif self._run is not None and self._step is not None:
+            self._fps_actual = _rate_from_trace(self.runtime_dir / "trace.jsonl")
 
         if error is None and process is not None and process.poll() not in (None, 0):
             error = logs[-1] if logs else f"Policy process exited with code {process.poll()}"

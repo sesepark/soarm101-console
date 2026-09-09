@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -31,8 +32,10 @@ from .vleader.spec import JOINT_ORDER, SpecError, load_joint_specs
 
 RUNTIME_DIR = Path(__file__).parents[2] / "runtime/policy"
 STATUS_PATH = RUNTIME_DIR / "status.json"
-#: 시행마다 덮어쓴다. 한 줄이 한 제어 틱이고, 첫 줄은 관절 순서다.
+#: 마지막 시행을 가리킨다. 한 줄이 한 제어 틱이고, 첫 줄은 관절 순서다.
 TRACE_PATH = RUNTIME_DIR / "trace.jsonl"
+TRACE_DIR = RUNTIME_DIR / "traces"
+TRACE_RETENTION = 20
 ALIGNMENT_ARRIVAL_TIMEOUT_S = 30.0
 ALIGNMENT_SETTLE_S = 2.0
 # 이 팔에서 잰 정상상태 오차 최대 1.06도의 약 3배이며, 8도 follow-error 경계보다
@@ -272,7 +275,54 @@ RTC_EXECUTION_HORIZON = 25
 
 
 
-def _start_motion_trace() -> Callable[[], None]:
+class _MotionTrace:
+    def __init__(
+        self,
+        arm: Callable[[Callable[[], None]], None],
+        disarm: Callable[[], None],
+        stop: Callable[[], None],
+    ):
+        self.arm = arm
+        self.disarm = disarm
+        self.stop = stop
+
+
+def _safe_trace_part(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return cleaned or fallback
+
+
+def _trace_archive_path() -> Path:
+    started_at = _safe_trace_part(
+        os.getenv("SOARM_POLICY_STARTED_AT", "") or f"{time.time():.6f}", "unknown-time"
+    )
+    run = _safe_trace_part(os.getenv("SOARM_POLICY_RUN", ""), "unknown-run")
+    step = _safe_trace_part(os.getenv("SOARM_POLICY_STEP", ""), "unknown-step")
+    location = "remote" if os.getenv("SOARM_REMOTE_POLICY_PATH", "") else "local"
+    return TRACE_DIR / f"{started_at}-{run}-{step}-{location}.jsonl"
+
+
+def _point_latest_trace_at(path: Path) -> None:
+    temporary = TRACE_PATH.with_suffix(".tmp")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(path.relative_to(RUNTIME_DIR))
+    os.replace(temporary, TRACE_PATH)
+
+
+def _prune_trace_archives() -> None:
+    try:
+        archives = sorted(
+            TRACE_DIR.glob("*.jsonl"),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+            reverse=True,
+        )
+        for path in archives[TRACE_RETENTION:]:
+            path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("오래된 동작 기록을 정리하지 못했습니다.", exc_info=True)
+
+
+def _start_motion_trace() -> _MotionTrace:
     """팔이 매 틱 어디를 명령받았고 실제로 어디에 있었는지 남긴다.
 
     `so_follower.send_action`은 `max_relative_target`이 설정돼 있으면 이미
@@ -286,51 +336,93 @@ def _start_motion_trace() -> Callable[[], None]:
 
     실패해도 롤아웃을 멈추지 않는다. 계기가 팔을 세우는 일은 없어야 한다.
     """
-    logger = logging.getLogger(__name__)
     try:
         from lerobot.robots.so_follower import so_follower as follower_module
+    except Exception:
+        logger.warning("동작 기록 지점을 감싸지 못했습니다.", exc_info=True)
+        return _MotionTrace(lambda _callback: None, lambda: None, lambda: None)
 
-        original = follower_module.ensure_safe_goal_position
+    original = follower_module.ensure_safe_goal_position
+    handle = None
+    started = time.perf_counter()
+    try:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        handle = TRACE_PATH.open("w", buffering=1 << 16)
-        started = time.perf_counter()
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        archive_path = _trace_archive_path()
+        handle = archive_path.open("w", buffering=1 << 14)
+        _point_latest_trace_at(archive_path)
+        _prune_trace_archives()
     except Exception:
         logger.warning("동작 기록을 열지 못했습니다. 기록 없이 진행합니다.", exc_info=True)
-        return lambda: None
 
     names: list[str] = []
+    state_lock = threading.Lock()
+    on_first_rollout_action: Callable[[], None] | None = None
+    rollout_started = False
+    rows_since_flush = 0
+
+    def arm(callback: Callable[[], None]) -> None:
+        nonlocal on_first_rollout_action
+        with state_lock:
+            on_first_rollout_action = callback
+
+    def disarm() -> None:
+        nonlocal on_first_rollout_action, rollout_started
+        with state_lock:
+            on_first_rollout_action = None
+            rollout_started = False
 
     def traced(goal_present_pos, max_relative_target):
-        try:
-            nonlocal names
-            if not names:
-                names = sorted(goal_present_pos)
-                handle.write(json.dumps({"joints": names}) + "\n")
-            if set(goal_present_pos) == set(names):
-                handle.write(
-                    json.dumps(
-                        {
-                            "t": round(time.perf_counter() - started, 4),
-                            "g": [round(goal_present_pos[n][0], 3) for n in names],
-                            "p": [round(goal_present_pos[n][1], 3) for n in names],
-                        }
+        nonlocal on_first_rollout_action, rollout_started, rows_since_flush
+        callback = None
+        with state_lock:
+            if on_first_rollout_action is not None:
+                callback = on_first_rollout_action
+                on_first_rollout_action = None
+                rollout_started = True
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logger.warning("첫 정책 명령 상태를 기록하지 못했습니다.", exc_info=True)
+        if handle is not None:
+            try:
+                nonlocal names
+                if not names:
+                    names = sorted(goal_present_pos)
+                    handle.write(json.dumps({"joints": names}) + "\n")
+                if set(goal_present_pos) == set(names):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "t": round(time.perf_counter() - started, 4),
+                                "g": [round(goal_present_pos[n][0], 3) for n in names],
+                                "p": [round(goal_present_pos[n][1], 3) for n in names],
+                                "rollout": rollout_started,
+                            }
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
-        except Exception:
-            pass
+                    rows_since_flush += 1
+                    if rows_since_flush >= 30:
+                        handle.flush()
+                        rows_since_flush = 0
+            except Exception:
+                pass
         return original(goal_present_pos, max_relative_target)
 
     follower_module.ensure_safe_goal_position = traced
 
     def stop() -> None:
         follower_module.ensure_safe_goal_position = original
+        if handle is None:
+            return
         try:
             handle.close()
         except Exception:
             pass
 
-    return stop
+    return _MotionTrace(arm, disarm, stop)
 
 
 def _robot_config(
@@ -606,7 +698,9 @@ def build_remote_client_config(
     return config
 
 
-def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리에서 읽는 편이 낫다
+def main(
+    motion_trace: _MotionTrace | None = None,
+) -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리에서 읽는 편이 낫다
     settings = Settings()
     run = os.getenv("SOARM_POLICY_RUN", "")
     step = os.getenv("SOARM_POLICY_STEP", "")
@@ -658,7 +752,7 @@ def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리�
         stop_requested = threading.Event()
         previous_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: stop_requested.set())
-        phase = "aligning" if home is not None else "running"
+        phase = "aligning" if home is not None else "loading"
         _write_status(
             phase=phase,
             home=home or {},
@@ -694,10 +788,10 @@ def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리�
                 config = build_rollout_config(settings, run, step, task, fps, max_seconds)
             if stop_requested.is_set():
                 return
-            # 원격은 서버가 체크포인트를 GPU에 올리는 동안 팔이 아직 아무것도 하지 않는다.
-            # 그 시간을 `running`이라고 적으면 화면은 도는 것처럼 보이고 시한도 그때부터
-            # 세어, 사람은 아무 일도 일어나지 않는 2분을 본다.
-            phase = "loading" if remote_path else "running"
+            # 원격 GPU 적재뿐 아니라 로컬 체크포인트 적재와 로봇 연결 중에도 팔은 아직
+            # 아무것도 하지 않는다. 첫 정책 명령 전까지 그 시간을 `running`이라고 적으면
+            # 화면은 움직인다고 거짓말하고 시한도 너무 일찍 세기 시작한다.
+            phase = "loading"
             _write_status(phase=phase, home=home or {}, run=run, step=step, task=task)
             if not remote_path:
                 signal.signal(signal.SIGTERM, previous_sigterm)
@@ -717,7 +811,20 @@ def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리�
                         task, stop_requested, max_seconds, on_ready=policy_is_loaded
                     )
                 else:
-                    lerobot_rollout.rollout(config)
+                    def first_policy_action() -> None:
+                        nonlocal phase
+                        phase = "running"
+                        _write_status(
+                            phase=phase, home=home or {}, run=run, step=step, task=task
+                        )
+
+                    if motion_trace is not None:
+                        motion_trace.arm(first_policy_action)
+                    try:
+                        lerobot_rollout.rollout(config)
+                    finally:
+                        if motion_trace is not None:
+                            motion_trace.disarm()
             except BaseException:
                 remote_failed = bool(remote_path)
                 raise
@@ -766,8 +873,8 @@ def main() -> None:  # noqa: PLR0915 — 한 롤아웃의 순서를 한 자리�
 if __name__ == "__main__":
     # 정렬·롤아웃·복귀까지 한 시행의 모든 움직임이 한 파일에 들어간다. 복귀는
     # 우리가 만든 매끄러운 궤적이라, 같은 파일 안의 비교 기준이 되기도 한다.
-    _stop_motion_trace = _start_motion_trace()
+    _motion_trace = _start_motion_trace()
     try:
-        main()
+        main(_motion_trace)
     finally:
-        _stop_motion_trace()
+        _motion_trace.stop()

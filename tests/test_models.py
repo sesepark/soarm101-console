@@ -571,18 +571,37 @@ def test_policy_main_returns_to_requested_or_captured_home(
     )
     from lerobot.scripts import lerobot_rollout
 
-    monkeypatch.setattr(lerobot_rollout, "rollout", lambda config: None)
+    class Trace:
+        callback = None
+
+        def arm(self, callback):
+            self.callback = callback
+
+        def disarm(self):
+            self.callback = None
+
+    trace = Trace()
+
+    def rollout(_config):
+        # 적재가 끝나도 send_action 전까지는 loading이다. 첫 명령을 잡은 trace만
+        # running으로 넘길 수 있고, 같은 콜백을 두 번 부를 길은 없다.
+        assert phases[-1] == "loading"
+        assert trace.callback is not None
+        callback, trace.callback = trace.callback, None
+        callback()
+
+    monkeypatch.setattr(lerobot_rollout, "rollout", rollout)
     monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
     monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
     monkeypatch.setenv("SOARM_POLICY_TASK", "Pick up block")
     monkeypatch.setenv("SOARM_POLICY_HOME", json.dumps(requested_home) if requested_home else "")
 
-    policying.main()
+    policying.main(trace)
 
     assert list(dict.fromkeys(phases)) == (
-        ["aligning", "running", "returning"]
+        ["aligning", "loading", "running", "returning"]
         if requested_home
-        else ["running", "returning"]
+        else ["loading", "running", "returning"]
     )
     assert alignments[-1] == ("returning", requested_home or captured)
 
@@ -713,6 +732,79 @@ def test_local_policy_robot_keeps_dataset_camera_names():
     config = policying._robot_config(_settings(), 30)
 
     assert set(config.cameras) == {"scene", "wrist"}
+
+
+def test_motion_trace_fires_once_on_the_first_action_after_it_is_armed(
+    tmp_path, monkeypatch
+):
+    from lerobot.robots.so_follower import so_follower as follower_module
+
+    runtime = tmp_path / "policy"
+    monkeypatch.setattr(policying, "RUNTIME_DIR", runtime)
+    monkeypatch.setattr(policying, "TRACE_DIR", runtime / "traces")
+    monkeypatch.setattr(policying, "TRACE_PATH", runtime / "trace.jsonl")
+    monkeypatch.setenv("SOARM_POLICY_STARTED_AT", "1000.0")
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+    monkeypatch.delenv("SOARM_REMOTE_POLICY_PATH", raising=False)
+    order = []
+    monkeypatch.setattr(
+        follower_module,
+        "ensure_safe_goal_position",
+        lambda goal, limit: order.append("command") or goal,
+    )
+
+    trace = policying._start_motion_trace()
+    goal = {"shoulder_pan": (1.0, 0.0)}
+    try:
+        # 정렬에서 같은 함수를 불러도 아직 arm하지 않았으므로 콜백은 없다.
+        follower_module.ensure_safe_goal_position(goal, 3.0)
+        order.clear()
+        trace.arm(lambda: order.append("running"))
+        follower_module.ensure_safe_goal_position(goal, 3.0)
+        follower_module.ensure_safe_goal_position(goal, 3.0)
+        trace.disarm()
+        follower_module.ensure_safe_goal_position(goal, 3.0)
+    finally:
+        trace.stop()
+
+    assert order == ["running", "command", "command", "command"]
+    rows = [json.loads(line) for line in policying.TRACE_PATH.read_text().splitlines()[1:]]
+    assert [row["rollout"] for row in rows] == [False, True, True, False]
+
+
+def test_motion_traces_are_archived_with_location_and_pruned(tmp_path, monkeypatch):
+    from lerobot.robots.so_follower import so_follower as follower_module
+
+    runtime = tmp_path / "policy"
+    monkeypatch.setattr(policying, "RUNTIME_DIR", runtime)
+    monkeypatch.setattr(policying, "TRACE_DIR", runtime / "traces")
+    monkeypatch.setattr(policying, "TRACE_PATH", runtime / "trace.jsonl")
+    monkeypatch.setattr(policying, "TRACE_RETENTION", 2)
+    monkeypatch.setattr(
+        follower_module,
+        "ensure_safe_goal_position",
+        lambda goal, limit: goal,
+    )
+    monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
+    monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
+
+    for started_at, remote in (("1000", False), ("1001", True), ("1002", False)):
+        monkeypatch.setenv("SOARM_POLICY_STARTED_AT", started_at)
+        if remote:
+            monkeypatch.setenv("SOARM_REMOTE_POLICY_PATH", "/remote/model")
+        else:
+            monkeypatch.delenv("SOARM_REMOTE_POLICY_PATH", raising=False)
+        trace = policying._start_motion_trace()
+        follower_module.ensure_safe_goal_position({"shoulder_pan": (1.0, 0.0)}, 3.0)
+        trace.stop()
+
+    archives = sorted(path.name for path in policying.TRACE_DIR.glob("*.jsonl"))
+    assert len(archives) == 2
+    assert any(name.startswith(f"1001-{RUN}-{STEP}-remote") for name in archives)
+    assert any(name.startswith(f"1002-{RUN}-{STEP}-local") for name in archives)
+    assert policying.TRACE_PATH.is_symlink()
+    assert policying.TRACE_PATH.resolve().name.startswith(f"1002-{RUN}-{STEP}-local")
 
 
 def test_remote_camera_name_falls_back_when_checkpoint_has_no_mapping():
@@ -908,14 +1000,14 @@ def test_how_long_the_last_load_took_is_remembered_per_checkpoint(tmp_path):
     assert manager._remembered_load_seconds(RUN, STEP, True) == 1.8
 
 
-def test_the_measured_load_time_reaches_the_screen(tmp_path):
+@pytest.mark.parametrize("remote", [False, True])
+def test_the_measured_load_time_reaches_the_screen(tmp_path, remote):
     manager = PolicyManager(_settings())
     manager.runtime_dir = tmp_path
-    manager._run, manager._step, manager._remote = RUN, STEP, True
+    manager._run, manager._step, manager._remote = RUN, STEP, remote
     manager._max_seconds = 120.0
     manager._launched_at = 1_000.0
     manager._started_at = 1_000.0
-    manager._remote = True
     manager._phase = "loading"
     (tmp_path / "status.json").write_text(json.dumps({"phase": "running"}), encoding="utf-8")
 
@@ -923,7 +1015,9 @@ def test_the_measured_load_time_reaches_the_screen(tmp_path):
 
     assert status["load_seconds"] is not None and status["load_seconds"] > 0
     # 다음 시행은 그 값을 미리 알고 시작한다.
-    assert manager._remembered_load_seconds(RUN, STEP, True) == round(status["load_seconds"], 1)
+    assert manager._remembered_load_seconds(RUN, STEP, remote) == round(
+        status["load_seconds"], 1
+    )
 
 
 def test_remote_connection_failure_holds_in_place_instead_of_returning(
@@ -1269,10 +1363,9 @@ def test_remote_client_loop_rate_counts_executed_actions_not_observations():
     The rate that is real comes from ``Obs #N``: N is the last *executed* action's index
     (``timestep=max(latest_action, 0)``), so its slope against the clock is the control rate.
     """
-    from soarm_console.policy_manager import _ACTUAL_FPS, _REMOTE_TICK, _rate_from_ticks
+    from soarm_console.policy_manager import _REMOTE_TICK, _rate_from_ticks
 
     line = "INFO 2026-09-09 09:47:12 t_client.py:443 Obs #2664 | Avg FPS: 5.42 | Target: 30.00"
-    assert _ACTUAL_FPS.search(line) is None
     match = _REMOTE_TICK.search(line)
     assert match is not None
     assert match.group(1, 2, 3) == ("09", "47", "12")
@@ -1294,6 +1387,48 @@ def test_remote_client_loop_rate_counts_executed_actions_not_observations():
     assert _rate_from_ticks([(100, 5)]) is None
     assert _rate_from_ticks([(100, 5), (100, 40)]) is None
 
-    # The local rollout keeps its own line.
-    local = "WARNING rollout is running slower (24.5 Hz) than the target"
-    assert float(_ACTUAL_FPS.search(local).group(1)) == 24.5
+
+
+def test_local_control_rate_comes_from_trace_timestamps(tmp_path):
+    from soarm_console.policy_manager import _rate_from_trace
+
+    trace = tmp_path / "trace.jsonl"
+    rows = [{"joints": ["shoulder_pan"]}]
+    rows.extend(
+        {"t": index / 100, "g": [0], "p": [0], "rollout": False}
+        for index in range(100)
+    )
+    rows.extend(
+        {"t": 3 + index / 24, "g": [0], "p": [0], "rollout": True}
+        for index in range(241)
+    )
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert _rate_from_trace(trace) == pytest.approx(24.0)
+
+
+def test_local_control_rate_stays_empty_for_a_short_trace(tmp_path):
+    from soarm_console.policy_manager import _rate_from_trace
+
+    trace = tmp_path / "trace.jsonl"
+    rows = ({"t": index / 30} for index in range(150))
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert _rate_from_trace(trace) is None
+
+
+def test_local_status_uses_trace_but_remote_status_keeps_log_ticks(tmp_path):
+    trace = tmp_path / "trace.jsonl"
+    rows = ({"t": index / 20} for index in range(241))
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    local = PolicyManager(_settings())
+    local.runtime_dir = tmp_path
+    local._run, local._step = RUN, STEP
+    assert local.status()["fps_actual"] == pytest.approx(20.0)
+
+    remote = PolicyManager(_settings())
+    remote.runtime_dir = tmp_path
+    remote._remote = True
+    remote._ticks.extend((second, 30 * second) for second in range(20))
+    assert remote.status()["fps_actual"] == pytest.approx(30.0)

@@ -21,9 +21,16 @@ import statistics
 from pathlib import Path
 
 DEFAULT = Path(__file__).parents[1] / "runtime/policy/trace.jsonl"
-#: 학습 데이터(soarm101_cube134_dnv_strat 134회)의 |action - observation.state|.
-#: 사람이 몰 때 팔이 명령에 얼마나 붙어 있었는지의 기준선이다.
+#: 아래 셋은 모두 학습 데이터(soarm101_cube134_dnv_strat, 134회)를 이 도구와 **같은
+#: 방식으로** 재서 얻은 기준선이다. 사람이 리더 팔로 몰았을 때의 값이므로, 정책이
+#: 그보다 거칠면 거친 쪽은 정책이다.
+#: |action - observation.state|의 중앙값.
 DEMO_TRACKING_MEDIAN_DEG = 4.8
+#: 명령(action)의 RMS 저크 범위, °/s³. 관절마다 4,188(shoulder_pan)~7,699(wrist_roll).
+DEMO_COMMAND_JERK = (4188, 7699)
+#: 팔(observation.state)이 명령보다 얼마나 거칠었나. 0.9배 — 서보가 저역통과로 작동해
+#: 오히려 명령보다 매끄럽다. 건강한 추종의 지문이다.
+DEMO_ARM_OVER_COMMAND = 0.9
 
 
 def _load(path: Path, lo: float, hi: float):
@@ -86,6 +93,7 @@ def main() -> None:
 
     print()
     print("=== 3. 저크 (°/s³, RMS) — 눈에 보이는 '툭툭'의 정체 ===")
+    print(f"  시연 기준: 명령 {DEMO_COMMAND_JERK[0]:,}~{DEMO_COMMAND_JERK[1]:,} · 팔/명령 {DEMO_ARM_OVER_COMMAND}배")
     print(f"  {'관절':<16}{'명령':>12}{'팔':>12}{'팔/명령':>10}")
     ratios = []
     for i, name in enumerate(joints):
@@ -99,7 +107,21 @@ def main() -> None:
         ratios.append(ratio)
         print(f"  {name:<16}{out['g']:>12.0f}{out['p']:>12.0f}{ratio:>10.1f}x")
     median_ratio = statistics.median(ratios)
+    command_jerks = []
+    for i in range(len(joints)):
+        series = [r["g"][i] for r in rows]
+        v = _derivative(series, gaps)
+        a = _derivative(v, gaps[1:])
+        command_jerks.append(_rms(_derivative(a, gaps[2:])))
+    median_command = statistics.median(command_jerks)
     print()
+    if median_command > 2 * DEMO_COMMAND_JERK[1]:
+        print(f"  → 명령 자체가 시연보다 거칠다 (중앙값 {median_command:,.0f} vs 시연 상한 "
+              f"{DEMO_COMMAND_JERK[1]:,}). 배관이 아니라 정책의 궤적 문제다")
+    elif median_command < DEMO_COMMAND_JERK[0]:
+        print(f"  → 명령은 시연보다 매끄럽다 (중앙값 {median_command:,.0f})")
+    else:
+        print(f"  → 명령은 시연과 같은 수준이다 (중앙값 {median_command:,.0f})")
     if median_ratio > 3:
         print(f"  → 팔이 명령보다 {median_ratio:.1f}배 거칠다. 원인은 정책이 아니라 그 아래에 있다")
         print("     (리미터·서보·제어 간격 흔들림을 먼저 본다)")

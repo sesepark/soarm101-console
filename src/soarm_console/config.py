@@ -58,8 +58,27 @@ class Settings:
     max_relative_target: float = field(
         default_factory=lambda: float(os.getenv("SOARM_MAX_RELATIVE_TARGET", "2"))
     )
+    #: 정책이 모는 동안 한 틱(33ms)에 관절 하나가 움직일 수 있는 최대 각도.
+    #:
+    #: **도달 범위가 아니라 속도의 한계다.** 범위는 서보 보정이 따로 막는다 —
+    #: `motors_bus._unnormalize`가 매 쓰기마다 `range_min~range_max`로 자르므로
+    #: (shoulder_pan 236°, elbow_flex 194°, gripper 127° …) 이 값을 올려도 팔이
+    #: 보정 범위 밖으로 나갈 수는 없다.
+    #:
+    #: 2026-09-09까지 12.0이었는데, 그 값이 팔이 주기적으로 끊기는 원인이었다.
+    #: 수집할 때는 이 리미터가 사실상 꺼져 있고(`SOARM_MAX_RELATIVE_TARGET=1000`),
+    #: 그렇게 모은 시연 자체가 `|action - observation.state|`가 12°를 넘는 프레임을
+    #: **11.5%** 가지고 있다(최대 34.2°). 즉 12°는 사람이 직접 몰 때 낸 명령의
+    #: 9분의 1을 자르는 값이었다. 정책은 자기 학습 데이터가 지킨 적 없는 규칙을
+    #: 강요당했고, 그 결과 `goal = present + 12`가 매 틱 다시 걸리면서 리미터가
+    #: 속도 조절기가 됐다 — 실측으로 제어 틱의 17~23%가 잘렸고 그 4분의 3이
+    #: 5틱 이상 연속이었으며, 팔은 명령보다 12~25° 뒤처진 채 평형에 들어갔다.
+    #: 그동안 정책이 낸 명령은 47°/초로, 시연의 90퍼센타일(~70°/초)에도 못 미쳤다.
+    #:
+    #: 40.0은 시연의 최대치 34.2°보다 위다. 사람이 낸 명령은 하나도 자르지 않으면서
+    #: 폭주(한 틱에 100° 이상)는 여전히 잡는다.
     policy_max_relative_target: float = field(
-        default_factory=lambda: float(os.getenv("SOARM_POLICY_MAX_RELATIVE_TARGET", "12.0"))
+        default_factory=lambda: float(os.getenv("SOARM_POLICY_MAX_RELATIVE_TARGET", "40.0"))
     )
 
     # 학습이 도는 기계. 주소와 계정은 이 저장소가 공개이므로 여기 적지 않고 `config/soarm.env`에

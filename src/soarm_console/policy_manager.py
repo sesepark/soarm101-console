@@ -8,6 +8,7 @@ import threading
 import time
 import signal
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from .calibration import validate_calibration
 from .config import Settings
@@ -27,12 +28,51 @@ from .teleop import TeleopError
 _RTC_LATENCY = re.compile(r"RTC inference latency=([0-9.]+)s")
 _REMOTE_LATENCY = re.compile(r"Network latency \(server->client\): ([0-9.]+)ms")
 _ACTUAL_FPS = re.compile(r"running slower \(([0-9.]+) Hz\)")
-#: The remote client never prints that warning.  It reports the rate it is actually
-#: achieving on every observation instead — ``Obs #2664 | Avg FPS: 5.42 | Target: 30.00``.
-#: Without this pattern ``fps_actual`` stayed None for every remote rollout, so the app
-#: could not say the loop was behind and a person had to feel the arm stutter and then
-#: open this log to find out it was running at 5.4 Hz instead of 30 (2026-09-08).
-_REMOTE_FPS = re.compile(r"Avg FPS: ([0-9.]+) \| Target: ([0-9.]+)")
+#: 원격 클라이언트는 그 경고를 찍지 않는다. 대신 관측마다 이런 줄을 남긴다 —
+#: ``Obs #2664 | Avg FPS: 5.42 | Target: 30.00``.
+#:
+#: **그 `Avg FPS`는 제어율이 아니다.** lerobot의 `control_loop_observation`은 액션 큐가
+#: 임계 아래로 내려갔을 때만 불리므로(`_ready_to_send_observation`), 저 숫자는 *관측을
+#: 보낸* 빈도다. 큐가 차 있는 동안은 제어 루프가 30Hz로 돌면서도 관측을 안 보내고, 그
+#: 구간이 평균을 끌어내린다. 2026-09-09 실측으로 저 값이 9.6일 때 실제 제어율은 29.0Hz였다.
+#:
+#: 2026-09-08에 이 자리에 `Avg FPS`를 그대로 `fps_actual`로 넣었고, 그 숫자를 보고 "제어
+#: 루프가 5.4Hz"라고 적어 터널을 원인으로 지목했다. 터널이 왕복 지연을 더한 것은 사실이지만
+#: 제어 루프가 5.4Hz였다는 것은 이 계기가 만든 허상이었다.
+#:
+#: 진짜 제어율은 `Obs #N`의 N에서 나온다. N은 마지막으로 **실행된 액션의 번호**이므로
+#: (`timestep=max(latest_action, 0)`), 두 줄 사이의 N 증가량을 그 사이 시간으로 나누면
+#: 초당 실행된 액션 수, 곧 제어율이다.
+_REMOTE_TICK = re.compile(
+    r"\b(\d\d):(\d\d):(\d\d)\b.*?Obs #(\d+) \| Avg FPS: [0-9.]+ \| Target: ([0-9.]+)"
+)
+
+
+#: 이보다 짧은 구간에서는 재지 않는다. 로그의 시각이 초 단위라 5초 창에서는 참값 29Hz가
+#: 25Hz로 나온다(2026-09-09 실측). 틀린 숫자를 보여 주는 것보다 비워 두는 편이 낫다.
+_RATE_MIN_SPAN_SECONDS = 10
+
+
+def _rate_from_ticks(ticks: Sequence[tuple[int, int]]) -> float | None:
+    """실행된 액션 번호가 시간에 대해 오르는 기울기 = 제어율(Hz).
+
+    초마다 번호의 평균을 먼저 낸다. 한 초 안에 표본이 여러 개 들어오는데 그 초의 어느
+    지점에서 창이 시작하고 끝나느냐에 따라 양끝만 쓰면 20%까지 어긋나기 때문이다.
+    """
+    seconds: dict[int, list[int]] = {}
+    for second, index in ticks:
+        seconds.setdefault(second, []).append(index)
+    points = sorted((s, sum(v) / len(v)) for s, v in seconds.items())
+    if len(points) < 2 or points[-1][0] - points[0][0] < _RATE_MIN_SPAN_SECONDS:
+        return None
+    n = len(points)
+    mean_t = sum(p[0] for p in points) / n
+    mean_i = sum(p[1] for p in points) / n
+    denominator = sum((p[0] - mean_t) ** 2 for p in points)
+    if denominator <= 0:
+        return None
+    slope = sum((p[0] - mean_t) * (p[1] - mean_i) for p in points) / denominator
+    return slope if slope > 0 else None
 
 
 class PolicyManager:
@@ -53,6 +93,10 @@ class PolicyManager:
         self._moving_since: float | None = None
         self._expires_at: float | None = None
         self._fps_target: float | None = None
+        #: (초, 실행된 액션 번호). 제어율은 이 표본의 기울기다. 로그 꼬리는 400줄뿐이고
+        #: 팔이 끊길 때는 클램프 경고가 쏟아져 그 400줄이 12초까지 줄어든다 — 정작 재야
+        #: 할 때 창이 짧아지므로, 폴링할 때마다 본 것을 여기 누적해 둔다.
+        self._ticks: deque[tuple[int, int]] = deque(maxlen=2000)
         #: 이 시행에 허락된 초. 적재가 끝난 뒤 시한을 다시 세는 데 쓴다.
         self._max_seconds: float | None = None
         #: 프로세스를 띄운 시각. 원격 적재 시간을 재기 위해 둔다.
@@ -182,6 +226,7 @@ class PolicyManager:
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             (self.runtime_dir / "status.json").unlink(missing_ok=True)
             self._logs.clear()
+            self._ticks.clear()
             self._fps_actual = None
             self._chunk_seconds = None
             self._chunks = None
@@ -380,11 +425,15 @@ class PolicyManager:
                 self._chunks = (self._chunks or 0) + 1
             if match := _ACTUAL_FPS.search(text):
                 self._fps_actual = float(match.group(1))
-            if match := _REMOTE_FPS.search(text):
-                rate = float(match.group(1))
-                if rate > 0:
-                    self._fps_actual = rate
-                    self._fps_target = float(match.group(2))
+            if match := _REMOTE_TICK.search(text):
+                h, m, s, index, target = match.groups()
+                sample = (int(h) * 3600 + int(m) * 60 + int(s), int(index))
+                # 같은 줄을 여러 번 보게 되므로(로그 꼬리는 겹친다) 번호로 거른다.
+                if not self._ticks or sample[1] > self._ticks[-1][1]:
+                    self._ticks.append(sample)
+                self._fps_target = float(target)
+        self._fps_actual = _rate_from_ticks(self._ticks)
+
         if error is None and process is not None and process.poll() not in (None, 0):
             error = logs[-1] if logs else f"Policy process exited with code {process.poll()}"
         return {

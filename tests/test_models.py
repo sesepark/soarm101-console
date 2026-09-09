@@ -1252,22 +1252,47 @@ def test_camera_map_falls_back_to_position_for_names_it_cannot_read():
     assert models.camera_map(None) == {}
 
 
-def test_remote_client_loop_rate_is_read_from_its_own_log_line():
-    """The remote client never prints ``running slower``; it prints the rate it is achieving.
+def test_remote_client_loop_rate_counts_executed_actions_not_observations():
+    """``Avg FPS`` in the remote client's log is NOT the control rate.
 
-    While only the local warning was matched, ``fps_actual`` stayed None for every remote
-    rollout, so nothing could say the control loop was behind.  A person felt the arm stutter
-    and had to open this log to learn it was running at 5.4 Hz against a 30 Hz target
-    (2026-09-08).
+    ``control_loop_observation`` runs only when the action queue has fallen below the
+    threshold, so that average counts *observations sent*.  While the queue is full the
+    control loop keeps executing actions at 30 Hz and sends nothing, and those ticks drag
+    the average down.  Measured 2026-09-09: ``Avg FPS`` read 9.6 while the loop was
+    executing 29.0 actions per second.
+
+    On 2026-09-08 this value was wired straight into ``fps_actual`` and the number it
+    produced ("the loop is at 5.4 Hz") was used as evidence that the SSH tunnel was
+    throttling the control loop.  The tunnel did add round-trip latency, but the 5.4 Hz
+    reading was an artifact of this gauge.
+
+    The rate that is real comes from ``Obs #N``: N is the last *executed* action's index
+    (``timestep=max(latest_action, 0)``), so its slope against the clock is the control rate.
     """
-    from soarm_console.policy_manager import _ACTUAL_FPS, _REMOTE_FPS
+    from soarm_console.policy_manager import _ACTUAL_FPS, _REMOTE_TICK, _rate_from_ticks
 
-    line = "INFO t_client.py:443 Obs #2664 | Avg FPS: 5.42 | Target: 30.00"
+    line = "INFO 2026-09-09 09:47:12 t_client.py:443 Obs #2664 | Avg FPS: 5.42 | Target: 30.00"
     assert _ACTUAL_FPS.search(line) is None
-    match = _REMOTE_FPS.search(line)
+    match = _REMOTE_TICK.search(line)
     assert match is not None
-    assert float(match.group(1)) == 5.42
-    assert float(match.group(2)) == 30.00
+    assert match.group(1, 2, 3) == ("09", "47", "12")
+    assert int(match.group(4)) == 2664
+    assert float(match.group(5)) == 30.00
+
+    # A loop truly at 30 Hz, whose observation average would have read far lower.
+    thirty = [(t, 30 * t) for t in range(20)]
+    assert _rate_from_ticks(thirty) == 30.0
+
+    # A loop that really is behind is still reported as behind.
+    behind = [(t, 12 * t) for t in range(20)]
+    assert _rate_from_ticks(behind) == 12.0
+
+    # Too short a window is left unmeasured rather than answered wrongly: the log's clock
+    # has one-second resolution, so a five-second window read 25 Hz for a true 29 Hz.
+    assert _rate_from_ticks([(t, 30 * t) for t in range(5)]) is None
+    assert _rate_from_ticks([]) is None
+    assert _rate_from_ticks([(100, 5)]) is None
+    assert _rate_from_ticks([(100, 5), (100, 40)]) is None
 
     # The local rollout keeps its own line.
     local = "WARNING rollout is running slower (24.5 Hz) than the target"

@@ -121,11 +121,10 @@
       <pre id="physical-checks"></pre>
       <p>맥북·가상 리더·수집·정책이 팔을 점유하면 시작할 수 없습니다. 기존 화면에서 권한과 모드를 먼저 반납하세요. 자동으로 빼앗지 않습니다.</p>
       <label class="ack"><input id="physical-confirm" type="checkbox"><span>현장에서 두 팔의 초기 자세, 사람·장애물·케이블과 물리 전원 차단 위치를 확인했습니다.</span></label>
-      <label class="field">확인 문구 <input id="physical-phrase" autocomplete="off" placeholder="START SOARM101"></label>
       <p>조작 토큰은 아래 권한 탭에서 입력하세요. 권한 받기 버튼은 누르지 않아도 됩니다.</p>
       <button id="physical-start" class="primary" type="button" disabled>물리 텔레옵 시작</button>
       <button id="physical-stop" class="stop" type="button">물리 텔레옵 정지</button>
-      <p>탭 이동이나 휴대폰 화면 잠금으로 물리 텔레옵이 정지하지 않습니다. 종료할 때 정지를 누르세요. 정지는 토크 해제가 아니며 팔은 마지막 자세를 유지합니다.</p>
+      <p>휴대폰 화면 잠금·앱 전환·페이지 종료 시 텔레옵을 정지합니다. 연결이 끊겨 종료 요청이 도달하지 않아도 마지막 heartbeat 후 5초 만료 시 종료를 요청합니다. 이 화면의 탭 이동은 실행을 유지합니다. 정지는 토크 해제가 아니며 팔은 마지막 자세를 유지합니다. 재접속해도 자동 재시작하지 않습니다.</p>
       <p id="physical-error" role="alert"></p>
       <pre id="physical-logs"></pre>
     </section>

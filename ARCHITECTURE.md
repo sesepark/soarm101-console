@@ -11,7 +11,8 @@
 > 무시하는 임의의 upstream 프로세스까지 차단하지는 않는다. 아직 구현되지 않은 것은 ROS 2
 > Bridge, 수집 중 health 감지, 독립 power cutoff다. 로컬 학습 정책 실행은
 > `PolicyManager` + `policying`이 LeRobot rollout을 감싸는 네 번째 모드로 구현되어 있다.
-> 물리 리더 텔레옵 경로(`soarm_console.teleoperating`)에는 lease도 watchdog도 없다 —
+> 모바일 물리 리더 텔레옵에는 폰 heartbeat 기반 5초 lease와 자식의 독립 종료 watchdog을
+> 추가했다(`docs/HUBq.md`). 기존 데스크톱 물리 리더 텔레옵 경로에는 command lease가 없다 —
 > 리더 팔에서 읽은 값을 그대로 흘려보내는 구조라 끼어들 자리가 없다. 2026-09-05에
 > `lerobot-teleoperate` 바이너리에서 우리 모듈로 옮겼는데, 그것은 lease를 들이기 위해서가
 > 아니라 **루프의 앞뒤**를 잡기 위해서였다: 토크가 켜지기 전의 목표 동기화와 첫 틱 전의

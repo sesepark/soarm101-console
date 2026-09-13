@@ -23,6 +23,7 @@ from .calibration import validate_calibration
 from .config import Settings
 from .follower_start import align_follower_to_leader, install_safe_follower_start
 from .owner_lock import DeviceLockError, DeviceLockSet, inherited_locks_cover
+from .mobile_watchdog import mobile_watchdog
 
 
 #: LeRobot의 기본 텔레옵 주기는 60Hz지만, 수집이 30Hz로 찍으므로 여기도 30으로 둔다.
@@ -87,8 +88,8 @@ def run(settings: Settings) -> None:
 
     # 리더를 먼저 붙인다. upstream이 그렇게 하고, 팔로워가 붙은 채 오래 놀지 않게 하려는
     # 것이다 — 노는 동안 펌웨어 워치독이 돌 수 있다.
-    connect_without_prompting(teleop, "leader")
     try:
+        connect_without_prompting(teleop, "leader")
         connect_without_prompting(robot, "follower")
 
         teleop_action_processor, robot_action_processor, robot_observation_processor = (
@@ -144,8 +145,11 @@ def main() -> None:
     except DeviceLockError as exc:
         raise SystemExit(f"Refusing to teleoperate: {exc}") from exc
 
-    with lock_context:
-        run(settings)
+    with lock_context, mobile_watchdog():
+        try:
+            run(settings)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

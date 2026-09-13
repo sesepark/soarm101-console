@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .cameras import RECORDING_PROFILE, CameraProfile, CameraWorker
@@ -208,6 +208,14 @@ app.include_router(
 
 class MotionRequest(BaseModel):
     confirmation: str
+
+
+class MobileMotionRequest(MotionRequest):
+    session: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class MobileSessionRequest(BaseModel):
+    session: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class RecordRequest(BaseModel):
@@ -709,6 +717,10 @@ def release_torque(request: Request, body: TorqueReleaseRequest) -> dict[str, ob
 
 @app.post("/api/teleoperation/start")
 def start_teleoperation(request: MotionRequest) -> dict[str, object]:
+    return _start_teleoperation(request)
+
+
+def _start_teleoperation(request: MotionRequest, mobile_session: str | None = None) -> dict[str, object]:
     global last_doctor
     if request.confirmation != "START SOARM101":
         raise HTTPException(status_code=400, detail="Confirmation phrase does not match")
@@ -725,7 +737,35 @@ def start_teleoperation(request: MotionRequest) -> dict[str, object]:
             detail=f"Hardware doctor did not pass: {doctor_failure(last_doctor)}",
         )
     try:
-        teleop.start()
+        if mobile_session:
+            teleop.start(mobile_session=mobile_session)
+        else:
+            teleop.start()
+    except TeleopError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return teleop.status()
+
+
+@app.post("/api/teleoperation/mobile/start")
+def start_mobile_teleoperation(request: Request, body: MobileMotionRequest) -> dict[str, object]:
+    _authorise_motion(_token_from(request))
+    return _start_teleoperation(body, body.session)
+
+
+@app.post("/api/teleoperation/mobile/heartbeat")
+def mobile_teleoperation_heartbeat(request: Request, body: MobileSessionRequest) -> dict[str, object]:
+    _authorise_motion(_token_from(request))
+    try:
+        return teleop.mobile_heartbeat(body.session)
+    except TeleopError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/teleoperation/mobile/stop")
+def stop_mobile_teleoperation(body: MobileSessionRequest) -> dict[str, object]:
+    # A late pagehide from an old phone must not stop a newer phone or Mac job.
+    try:
+        teleop.stop(mobile_session=body.session)
     except TeleopError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return teleop.status()

@@ -189,6 +189,13 @@ def heartbeat() -> int:
     return int(value["renewed"])
 
 
+def mobile_heartbeat(process: JobProcess, session: str) -> dict[str, Any]:
+    value = _request("POST", f"/jobs/{process.job_id}/mobile-heartbeat", {"session": session}, timeout=1.0)
+    if not isinstance(value, dict) or value.get("running") is not True:
+        raise HubQError("HUBq returned an invalid mobile heartbeat response")
+    return value
+
+
 def emergency_stop(process: JobProcess, stop_signal: int, timeout: float) -> bool:
     """Safety escape hatch when HUBq is unreachable; never gate a stop on the scheduler."""
     try:

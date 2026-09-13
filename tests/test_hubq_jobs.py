@@ -52,6 +52,66 @@ def test_five_deployed_kinds_declare_commands_devices_and_motion() -> None:
     )
 
 
+def test_mobile_lease_is_not_renewed_by_console_and_cannot_be_revived(tmp_path, monkeypatch):
+    import hubq.jobs as job_module
+
+    monkeypatch.setattr(job_module, "MOBILE_TELEOP_TIMEOUT", 0.15)
+    monkeypatch.setenv(LOCK_DIR_ENV, str(tmp_path / "locks"))
+    kinds = tmp_path / "kinds"
+    _kind(kinds, ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.02; done"], limit_seconds=3600)
+    registry = JobRegistry(tmp_path / "state", kinds)
+    session = "a" * 32
+    job = registry.start(kind="teleop", owner="physical-leader-teleop",
+                         devices={"leader": str(tmp_path / "leader"), "follower": str(tmp_path / "follower")},
+                         env={}, metadata={"mobile_session": session}, confirmed=True)
+    try:
+        assert job["limit_seconds"] == 0.15
+        assert registry.heartbeat() == 0
+        with pytest.raises(JobConflict):
+            registry.mobile_heartbeat(job["id"], "b" * 32)
+        time.sleep(0.03)
+        renewed = registry.mobile_heartbeat(job["id"], session)
+        assert renewed["expires_at"] > job["lease_expires_at"]
+        recovered = JobRegistry(tmp_path / "state", kinds)
+        assert recovered.heartbeat() == 0
+        assert recovered.describe(job["id"])["lease_expires_at"] == renewed["expires_at"]
+        time.sleep(0.17)
+        with pytest.raises(JobConflict):
+            recovered.mobile_heartbeat(job["id"], session)
+        assert recovered.expire_due() == [job["id"]]
+        assert recovered.describe(job["id"])["state"] != "running"
+    finally:
+        registry.stop(job["id"])
+
+
+def test_mobile_worker_stops_without_any_daemon_expiry_pass(tmp_path, monkeypatch):
+    import sys
+    import hubq.jobs as job_module
+
+    monkeypatch.setattr(job_module, "MOBILE_TELEOP_TIMEOUT", 0.6)
+    monkeypatch.setenv(LOCK_DIR_ENV, str(tmp_path / "locks"))
+    kinds = tmp_path / "kinds"
+    marker = tmp_path / "graceful-stop"
+    command = ("import time\nfrom pathlib import Path\n"
+               "from soarm_console.mobile_watchdog import mobile_watchdog\n"
+               "try:\n with mobile_watchdog():\n  while True: time.sleep(0.01)\n"
+               f"except KeyboardInterrupt:\n Path({str(marker)!r}).touch()\n")
+    _kind(kinds, [sys.executable, "-c", command], limit_seconds=3600)
+    registry = JobRegistry(tmp_path / "state", kinds)
+    job = registry.start(kind="teleop", owner="physical-leader-teleop",
+                         devices={"leader": str(tmp_path / "leader"), "follower": str(tmp_path / "follower")},
+                         env={}, metadata={"mobile_session": "a" * 32}, confirmed=True)
+    try:
+        # Neither console heartbeat nor HUBq expire_due is called here.
+        deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert marker.exists()
+        assert hubq_client.JobProcess(registry.describe(job["id"])).metadata["mobile_session"] == "a" * 32
+    finally:
+        registry.stop(job["id"])
+
+
 def test_expired_job_gets_its_graceful_signal(tmp_path: Path, monkeypatch) -> None:
     kinds = tmp_path / "kinds"
     marker = tmp_path / "stopped"

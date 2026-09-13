@@ -67,6 +67,10 @@ class StopRequest(BaseModel):
     timeout: float | None = Field(default=None, gt=0, le=120)
 
 
+class MobileHeartbeatRequest(BaseModel):
+    session: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class RegistrationRequest(BaseModel):
     owner: str
     devices: list[str] = Field(min_length=1, max_length=16)
@@ -136,6 +140,16 @@ def heartbeat() -> dict[str, int]:
 def stop_job(job_id: str, body: StopRequest | None = None) -> dict[str, object]:
     try:
         return jobs.stop(job_id, timeout=body.timeout if body is not None else None)
+    except JobError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/jobs/{job_id}/mobile-heartbeat")
+def mobile_heartbeat(job_id: str, body: MobileHeartbeatRequest) -> dict[str, object]:
+    try:
+        return jobs.mobile_heartbeat(job_id, body.session)
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except JobError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -61,6 +61,18 @@ jobs by kind and restores manager metadata from HUBq. Stop calls go through HUBq
 process-group signal only as the safety escape hatch when HUBq cannot be reached; stopping an arm
 must never be gated on scheduler availability.
 
+Mobile physical teleoperation is an explicit exception to console-owned liveness. Its teleop job
+metadata contains a random `mobile_session`; HUBq assigns a fixed 5-second lease. The console's
+global `/heartbeat` skips these jobs. Only `/jobs/{id}/mobile-heartbeat` with the matching session
+renews an unexpired live job; late heartbeats never resurrect expired sessions. Phone lock,
+backgrounding, and page exit send a session-specific stop, and reconnect requires a new check.
+The worker receives `SOARM_MOBILE_JOB_RECORD`, the path to HUBq's atomically replaced durable job
+record, and independently checks `lease_expires_at` every 200ms. Missing/corrupt/expired records
+cause SIGINT through the existing disconnect path (follower torque retained), even if both console
+and HUBq have died. Concurrent SIGINTs are ignored during cleanup. Reconciliation preserves the
+deadline and cannot give an abandoned phone a fresh grace period. Existing desktop/Mac job
+liveness, lock directory, loop, and motion limits are unchanged.
+
 There is still no automatic motion queue in this stage. Every motion kind also requires the console
 to set the per-start `confirmed` gate after its existing human confirmation, so no arm-moving kind
 can start from a queue without that fresh confirmation. Adding a queue later must preserve that rule

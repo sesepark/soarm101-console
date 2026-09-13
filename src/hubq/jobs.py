@@ -17,6 +17,7 @@ from soarm_console.owner_lock import DeviceLockError, DeviceLockSet
 
 PROJECT_ROOT = Path(__file__).parents[2]
 KINDS_DIR = Path(__file__).with_name("kinds")
+MOBILE_TELEOP_TIMEOUT = 5.0
 
 
 class JobError(RuntimeError):
@@ -185,6 +186,14 @@ class JobRegistry:
         confirmed: bool = False,
     ) -> dict[str, Any]:
         spec = self._spec(kind)
+        mobile_session = metadata.get("mobile_session")
+        if mobile_session is not None and (
+            kind != "teleop" or not isinstance(mobile_session, str)
+            or len(mobile_session) != 32
+            or any(char not in "0123456789abcdef" for char in mobile_session)
+        ):
+            raise JobError("Invalid mobile teleoperation session")
+        limit_seconds = MOBILE_TELEOP_TIMEOUT if mobile_session else spec.limit_seconds
         if spec.motion and not confirmed:
             raise JobError("Motion confirmation is required")
         if owner not in spec.owners:
@@ -211,6 +220,11 @@ class JobRegistry:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             child_env = os.environ.copy()
             child_env.update(env)
+            # A mobile worker independently watches the same atomic durable lease,
+            # so losing BOTH daemons cannot leave it driving an orphaned arm.
+            child_env.pop("SOARM_MOBILE_JOB_RECORD", None)
+            if mobile_session:
+                child_env["SOARM_MOBILE_JOB_RECORD"] = str(self.jobs_dir / f"{job_id}.json")
             child_env["SOARM_OWNER_LOCK_FDS"] = owner_locks.inherited_spec
             child_env.setdefault("PYTHONPATH", str(PROJECT_ROOT / "src"))
             command = [str(PROJECT_ROOT / part) if index == 0 and "/" in part and not Path(part).is_absolute() else part for index, part in enumerate(spec.command)]
@@ -231,9 +245,9 @@ class JobRegistry:
                 "return_code": None,
                 "log_path": str(log_path),
                 "reconciled": False,
-                "limit_seconds": spec.limit_seconds,
+                "limit_seconds": limit_seconds,
                 "lease_expires_at": (
-                    time.time() + spec.limit_seconds if spec.limit_seconds is not None else None
+                    time.time() + limit_seconds if limit_seconds is not None else None
                 ),
                 "expiry_stop_requested_at": None,
                 "sidecars": [],
@@ -339,6 +353,8 @@ class JobRegistry:
         with self._lock:
             self._refresh_all()
             for record in self._records.values():
+                if record.get("metadata", {}).get("mobile_session"):
+                    continue  # The console must never renew a disconnected phone's job.
                 if record["state"] != "running" or record.get("expiry_stop_requested_at") is not None:
                     continue
                 spec = self.kinds.get(str(record.get("kind")))
@@ -349,6 +365,23 @@ class JobRegistry:
                 self._write(record)
                 renewed += 1
         return renewed
+
+    def mobile_heartbeat(self, job_id: str, session: str) -> dict[str, Any]:
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobError("Unknown mobile teleoperation job")
+            self._refresh(record)
+            now = time.time()
+            if (record["kind"] != "teleop"
+                or record.get("metadata", {}).get("mobile_session") != session
+                or record["state"] != "running"
+                or record.get("expiry_stop_requested_at") is not None
+                or record.get("lease_expires_at", 0) <= now):
+                raise JobConflict("Mobile teleoperation session has ended; start again with fresh confirmation")
+            record["lease_expires_at"] = now + MOBILE_TELEOP_TIMEOUT
+            self._write(record)
+            return {"running": True, "expires_at": record["lease_expires_at"]}
 
     def expire_due(self) -> list[str]:
         """Request the configured graceful stop for abandoned, expired jobs."""

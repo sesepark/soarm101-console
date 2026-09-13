@@ -41,7 +41,7 @@ class TeleopManager:
                 problems.append(problem)
         return problems
 
-    def start(self) -> None:
+    def start(self, mobile_session: str | None = None) -> None:
         with self._lock:
             if self.running:
                 raise TeleopError("Teleoperation is already running")
@@ -58,17 +58,28 @@ class TeleopManager:
                         "follower": self.settings.follower_port,
                     },
                     {},
-                    {},
+                    {"mobile_session": mobile_session} if mobile_session else {},
                     True,
                 )
             except hubq_client.HubQError as exc:
                 raise TeleopError(str(exc)) from exc
 
-    def stop(self, timeout: float = 8.0) -> None:
+    def mobile_heartbeat(self, session: str) -> dict[str, object]:
+        if not self.running or self._process is None or self._process.metadata.get("mobile_session") != session:
+            raise TeleopError("Mobile teleoperation session has ended; start again with fresh confirmation")
+        try:
+            return hubq_client.mobile_heartbeat(self._process, session)
+        except hubq_client.HubQError as exc:
+            raise TeleopError(str(exc)) from exc
+
+    def stop(self, timeout: float = 8.0, mobile_session: str | None = None) -> None:
         with self._lock:
+            self.running  # Recover a surviving HUBq job after console restart.
             process = self._process
             if process is None or process.poll() is not None:
                 return
+            if mobile_session and process.metadata.get("mobile_session") != mobile_session:
+                raise TeleopError("Mobile teleoperation session does not match")
         try:
             result = hubq_client.stop_job(process, timeout)
         except hubq_client.HubQError as exc:

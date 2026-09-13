@@ -176,7 +176,7 @@ def test_each_console_exclusion_route_has_one_claim_and_no_running_matrix() -> N
         "configure_camera",
         "doctor",
         "release_torque",
-        "start_teleoperation",
+        "_start_teleoperation",
         "start_recording",
         "delete_dataset",
         "delete_dataset_episode",
@@ -186,6 +186,13 @@ def test_each_console_exclusion_route_has_one_claim_and_no_running_matrix() -> N
         "start_intrinsics",
         "start_extrinsics",
     }
+
+    # Desktop and phone share one preflight/claim path; neither wrapper bypasses it.
+    for name in ("start_teleoperation", "start_mobile_teleoperation"):
+        calls = [call for call in ast.walk(functions[name])
+                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                 and call.func.id == "_start_teleoperation"]
+        assert len(calls) == 1, name
 
     for name in guarded:
         node = functions[name]

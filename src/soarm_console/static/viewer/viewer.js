@@ -1410,10 +1410,44 @@ document.addEventListener('visibilitychange', () => {
 let physicalReady = false;
 let physicalPending = false;
 let physicalRefreshing = false;
+let physicalSession = null;
+let physicalHeartbeatPending = false;
+
+function stopPhoneSession(keepalive = false) {
+  const session = physicalSession;
+  physicalSession = null;
+  if (!session) return;
+  // pagehide requests are best-effort; the durable 5s worker/HUBq lease is
+  // authoritative even if the browser is killed before this reaches the server.
+  fetch('/api/teleoperation/mobile/stop', {
+    method: 'POST', keepalive,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session }),
+  }).catch(() => {});
+}
+window.addEventListener('pagehide', () => stopPhoneSession(true));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopPhoneSession(true);
+});
+setInterval(async () => {
+  if (!physicalSession || document.hidden || physicalHeartbeatPending) return;
+  physicalHeartbeatPending = true;
+  try {
+    await post('/api/teleoperation/mobile/heartbeat', { session: physicalSession });
+  } catch (error) {
+    // During doctor/start there may not yet be a job; never restore a session
+    // automatically after an already-running job has ended.
+    if (!physicalPending) {
+      el('physical-error').textContent = korean(error.message);
+      stopPhoneSession();
+    }
+  } finally {
+    physicalHeartbeatPending = false;
+  }
+}, 1000);
 function paintPhysicalStart() {
   el('physical-start').disabled = physicalPending || !physicalReady
     || !el('physical-confirm').checked
-    || el('physical-phrase').value !== 'START SOARM101'
     || !el('token').value.trim();
 }
 async function refreshPhysicalTeleop() {
@@ -1424,6 +1458,7 @@ async function refreshPhysicalTeleop() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const state = await response.json();
     const running = state.teleoperation.running;
+    if (!running && !physicalPending) physicalSession = null;
     const virtual = state.virtual_leader;
     const busy = state.recording.running || state.replay.running || state.policy.running
       || Boolean(virtual?.lease) || Boolean(virtual?.torque_enabled)
@@ -1442,21 +1477,31 @@ async function refreshPhysicalTeleop() {
     paintPhysicalStart();
   }
 }
-for (const id of ['physical-confirm', 'physical-phrase', 'token']) {
+for (const id of ['physical-confirm', 'token']) {
   el(id).addEventListener('input', paintPhysicalStart);
 }
 el('physical-start').addEventListener('click', async () => {
   if (el('physical-start').disabled) return;
   physicalPending = true;
+  physicalSession = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+    (value) => value.toString(16).padStart(2, '0')).join('');
+  const startingSession = physicalSession;
   paintPhysicalStart();
   el('physical-error').textContent = '';
   try {
-    await post('/api/teleoperation/start', { confirmation: el('physical-phrase').value });
+    await post('/api/teleoperation/mobile/start', {
+      confirmation: 'START SOARM101', session: startingSession,
+    });
+    // A phone can lock while the server is still running preflight/alignment.
+    // Stop this exact session again once start returns; do not resume heartbeats.
+    if (document.hidden || physicalSession !== startingSession) {
+      await post('/api/teleoperation/mobile/stop', { session: startingSession });
+    }
   } catch (error) {
+    stopPhoneSession();
     el('physical-error').textContent = korean(error.message);
   } finally {
     el('physical-confirm').checked = false;
-    el('physical-phrase').value = '';
     physicalPending = false;
     await refreshPhysicalTeleop();
   }
@@ -1464,6 +1509,7 @@ el('physical-start').addEventListener('click', async () => {
 el('physical-stop').addEventListener('click', async () => {
   // Stop stays available even with stale status or a pending start.
   try {
+    physicalSession = null;
     await post('/api/teleoperation/stop');
     el('physical-error').textContent = '';
   } catch (error) {

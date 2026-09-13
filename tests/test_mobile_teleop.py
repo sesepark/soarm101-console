@@ -28,6 +28,12 @@ def test_mobile_physical_teleop_uses_existing_owner_and_stop_contracts():
     assert "Boolean(virtual?.lease)" in js
     assert "repeat(5, 1fr)" in css
     assert "body.host-native #teleop-pane { display: none !important; }" in css
+    assert '<details class="physical-details"><summary>실행 로그</summary>' in html
+    assert 'id="physical-diagnostics"' in html
+    assert 'id="physical-token-link"' in html
+    assert 'body.tab-teleop .camera-chips { display: none !important; }' in css
+    assert 'grid-template-columns: minmax(0, 1fr) 88px' in css
+    assert "el('physical-token-link').hidden = Boolean(el('token').value.trim())" in js
 
 
 @pytest.mark.parametrize("record,expected", [

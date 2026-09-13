@@ -1446,6 +1446,8 @@ setInterval(async () => {
   }
 }, 1000);
 function paintPhysicalStart() {
+  el('physical-token-link').hidden = Boolean(el('token').value.trim());
+  el('physical-start').textContent = physicalPending ? '시작 중…' : '텔레옵 시작';
   el('physical-start').disabled = physicalPending || !physicalReady
     || !el('physical-confirm').checked
     || !el('token').value.trim();
@@ -1464,14 +1466,19 @@ async function refreshPhysicalTeleop() {
       || Boolean(virtual?.lease) || Boolean(virtual?.torque_enabled)
       || Boolean(state.calibration?.extrinsics?.running);
     physicalReady = !running && !busy && state.teleop_preflight.length === 0;
-    el('physical-state').textContent = running ? '물리 텔레옵 실행 중'
-      : busy ? '다른 모드 또는 가상 리더가 점유 중 — 기존 모드에서 반납하세요'
-      : physicalReady ? '시작 준비 완료 · 서버에서 장치 점유와 진단을 다시 검사합니다' : '시작 조건을 확인하세요';
-    el('physical-checks').textContent = state.teleop_preflight.map(korean).join('\n');
-    el('physical-logs').textContent = (state.teleoperation.logs || []).join('\n');
+    el('physical-state').textContent = running ? '실행 중' : busy ? '점유 중' : physicalReady ? '준비 완료' : '준비 필요';
+    el('physical-state').dataset.state = running ? 'running' : physicalReady ? 'ready' : 'blocked';
+    const checks = state.teleop_preflight.map(korean);
+    if (busy) checks.unshift('다른 모드에서 팔 점유를 먼저 반납하세요.');
+    el('physical-diagnostics').hidden = checks.length === 0;
+    el('physical-checks').textContent = checks.join('\n');
+    el('physical-logs').textContent = (state.teleoperation.logs || []).join('\n') || '로그 없음';
   } catch (error) {
     physicalReady = false;
-    el('physical-state').textContent = `서버 상태 확인 실패: ${error.message}`;
+    el('physical-state').textContent = '연결 끊김';
+    el('physical-state').dataset.state = 'offline';
+    el('physical-diagnostics').hidden = false;
+    el('physical-checks').textContent = `서버 연결을 확인하세요. ${error.message}`;
   } finally {
     physicalRefreshing = false;
     paintPhysicalStart();
@@ -1480,6 +1487,10 @@ async function refreshPhysicalTeleop() {
 for (const id of ['physical-confirm', 'token']) {
   el(id).addEventListener('input', paintPhysicalStart);
 }
+el('physical-token-link').addEventListener('click', () => {
+  setTab('lease');
+  el('token').focus();
+});
 el('physical-start').addEventListener('click', async () => {
   if (el('physical-start').disabled) return;
   physicalPending = true;

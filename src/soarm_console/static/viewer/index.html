@@ -115,18 +115,20 @@
     </section>
 
     <section id="teleop-pane" aria-label="물리 리더 텔레오퍼레이션">
-      <h2>리더 → 팔로워</h2>
-      <p>휴대폰은 실행·정지를 맡고, 실제 리더 팔을 움직이면 팔로워가 따라갑니다. 두 팔은 허브 서버에 연결되어 있어야 합니다.</p>
-      <p id="physical-state" role="status">상태 확인 중</p>
-      <pre id="physical-checks"></pre>
-      <p>맥북·가상 리더·수집·정책이 팔을 점유하면 시작할 수 없습니다. 기존 화면에서 권한과 모드를 먼저 반납하세요. 자동으로 빼앗지 않습니다.</p>
-      <label class="ack"><input id="physical-confirm" type="checkbox"><span>현장에서 두 팔의 초기 자세, 사람·장애물·케이블과 물리 전원 차단 위치를 확인했습니다.</span></label>
-      <p>조작 토큰은 아래 권한 탭에서 입력하세요. 권한 받기 버튼은 누르지 않아도 됩니다.</p>
-      <button id="physical-start" class="primary" type="button" disabled>물리 텔레옵 시작</button>
-      <button id="physical-stop" class="stop" type="button">물리 텔레옵 정지</button>
-      <p>휴대폰 화면 잠금·앱 전환·페이지 종료 시 텔레옵을 정지합니다. 연결이 끊겨 종료 요청이 도달하지 않아도 마지막 heartbeat 후 5초 만료 시 종료를 요청합니다. 이 화면의 탭 이동은 실행을 유지합니다. 정지는 토크 해제가 아니며 팔은 마지막 자세를 유지합니다. 재접속해도 자동 재시작하지 않습니다.</p>
-      <p id="physical-error" role="alert"></p>
-      <pre id="physical-logs"></pre>
+      <div class="physical-shell">
+        <header class="physical-heading"><div><small>PHYSICAL TELEOP</small><h2>리더 · 팔로워</h2></div><span class="physical-badge" id="physical-state" role="status" data-state="checking">확인 중</span></header>
+        <article class="physical-card">
+          <div class="physical-route" aria-label="리더에서 팔로워로"><span><small>LEADER</small><strong>리더</strong></span><svg viewBox="0 0 40 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 12h30m-8-8 8 8-8 8"/></svg><span><small>FOLLOWER</small><strong>팔로워</strong></span></div>
+          <p class="physical-caption">리더 팔을 움직이면 팔로워가 따라갑니다</p>
+          <label class="ack physical-ack"><input id="physical-confirm" type="checkbox"><span>초기 자세 · 작업영역 · 전원 차단 확인</span></label>
+          <button id="physical-token-link" class="ghost" type="button" hidden>조작 토큰 입력 <span aria-hidden="true">→</span></button>
+          <div class="physical-actions"><button id="physical-start" class="primary" type="button" disabled>텔레옵 시작</button><button id="physical-stop" class="stop" type="button">정지</button></div>
+          <p id="physical-error" role="alert"></p>
+          <p class="physical-footnote">폰 잠금 시 자동 정지 · 연결 유실 시 5초 만료<br>정지해도 팔의 토크는 유지됩니다</p>
+        </article>
+        <details id="physical-diagnostics" class="physical-details" hidden><summary>시작 조건 확인</summary><pre id="physical-checks"></pre></details>
+        <details class="physical-details"><summary>실행 로그</summary><pre id="physical-logs">로그 없음</pre></details>
+      </div>
     </section>
     <!-- 상태. `상태` 탭에서만 무대를 쓴다. -->
     <section id="status-pane">
@@ -201,7 +203,7 @@
 
   <!-- ─────────────────────────────── 아래 탭. 엄지가 닿는 자리. -->
   <nav id="tabs" role="tablist">
-    <button class="tab" type="button" data-tab="teleop"><span aria-hidden="true">↔</span>텔레옵</button>
+    <button class="tab" type="button" data-tab="teleop"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h17m-4-4 4 4-4 4M21 17H4m4-4-4 4 4 4"/></svg></span>텔레옵</button>
     <button class="tab on" type="button" data-tab="drive"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5v19M2.5 12h19"/><path d="M9.6 5.1L12 2.7l2.4 2.4M9.6 18.9L12 21.3l2.4-2.4M5.1 9.6L2.7 12l2.4 2.4M18.9 9.6L21.3 12l-2.4 2.4"/></svg></span>조작</button>
     <button class="tab" type="button" data-tab="camera"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="19" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.6"/><path d="M8.5 6l1.4-2.2h4.2L15.5 6"/></svg></span>카메라</button>
     <button class="tab" type="button" data-tab="status"><span><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18a8.5 8.5 0 1 1 16 0"/><path d="M12 18l4.2-4.6"/><circle cx="12" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg></span>상태</button>

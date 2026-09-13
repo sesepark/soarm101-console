@@ -479,12 +479,37 @@ input[type=range]:disabled::-moz-range-thumb { background: #243e78; }
 
 #teleop-pane { display: none; }
 body.tab-teleop #stage { grid-template-rows: minmax(0, 1fr); grid-column: 1 / -1; }
-body.tab-teleop #teleop-pane { display: block; overflow-y: auto; padding: 20px max(16px, var(--safe-r)) 20px max(16px, var(--safe-l)); }
+body.tab-teleop #teleop-pane { display: block; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 20px max(16px, var(--safe-r)) 16px max(16px, var(--safe-l)); }
 body.tab-teleop #camera-pane, body.tab-teleop #view-pane,
-body.tab-teleop #status-pane, body.tab-teleop #panel { display: none !important; }
-#teleop-pane pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
-#teleop-pane button { min-height: 48px; margin: 8px 0; width: 100%; }
-#physical-error { color: #ffb4a9; }
+body.tab-teleop #status-pane, body.tab-teleop #panel,
+body.tab-teleop .camera-chips { display: none !important; }
+.physical-shell { width: 100%; max-width: 480px; margin: 0 auto; display: grid; gap: 12px; }
+.physical-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.physical-heading small { font-size: 10px; letter-spacing: .12em; color: var(--muted); }
+.physical-heading h2 { font-size: 22px; margin: 4px 0 0; letter-spacing: -.04em; }
+.physical-badge { flex-shrink: 0; border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; font-size: 11px; color: var(--muted); }
+.physical-badge[data-state="ready"] { color: var(--green); border-color: rgba(67,214,149,.4); }
+.physical-badge[data-state="running"] { color: var(--ink); background: var(--blue); border-color: var(--blue); }
+.physical-badge[data-state="blocked"], .physical-badge[data-state="offline"] { color: var(--amber); }
+.physical-card { padding: 20px 16px 14px; border: 1px solid var(--line); border-radius: 20px; background: var(--panel); }
+.physical-route { display: flex; align-items: center; justify-content: center; gap: 28px; padding: 10px 0 6px; }
+.physical-route span { display: grid; gap: 5px; text-align: center; }
+.physical-route small { font-size: 10px; letter-spacing: .1em; color: var(--muted); }
+.physical-route strong { font-size: 25px; letter-spacing: -.03em; }
+.physical-route svg { width: 40px; height: 24px; color: var(--muted); }
+.physical-caption { text-align: center; font-size: 11px; color: var(--muted); margin: 10px 0 22px; }
+#teleop-pane .physical-ack { padding: 13px 10px; margin: 0 0 12px; border: 1px solid var(--line); border-radius: 12px; font-size: 12px; min-height: 48px; }
+.physical-actions { display: grid; grid-template-columns: minmax(0, 1fr) 88px; gap: 8px; }
+#teleop-pane button { min-height: 52px; width: 100%; border-radius: 12px; font-weight: 700; }
+#teleop-pane button:disabled { opacity: .4; }
+#physical-token-link { margin-bottom: 10px; min-height: 44px !important; text-align: left; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+.physical-footnote { font-size: 10.5px; line-height: 1.65; color: var(--muted); text-align: center; margin: 14px 0 0; }
+.physical-details { border: 1px solid var(--line); border-radius: 12px; padding: 0 12px; color: var(--muted); font-size: 12px; }
+.physical-details summary { cursor: pointer; padding: 13px 0; min-height: 44px; }
+#teleop-pane pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.6; margin: 0 0 12px; max-height: 180px; overflow-y: auto; user-select: text; }
+#physical-error { color: #ffb4a9; font-size: 12px; line-height: 1.5; margin: 12px 0 0; overflow-wrap: anywhere; }
+#physical-error:empty { display: none; }
+@media (max-height: 500px) { .physical-route { padding: 0; } .physical-caption { margin-bottom: 12px; } body.tab-teleop #teleop-pane { padding-top: 12px; } }
 body.host-native #teleop-pane { display: none !important; }
 
 #tabs {

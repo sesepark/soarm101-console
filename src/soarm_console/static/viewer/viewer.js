@@ -1180,6 +1180,7 @@ function paintGeometry() {
 // ---------------------------------------------------------------- 탭과 모드
 
 function setTab(next) {
+  releaseGrip();
   tab = next;
   document.body.className = document.body.className
     .replace(/\btab-\w+\b/g, '')
@@ -1190,6 +1191,7 @@ function setTab(next) {
   const sheetOpen = next === 'lease';
   el('sheet').hidden = !sheetOpen;
   el('sheet-scrim').hidden = !sheetOpen;
+  if (next === 'teleop') refreshPhysicalTeleop();
   requestAnimationFrame(resize);
 }
 
@@ -1339,7 +1341,13 @@ el('take').addEventListener('click', async () => {
 });
 
 el('give-back').addEventListener('click', () => giveBack());
-el('hold').addEventListener('click', holdNow);
+el('hold').addEventListener('click', () => {
+  holdNow();
+  // The virtual-leader hold alone cannot stop a HUBq physical leader job.
+  if (HOST !== 'native') {
+    post('/api/mode/stop').catch((error) => showReject({ message: korean(error.message) }));
+  }
+});
 el('banner-resume').addEventListener('click', async () => {
   // 멈춘 것을 푸는 것도 **조작**이라 토큰이 필요하다. 없으면 서버는 401로 답하고,
   // 그 답은 배너에 잠깐 떴다가 텔레메트리에 덮여 사라졌다 — 누른 사람에게는 버튼이
@@ -1396,6 +1404,76 @@ document.addEventListener('visibilitychange', () => {
   releaseGrip();
   giveBack();
 });
+
+// Physical teleoperation uses the existing HUBq claim/start contract, never a
+// second serial owner or an automatic takeover of the Mac's virtual lease.
+let physicalReady = false;
+let physicalPending = false;
+let physicalRefreshing = false;
+function paintPhysicalStart() {
+  el('physical-start').disabled = physicalPending || !physicalReady
+    || !el('physical-confirm').checked
+    || el('physical-phrase').value !== 'START SOARM101'
+    || !el('token').value.trim();
+}
+async function refreshPhysicalTeleop() {
+  if (physicalRefreshing) return;
+  physicalRefreshing = true;
+  try {
+    const response = await fetch('/api/status', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const state = await response.json();
+    const running = state.teleoperation.running;
+    const virtual = state.virtual_leader;
+    const busy = state.recording.running || state.replay.running || state.policy.running
+      || Boolean(virtual?.lease) || Boolean(virtual?.torque_enabled)
+      || Boolean(state.calibration?.extrinsics?.running);
+    physicalReady = !running && !busy && state.teleop_preflight.length === 0;
+    el('physical-state').textContent = running ? '물리 텔레옵 실행 중'
+      : busy ? '다른 모드 또는 가상 리더가 점유 중 — 기존 모드에서 반납하세요'
+      : physicalReady ? '시작 준비 완료 · 서버에서 장치 점유와 진단을 다시 검사합니다' : '시작 조건을 확인하세요';
+    el('physical-checks').textContent = state.teleop_preflight.map(korean).join('\n');
+    el('physical-logs').textContent = (state.teleoperation.logs || []).join('\n');
+  } catch (error) {
+    physicalReady = false;
+    el('physical-state').textContent = `서버 상태 확인 실패: ${error.message}`;
+  } finally {
+    physicalRefreshing = false;
+    paintPhysicalStart();
+  }
+}
+for (const id of ['physical-confirm', 'physical-phrase', 'token']) {
+  el(id).addEventListener('input', paintPhysicalStart);
+}
+el('physical-start').addEventListener('click', async () => {
+  if (el('physical-start').disabled) return;
+  physicalPending = true;
+  paintPhysicalStart();
+  el('physical-error').textContent = '';
+  try {
+    await post('/api/teleoperation/start', { confirmation: el('physical-phrase').value });
+  } catch (error) {
+    el('physical-error').textContent = korean(error.message);
+  } finally {
+    el('physical-confirm').checked = false;
+    el('physical-phrase').value = '';
+    physicalPending = false;
+    await refreshPhysicalTeleop();
+  }
+});
+el('physical-stop').addEventListener('click', async () => {
+  // Stop stays available even with stale status or a pending start.
+  try {
+    await post('/api/teleoperation/stop');
+    el('physical-error').textContent = '';
+  } catch (error) {
+    el('physical-error').textContent = korean(error.message);
+  }
+  await refreshPhysicalTeleop();
+});
+setInterval(() => {
+  if (tab === 'teleop' && !document.hidden) refreshPhysicalTeleop();
+}, 2000);
 
 // ---------------------------------------------------------------- 조작감
 

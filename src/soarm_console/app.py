@@ -31,6 +31,7 @@ from .datasets import (
 )
 from .diagnostics import doctor_failure, run_hardware_doctor
 from . import hubq_client
+from .machine import machine_status
 from .models import (
     ModelNotFound,
     build_manifest,
@@ -396,6 +397,7 @@ def service_worker() -> FileResponse:
 @app.get("/api/status")
 def status() -> dict[str, object]:
     return {
+        "machine": machine_status(),
         "motion_enabled": settings.motion_enabled,
         "camera_roles_confirmed": settings.camera_roles_confirmed,
         "max_relative_target": settings.max_relative_target,

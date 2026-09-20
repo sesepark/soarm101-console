@@ -25,6 +25,19 @@ def test_status_is_observation_only_and_exposes_all_subsystems():
     assert "recording" in payload
     assert "policy" in payload
     assert "doctor" in payload
+    assert "machine" in payload
+
+
+def test_status_exposes_hub_gpu_without_importing_torch(monkeypatch):
+    from soarm_console import app
+
+    expected = {
+        "host": "hub",
+        "gpu": {"name": "GTX 1660", "utilization_percent": 41},
+    }
+    monkeypatch.setattr(app, "machine_status", lambda: expected)
+
+    assert status()["machine"] == expected
 
 
 def test_status_exposes_virtual_recording_preflight_without_replacing_the_legacy_field(

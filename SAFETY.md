@@ -84,8 +84,12 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 시작 전에 관절별 거리를 읽는 미리보기, 그리고 **옆에 있는 사람**이 그 자리를 대신한다. 실물 확인은 사람이 옆에 있을 때
 `speed=0.25`로 한 에피소드를 끝까지 돌려 보고 중간에 stop이 듣는지 본 뒤에 한다.
 
-**정책 경로(2026-09-06)**: 학습 정책은 사람이 만든 궤적이 아니라 처음 보는 action을 내므로
-재생보다 좁은 별도 상한 `SOARM_POLICY_MAX_RELATIVE_TARGET`(기본 틱당 3.0°)을 쓴다. 시작은
+**정책 경로(2026-09-06, 2026-09-20 갱신)**: 정책의 스텝당 상대 이동 상한은 쓰지 않는다.
+학습 데이터가 그 상한 없이 수집됐는데 실행 때 목표를 `현재 위치 ± N°`로 자르면 정책이 낸
+궤적을 바꾸고, 팔이 뒤처질수록 매 틱 다시 잘리는 자기유지 평형이 생긴다. 실제 12° 설정은
+제어 틱의 17~23%를 잘랐고 대부분 여러 틱 연속이었다. `SO101FollowerConfig`에는
+`max_relative_target=None`을 넘긴다. 보정의 절대 관절 범위, 서보 속도 제한, 시작 정렬,
+실행 시한과 사람의 정지는 그대로다. 시작은
 모션 토큰, `SOARM_ENABLE_MOTION=1`, follower calibration/port, 확정된 카메라 역할, runnable
 모델과 단일 모드 검사를 모두 지나야 한다. follower와 scene/wrist 카메라는 한 owner lock으로
 잡는다. 실행은 새 루프가 아니라 `lerobot-rollout`의 base strategy와 RTC inference이고,
@@ -93,7 +97,7 @@ SIGINT가 오면 그 자리에서 서고 토크는 유지한다.
 `camera_map`을 뒤집은 `rename_map`으로 학습 때와 같은 image feature 이름을 만든다.
 
 중지는 서브프로세스에 SIGTERM을 보내 LeRobot의 `ProcessSignalHandler`와 teardown을 지나게
-한다. LeRobot의 시간제 복귀는 틱당 상대 목표 상한에 잘린 채 끝날 수 있으므로
+한다. LeRobot의 시간제 복귀 대신
 `return_to_initial_position=false`로 끄고, 콘솔이 teardown 뒤 재생과 같은 느린
 s-curve(첨두 20°/s)로 직접 복귀한다. 정책 요청에 `home`이 있으면 시작 전에 그 자세로 정렬하고
 끝에도 같은 자세로 돌아간다. `home`이 없으면 rollout 직전에 읽은 관절값을 복귀 목표로 쓴다.

@@ -195,11 +195,6 @@ class PolicyManager:
             problems.append("SOARM_ENABLE_MOTION=1 is not set")
         if not self.settings.camera_roles_confirmed:
             problems.append("SOARM_CAMERA_ROLES_CONFIRMED=1 is not set")
-        if (
-            not math.isfinite(self.settings.policy_max_relative_target)
-            or self.settings.policy_max_relative_target <= 0
-        ):
-            problems.append("SOARM_POLICY_MAX_RELATIVE_TARGET must be a positive finite number")
         error = validate_calibration(self.settings.follower_calibration)
         if error:
             problems.append(f"Invalid follower calibration: {error}")
@@ -485,7 +480,6 @@ class PolicyManager:
             "camera_map": dict(self._camera_map),
             "home": dict(self._home),
             "phase": self._phase,
-            "max_relative_target": self.settings.policy_max_relative_target,
             "inference": self._inference,
             # 지난번에 이 체크포인트를 올리는 데 걸린 초, 그리고 이번에 실제로 걸린 초.
             # 화면은 앞의 것으로 기다리는 사람에게 얼마나 남았는지 말한다.

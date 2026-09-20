@@ -325,9 +325,9 @@ def _prune_trace_archives() -> None:
 def _start_motion_trace() -> _MotionTrace:
     """팔이 매 틱 어디를 명령받았고 실제로 어디에 있었는지 남긴다.
 
-    `so_follower.send_action`은 `max_relative_target`이 설정돼 있으면 이미
-    `Present_Position`을 읽어 `ensure_safe_goal_position`에 `{관절: (목표, 현재)}`로
-    넘긴다. 그 자리를 감싸면 **버스를 한 번도 더 읽지 않고** 명령과 실제 위치를 함께 얻는다.
+    관측에서 이미 읽은 현재 위치를 기억했다가 바로 뒤의 `send_action`과 짝짓는다. 정책의
+    스텝당 상대 이동 상한은 꺼져 있으므로 `ensure_safe_goal_position`은 호출되지 않는다.
+    이 방식은 트레이스를 위해 시리얼을 한 번 더 읽지도 않고, 상한에 계측을 종속시키지도 않는다.
 
     이것이 없던 동안 "팔이 끊긴다"를 잴 수 있는 창은 클램프 경고뿐이었다. 그래서
     2026-09-09에 리미터를 12°에서 40°로 올려 그 경고가 사라지자, 고쳤는지 확인할 눈도
@@ -342,7 +342,8 @@ def _start_motion_trace() -> _MotionTrace:
         logger.warning("동작 기록 지점을 감싸지 못했습니다.", exc_info=True)
         return _MotionTrace(lambda _callback: None, lambda: None, lambda: None)
 
-    original = follower_module.ensure_safe_goal_position
+    original_observation = follower_module.SOFollower.get_observation
+    original_send_action = follower_module.SOFollower.send_action
     handle = None
     started = time.perf_counter()
     try:
@@ -360,6 +361,7 @@ def _start_motion_trace() -> _MotionTrace:
     on_first_rollout_action: Callable[[], None] | None = None
     rollout_started = False
     rows_since_flush = 0
+    latest_present: dict[int, dict[str, float]] = {}
 
     def arm(callback: Callable[[], None]) -> None:
         nonlocal on_first_rollout_action
@@ -372,7 +374,16 @@ def _start_motion_trace() -> _MotionTrace:
             on_first_rollout_action = None
             rollout_started = False
 
-    def traced(goal_present_pos, max_relative_target):
+    def traced_observation(robot):
+        observation = original_observation(robot)
+        latest_present[id(robot)] = {
+            key.removesuffix(".pos"): float(value)
+            for key, value in observation.items()
+            if key.endswith(".pos")
+        }
+        return observation
+
+    def traced_send_action(robot, action):
         nonlocal on_first_rollout_action, rollout_started, rows_since_flush
         callback = None
         with state_lock:
@@ -385,19 +396,28 @@ def _start_motion_trace() -> _MotionTrace:
                 callback()
             except Exception:
                 logger.warning("첫 정책 명령 상태를 기록하지 못했습니다.", exc_info=True)
+        sent = original_send_action(robot, action)
         if handle is not None:
             try:
                 nonlocal names
+                goal = {
+                    key.removesuffix(".pos"): float(value)
+                    for key, value in sent.items()
+                    if key.endswith(".pos")
+                }
+                present = latest_present.get(id(robot), {})
                 if not names:
-                    names = sorted(goal_present_pos)
+                    names = sorted(set(goal) & set(present))
+                    if not names:
+                        return sent
                     handle.write(json.dumps({"joints": names}) + "\n")
-                if set(goal_present_pos) == set(names):
+                if set(names).issubset(goal) and set(names).issubset(present):
                     handle.write(
                         json.dumps(
                             {
                                 "t": round(time.perf_counter() - started, 4),
-                                "g": [round(goal_present_pos[n][0], 3) for n in names],
-                                "p": [round(goal_present_pos[n][1], 3) for n in names],
+                                "g": [round(goal[n], 3) for n in names],
+                                "p": [round(present[n], 3) for n in names],
                                 "rollout": rollout_started,
                             }
                         )
@@ -409,12 +429,15 @@ def _start_motion_trace() -> _MotionTrace:
                         rows_since_flush = 0
             except Exception:
                 pass
-        return original(goal_present_pos, max_relative_target)
+        return sent
 
-    follower_module.ensure_safe_goal_position = traced
+    follower_module.SOFollower.get_observation = traced_observation
+    follower_module.SOFollower.send_action = traced_send_action
 
     def stop() -> None:
-        follower_module.ensure_safe_goal_position = original
+        follower_module.SOFollower.get_observation = original_observation
+        follower_module.SOFollower.send_action = original_send_action
+        latest_present.clear()
         if handle is None:
             return
         try:
@@ -450,7 +473,10 @@ def _robot_config(
         port=settings.follower_port,
         id=settings.follower_id,
         cameras=cameras,
-        max_relative_target=settings.policy_max_relative_target,
+        # 학습 데이터는 이 상한 없이 수집됐다. 여기서 목표를 현재 위치 기준으로 자르면
+        # 정책이 낸 궤적을 다른 궤적으로 바꾸고, 팔이 뒤처질수록 매 틱 다시 잘리는
+        # 자기유지 평형이 생긴다. 보정의 절대 관절 범위와 서보 속도 제한은 별개로 유지된다.
+        max_relative_target=None,
         disable_torque_on_disconnect=False,
     )
 
@@ -724,10 +750,6 @@ def main(
         raise SystemExit("Refusing policy rollout: task is required")
     if not isfinite(fps) or not isfinite(max_seconds) or fps <= 0 or max_seconds <= 0:
         raise SystemExit("Refusing policy rollout: fps and max_seconds must be positive")
-    if not isfinite(settings.policy_max_relative_target) or settings.policy_max_relative_target <= 0:
-        raise SystemExit(
-            "Refusing policy rollout: SOARM_POLICY_MAX_RELATIVE_TARGET must be positive and finite"
-        )
     try:
         decoded_home = json.loads(raw_home) if raw_home else None
         if decoded_home is not None and not isinstance(decoded_home, dict):
@@ -807,9 +829,21 @@ def main(
                             phase=phase, home=home or {}, run=run, step=step, task=task
                         )
 
-                    FailSafeRobotClient(config).run(
-                        task, stop_requested, max_seconds, on_ready=policy_is_loaded
-                    )
+                    # `on_ready` means the server loaded the weights, not that the arm has
+                    # received an action. Mark running at the first actual write, as local
+                    # rollout does, so a failed first inference remains a loading failure.
+                    if motion_trace is not None:
+                        motion_trace.arm(policy_is_loaded)
+                    try:
+                        FailSafeRobotClient(config).run(
+                            task,
+                            stop_requested,
+                            max_seconds,
+                            on_ready=(lambda: None) if motion_trace is not None else policy_is_loaded,
+                        )
+                    finally:
+                        if motion_trace is not None:
+                            motion_trace.disarm()
                 else:
                     def first_policy_action() -> None:
                         nonlocal phase

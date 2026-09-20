@@ -141,7 +141,7 @@ Hardware ownership은 command lease와 별개다.
 `running=true`이고 stop을 받으면 현재 자세에서 토크를 유지한 채 선다. 복귀 실패는 `error`에 남는다.
 허용 범위 1–600초이고 LeRobot `RolloutConfig.duration`에 그대로 들어간다. `/api/status`와
 시작·중지 응답의 `policy` 상태에는 `run`, `step`, `task`, `started_at`, `expires_at`,
-`fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `home`, `phase`, `max_relative_target`,
+`fps_target`, `fps_actual`, `chunk_seconds`, `chunks`, `camera_map`, `home`, `phase`,
 `inference`, `log_tail`, `error`가 실린다. 측정할 수 없는 성능 값은 `null`이다.
 
 Spark의 실행 목록은 sparkq `GET /api/runs`가 소유한다. 따라서 콘솔의

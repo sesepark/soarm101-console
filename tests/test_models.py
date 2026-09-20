@@ -103,7 +103,6 @@ def _settings(**overrides) -> Settings:
         "scene_camera": "/dev/scene",
         "wrist_camera": "/dev/wrist",
         "follower_port": "/dev/follower",
-        "policy_max_relative_target": 3.0,
     }
     values.update(overrides)
     return Settings(**values)
@@ -284,7 +283,7 @@ def test_checkpoint_pull_rejects_a_pretrained_model_symlink(model_root, tmp_path
     assert list(outside.iterdir()) == []
 
 
-def test_rollout_config_uses_rtc_duration_camera_rename_and_policy_limit(model_root):
+def test_rollout_config_uses_rtc_duration_camera_rename_without_a_step_limit(model_root):
     _received_model(model_root)
     models.build_manifest(_settings(), RUN, STEP)
 
@@ -294,7 +293,7 @@ def test_rollout_config_uses_rtc_duration_camera_rename_and_policy_limit(model_r
     assert config.inference.type == "rtc"
     assert config.duration == 137
     assert config.return_to_initial_position is False
-    assert config.robot.max_relative_target == 3.0
+    assert config.robot.max_relative_target is None
     assert config.rename_map == {
         "observation.images.scene": "observation.images.camera1",
         "observation.images.wrist": "observation.images.camera2",
@@ -710,9 +709,9 @@ def test_remote_policy_start_does_not_require_a_local_checkpoint(client, monkeyp
     assert started[0][1] == {"remote": True}
 
 
-def test_remote_client_uses_checkpoint_camera_names_and_the_twelve_degree_clamp():
+def test_remote_client_uses_checkpoint_camera_names_without_a_step_limit():
     config = policying.build_remote_client_config(
-        _settings(policy_max_relative_target=12.0),
+        _settings(),
         "pi05",
         "/home/operator/outputs/run/checkpoints/002000/pretrained_model",
         "Pick up block",
@@ -724,7 +723,7 @@ def test_remote_client_uses_checkpoint_camera_names_and_the_twelve_degree_clamp(
     )
 
     assert set(config.robot.cameras) == {"base_0_rgb", "left_wrist_0_rgb"}
-    assert config.robot.max_relative_target == 12.0
+    assert config.robot.max_relative_target is None
     assert config.checkpoint_rename_map["observation.images.scene"].endswith("base_0_rgb")
 
 
@@ -749,22 +748,31 @@ def test_motion_trace_fires_once_on_the_first_action_after_it_is_armed(
     monkeypatch.delenv("SOARM_REMOTE_POLICY_PATH", raising=False)
     order = []
     monkeypatch.setattr(
-        follower_module,
-        "ensure_safe_goal_position",
-        lambda goal, limit: order.append("command") or goal,
+        follower_module.SOFollower,
+        "get_observation",
+        lambda _robot: {"shoulder_pan.pos": 0.0},
+    )
+    monkeypatch.setattr(
+        follower_module.SOFollower,
+        "send_action",
+        lambda _robot, action: order.append("command") or action,
     )
 
     trace = policying._start_motion_trace()
-    goal = {"shoulder_pan": (1.0, 0.0)}
+    robot = object()
+    goal = {"shoulder_pan.pos": 1.0}
     try:
-        # 정렬에서 같은 함수를 불러도 아직 arm하지 않았으므로 콜백은 없다.
-        follower_module.ensure_safe_goal_position(goal, 3.0)
+        follower_module.SOFollower.get_observation(robot)
+        follower_module.SOFollower.send_action(robot, goal)
         order.clear()
         trace.arm(lambda: order.append("running"))
-        follower_module.ensure_safe_goal_position(goal, 3.0)
-        follower_module.ensure_safe_goal_position(goal, 3.0)
+        follower_module.SOFollower.get_observation(robot)
+        follower_module.SOFollower.send_action(robot, goal)
+        follower_module.SOFollower.get_observation(robot)
+        follower_module.SOFollower.send_action(robot, goal)
         trace.disarm()
-        follower_module.ensure_safe_goal_position(goal, 3.0)
+        follower_module.SOFollower.get_observation(robot)
+        follower_module.SOFollower.send_action(robot, goal)
     finally:
         trace.stop()
 
@@ -782,9 +790,14 @@ def test_motion_traces_are_archived_with_location_and_pruned(tmp_path, monkeypat
     monkeypatch.setattr(policying, "TRACE_PATH", runtime / "trace.jsonl")
     monkeypatch.setattr(policying, "TRACE_RETENTION", 2)
     monkeypatch.setattr(
-        follower_module,
-        "ensure_safe_goal_position",
-        lambda goal, limit: goal,
+        follower_module.SOFollower,
+        "get_observation",
+        lambda _robot: {"shoulder_pan.pos": 0.0},
+    )
+    monkeypatch.setattr(
+        follower_module.SOFollower,
+        "send_action",
+        lambda _robot, action: action,
     )
     monkeypatch.setenv("SOARM_POLICY_RUN", RUN)
     monkeypatch.setenv("SOARM_POLICY_STEP", STEP)
@@ -796,7 +809,9 @@ def test_motion_traces_are_archived_with_location_and_pruned(tmp_path, monkeypat
         else:
             monkeypatch.delenv("SOARM_REMOTE_POLICY_PATH", raising=False)
         trace = policying._start_motion_trace()
-        follower_module.ensure_safe_goal_position({"shoulder_pan": (1.0, 0.0)}, 3.0)
+        robot = object()
+        follower_module.SOFollower.get_observation(robot)
+        follower_module.SOFollower.send_action(robot, {"shoulder_pan.pos": 1.0})
         trace.stop()
 
     archives = sorted(path.name for path in policying.TRACE_DIR.glob("*.jsonl"))

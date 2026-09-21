@@ -194,6 +194,46 @@ def test_trajectory_endpoint_returns_frame_order_and_metadata_joint_order(data_r
     assert payload["state"] == state
     assert payload["action"] == [[value + 0.5 for value in frame] for frame in state]
 
+def test_trajectory_endpoint_returns_all_recorded_motor_sensor_columns(data_root):
+    from fastapi.testclient import TestClient
+    from soarm_console.app import app
+
+    directory = _make_dataset(data_root, "soarm101_pick")
+    state = [[float(index)] * 6 for index in range(3)]
+    _write_episode(directory, 0, state)
+    info_path = directory / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    columns = {
+        "observation.load": "load",
+        "observation.velocity": "vel",
+        "observation.temperature": "temp",
+        "observation.voltage": "volt",
+        "observation.servo_status": "status",
+        "observation.servo_moving": "moving",
+        "observation.current": "current",
+    }
+    for feature, suffix in columns.items():
+        info["features"][feature] = {
+            "dtype": "float32", "shape": [6],
+            "names": [f"joint_{index}.{suffix}" for index in range(6)],
+        }
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    data_path = directory / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(data_path)
+    values = [[float(frame + joint) for joint in range(6)] for frame in reversed(range(3))]
+    for feature in columns:
+        table = table.append_column(feature, pa.array(values))
+    pq.write_table(table, data_path)
+
+    response = TestClient(app).get("/api/datasets/soarm101_pick/episodes/0/trajectory")
+    assert response.status_code == 200
+    payload = response.json()
+    for api_name in ("load", "velocity", "temperature", "voltage", "servo_status", "servo_moving", "current"):
+        assert payload[api_name] == list(reversed(values))
+
 
 def test_trajectory_endpoint_reports_missing_dataset_and_episode(data_root):
     from fastapi.testclient import TestClient

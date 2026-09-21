@@ -69,6 +69,11 @@ STATE_FEATURE = "observation.state"
 TRAJECTORY_EXTRAS = {
     "observation.load": "load",
     "observation.velocity": "velocity",
+    "observation.temperature": "temperature",
+    "observation.voltage": "voltage",
+    "observation.servo_status": "servo_status",
+    "observation.servo_moving": "servo_moving",
+    "observation.current": "current",
     "observation.camera_fresh": "camera_fresh",
     "observation.wall_time": "wall_time",
     # 이 행의 서보 값이 이 프레임에서 새로 읽힌 것인가(1.0), 읽기가 실패해 직전 값이

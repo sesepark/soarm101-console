@@ -59,6 +59,12 @@ def test_smolvla_reports_the_rtc_engine_the_rollout_uses():
     assert policying.inference_kind("smolvla") == "rtc"
 
 
+def test_remote_non_rtc_policies_blend_overlapping_chunks():
+    assert policying.remote_inference_tuning("act") == (0.5, "conservative")
+    assert policying.remote_inference_tuning("fastwam") == (0.75, "conservative")
+    assert policying.remote_inference_tuning("pi05") == (0.5, "latest_only")
+
+
 def test_the_horizon_fits_in_the_chunk_the_policy_actually_emits():
     # 유도 구간이 청크보다 길 수는 없다. 배포된 SmolVLA의 chunk_size는 50이다.
     assert policying.RTC_EXECUTION_HORIZON < 50

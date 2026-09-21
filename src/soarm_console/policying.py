@@ -9,9 +9,10 @@ import re
 import signal
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from math import ceil, isfinite
 from queue import Empty
-from math import isfinite
 from pathlib import Path
 
 from .config import Settings
@@ -45,6 +46,28 @@ ALIGNMENT_TOLERANCE_PERCENT = 3.0
 ALIGNMENT_SETTLE_POLL_S = 0.1
 
 logger = logging.getLogger(__name__)
+
+
+REMOTE_DEFAULT_ACTIONS_PER_CHUNK = 50
+REMOTE_FASTWAM_QUEUE_THRESHOLD = 0.75
+REMOTE_MAX_QUEUE_THRESHOLD = 0.90
+REMOTE_LATENCY_SAFETY_FRAMES = 5
+REMOTE_BLEND_POLICIES = {"act", "fastwam"}
+
+
+def remote_inference_tuning(policy_type: str) -> tuple[float, str]:
+    """Choose buffering and overlap aggregation for a remote policy.
+
+    FastWAM emits only 32 actions for the deployed checkpoint.  At 30 Hz its old 50% refill
+    point left 0.53 s in the queue, less than the measured 0.56 s response time, so starvation
+    was guaranteed.  Start it at 75%, then let ``FailSafeRobotClient`` raise the threshold from
+    observed response latency.  ACT and FastWAM cannot use RTC, so preserve their remaining
+    plan with a conservative overlap blend instead of replacing it at every chunk boundary.
+    """
+    normalized = policy_type.strip().lower()
+    threshold = REMOTE_FASTWAM_QUEUE_THRESHOLD if normalized == "fastwam" else 0.5
+    aggregate = "conservative" if normalized in REMOTE_BLEND_POLICIES else "latest_only"
+    return threshold, aggregate
 
 
 def _alignment_distances(
@@ -566,6 +589,7 @@ class FailSafeRobotClient:
         self.client = RobotClient(config)
         self.client.policy_config.rename_map = dict(config.checkpoint_rename_map)
         self.failure: str | None = None
+        self._response_latencies: deque[float] = deque(maxlen=20)
         #: 우리가 끝내기로 한 뒤인가. 그 뒤의 취소는 고장이 아니라 우리가 낸 것이다.
         self._stopping = False
         original_stub = self.client.stub
@@ -576,8 +600,12 @@ class FailSafeRobotClient:
                 call = getattr(original_stub, name)
 
                 def watched(*args, **kwargs):
+                    started = time.perf_counter()
                     try:
-                        return call(*args, **kwargs)
+                        response = call(*args, **kwargs)
+                        if name == "GetActions" and getattr(response, "data", b""):
+                            owner._observe_action_latency(time.perf_counter() - started)
+                        return response
                     except grpc.RpcError as exc:
                         owner.abort(f"Remote policy connection failed: {exc.code().name}")
                         raise
@@ -586,6 +614,21 @@ class FailSafeRobotClient:
 
         self.client.stub = WatchedStub()
         self.client.channel.subscribe(self._channel_state, try_to_connect=True)
+
+    def _observe_action_latency(self, seconds: float) -> None:
+        """Move FastWAM's refill point early enough to cover measured response time."""
+        if self.client.config.policy_type.strip().lower() != "fastwam" or seconds <= 0:
+            return
+        self._response_latencies.append(seconds)
+        actual_chunk = self.client.action_chunk_size
+        if actual_chunk <= 0:
+            actual_chunk = self.client.config.actions_per_chunk
+        required = ceil(max(self._response_latencies) * self.client.config.fps)
+        required += REMOTE_LATENCY_SAFETY_FRAMES
+        threshold = min(REMOTE_MAX_QUEUE_THRESHOLD, required / max(1, actual_chunk))
+        self.client._chunk_size_threshold = max(
+            REMOTE_FASTWAM_QUEUE_THRESHOLD, threshold
+        )
 
     def _channel_state(self, state) -> None:
         import grpc
@@ -697,14 +740,16 @@ def build_remote_client_config(
     task: str,
     fps: float,
     rename_map: dict[str, str],
+    actions_per_chunk: int = REMOTE_DEFAULT_ACTIONS_PER_CHUNK,
 ):
     from lerobot.async_inference.configs import RobotClientConfig
 
+    chunk_size_threshold, aggregate_fn_name = remote_inference_tuning(policy_type)
     config = RobotClientConfig(
         policy_type=policy_type,
         pretrained_name_or_path=pretrained_path,
         robot=_robot_config(settings, fps, camera_rename_map=rename_map),
-        actions_per_chunk=50,
+        actions_per_chunk=actions_per_chunk,
         task=task.strip(),
         # 터널이 아니라 tailnet 주소로 바로 붙는다. 이유는
         # `Settings.effective_remote_policy_host`와 docs/원격_추론_끊김_진단_2026-09-08.md §5-5.
@@ -712,11 +757,11 @@ def build_remote_client_config(
         policy_device="cuda",
         client_device="cpu",
         fps=int(fps),
-        chunk_size_threshold=0.5,
+        chunk_size_threshold=chunk_size_threshold,
         # RTC를 쓰는 서버와 짝을 이루는 값이다. 서버가 새 청크를 **앞 계획 위에 이어 붙여**
         # 내주므로, 클라이언트가 겹치는 구간을 다시 섞으면(`weighted_average`는 0.3*old +
         # 0.7*new) 이어 붙인 것을 도로 흐린다. 이어 붙은 것을 그대로 쓴다.
-        aggregate_fn_name="latest_only",
+        aggregate_fn_name=aggregate_fn_name,
     )
     # Keep sending the checkpoint map. The remote RobotConfig already emits policy-named camera keys,
     # so none of its scene/wrist source keys exist and the server-side rename processor is a no-op.
@@ -738,6 +783,9 @@ def main(
     try:
         fps = float(os.getenv("SOARM_POLICY_FPS", "30"))
         max_seconds = float(os.getenv("SOARM_POLICY_MAX_SECONDS", "120"))
+        remote_action_steps = int(
+            os.getenv("SOARM_REMOTE_ACTION_STEPS", str(REMOTE_DEFAULT_ACTIONS_PER_CHUNK))
+        )
     except ValueError as exc:
         raise SystemExit(f"Refusing policy rollout: invalid numeric setting: {exc}") from exc
     if not settings.motion_enabled:
@@ -748,7 +796,13 @@ def main(
         raise SystemExit(f"Refusing policy rollout: invalid follower calibration: {error}")
     if not task.strip():
         raise SystemExit("Refusing policy rollout: task is required")
-    if not isfinite(fps) or not isfinite(max_seconds) or fps <= 0 or max_seconds <= 0:
+    if (
+        not isfinite(fps)
+        or not isfinite(max_seconds)
+        or fps <= 0
+        or max_seconds <= 0
+        or remote_action_steps <= 0
+    ):
         raise SystemExit("Refusing policy rollout: fps and max_seconds must be positive")
     try:
         decoded_home = json.loads(raw_home) if raw_home else None
@@ -804,7 +858,13 @@ def main(
                 ):
                     raise ValueError("Invalid remote checkpoint rename map")
                 config = build_remote_client_config(
-                    settings, remote_type, remote_path, task, fps, rename_map
+                    settings,
+                    remote_type,
+                    remote_path,
+                    task,
+                    fps,
+                    rename_map,
+                    remote_action_steps,
                 )
             else:
                 config = build_rollout_config(settings, run, step, task, fps, max_seconds)

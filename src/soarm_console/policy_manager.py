@@ -14,7 +14,7 @@ from .calibration import validate_calibration
 from .config import Settings
 from . import hubq_client
 from .models import describe_model
-from .datasets import DatasetError
+from .datasets import DatasetError, dataset_tasks
 from .policying import inference_kind
 from .spark import (
     SparkError,
@@ -51,6 +51,21 @@ _REMOTE_TICK = re.compile(
 #: 25Hz로 나온다(2026-09-09 실측). 틀린 숫자를 보여 주는 것보다 비워 두는 편이 낫다.
 _RATE_MIN_SPAN_SECONDS = 10
 _LOCAL_TRACE_TAIL_LINES = 600
+
+
+def _looks_like_url_task(task: str) -> bool:
+    normalized = task.strip().casefold()
+    return normalized.startswith(("http://", "https://", "www."))
+
+
+def _remote_action_steps(model: dict[str, object]) -> int:
+    """Use the shortest advertised horizon; the server cannot return more than that."""
+    values = [
+        int(value)
+        for key in ("chunk_size", "n_action_steps")
+        if isinstance((value := model.get(key)), (int, float)) and int(value) > 0
+    ]
+    return min(values) if values else 50
 
 
 def _rate_from_ticks(ticks: Sequence[tuple[int, int]]) -> float | None:
@@ -228,6 +243,8 @@ class PolicyManager:
     ) -> None:
         if not task.strip():
             raise TeleopError("A task description is required")
+        if _looks_like_url_task(task):
+            raise TeleopError("A URL cannot be used as a policy task description")
         if not 1 <= fps <= 60:
             raise TeleopError("fps must be between 1 and 60")
         if not 1 <= max_seconds <= 600:
@@ -251,6 +268,12 @@ class PolicyManager:
                 model = describe_model(run, step)
             if not model["runnable"]:
                 raise TeleopError("; ".join(model["problems"]))
+            if not remote:
+                trained_tasks = dataset_tasks(str(model.get("dataset", "")))
+                if trained_tasks and task.strip() not in trained_tasks:
+                    raise TeleopError(
+                        "The policy task must exactly match one of the training dataset tasks"
+                    )
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             (self.runtime_dir / "status.json").unlink(missing_ok=True)
             self._logs.clear()
@@ -290,6 +313,7 @@ class PolicyManager:
                         "SOARM_REMOTE_POLICY_PATH": str(model["source"]),
                         "SOARM_REMOTE_POLICY_TYPE": str(model["policy"]),
                         "SOARM_REMOTE_RENAME_MAP": json.dumps(model["rename_map"]),
+                        "SOARM_REMOTE_ACTION_STEPS": str(_remote_action_steps(model)),
                     }
                 )
             try:

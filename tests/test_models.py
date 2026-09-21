@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from queue import Queue
 
@@ -833,6 +834,48 @@ def test_remote_camera_name_falls_back_when_checkpoint_has_no_mapping():
     )
 
     assert set(config.robot.cameras) == {"overhead_rgb", "wrist"}
+
+
+def test_fastwam_uses_its_real_horizon_and_refills_before_half_empty():
+    config = policying.build_remote_client_config(
+        _settings(), "fastwam", "/home/operator/model", "Pick up block", 30, {}, 32
+    )
+
+    assert config.actions_per_chunk == 32
+    assert config.chunk_size_threshold == 0.75
+    assert config.aggregate_fn_name == "conservative"
+
+
+def test_fastwam_refill_threshold_tracks_measured_latency():
+    client = policying.FailSafeRobotClient.__new__(policying.FailSafeRobotClient)
+    client._response_latencies = deque(maxlen=20)
+
+    class Config:
+        policy_type = "fastwam"
+        actions_per_chunk = 32
+        fps = 30
+
+    class Inner:
+        config = Config()
+        action_chunk_size = 32
+        _chunk_size_threshold = 0.75
+
+    client.client = Inner()
+    client._observe_action_latency(0.70)
+
+    # ceil(0.70 * 30) + 5 safety frames = 26 of the actual 32-action chunk.
+    assert client.client._chunk_size_threshold == pytest.approx(26 / 32)
+
+
+@pytest.mark.parametrize("task", ["https://example.com", "HTTP://example.com", "www.example.com"])
+def test_policy_tasks_reject_urls(task):
+    assert policy_manager_module._looks_like_url_task(task)
+
+
+def test_remote_action_steps_use_the_shorter_model_horizon():
+    assert policy_manager_module._remote_action_steps(
+        {"chunk_size": 32, "n_action_steps": 50}
+    ) == 32
 
 
 def test_remote_connection_failure_discards_every_buffered_action():

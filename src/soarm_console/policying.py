@@ -58,7 +58,7 @@ REMOTE_BLEND_POLICIES = {"act", "fastwam"}
 def remote_inference_tuning(policy_type: str) -> tuple[float, str]:
     """Choose buffering and overlap aggregation for a remote policy.
 
-    FastWAM emits only 32 actions for the deployed checkpoint.  At 30 Hz its old 50% refill
+    FastWAM emits 32 actions for the deployed checkpoint.  At 30 Hz its old 50% refill
     point left 0.53 s in the queue, less than the measured 0.56 s response time, so starvation
     was guaranteed.  Start it at 75%, then let ``FailSafeRobotClient`` raise the threshold from
     observed response latency.  ACT and FastWAM cannot use RTC, so preserve their remaining

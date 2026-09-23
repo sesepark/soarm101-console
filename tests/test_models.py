@@ -878,6 +878,12 @@ def test_remote_action_steps_use_the_shorter_model_horizon():
     ) == 32
 
 
+def test_fastwam_remote_uses_predicted_horizon_not_select_action_limit():
+    assert policy_manager_module._remote_action_steps(
+        {"policy": "fastwam", "action_horizon": 32, "n_action_steps": 10}
+    ) == 32
+
+
 def test_remote_connection_failure_discards_every_buffered_action():
     from queue import Queue
 

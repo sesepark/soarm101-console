@@ -358,6 +358,19 @@ def test_remote_model_script_counts_checkpoint_bytes(tmp_path):
     assert result["bytes"] == sum(path.stat().st_size for path in tmp_path.iterdir())
 
 
+def test_remote_model_script_reads_fastwam_prediction_horizon(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "type": "fastwam", "action_horizon": 32, "n_action_steps": 10,
+    }))
+    (tmp_path / "train_config.json").write_text('{"dataset": {}}')
+    (tmp_path / "policy_preprocessor.json").write_text('{"steps": []}')
+
+    result = _run_remote_script(spark._REMOTE_MODEL, str(tmp_path))
+
+    assert result["action_horizon"] == 32
+    assert result["n_action_steps"] == 10
+
+
 def test_remote_model_accepts_a_policy_that_never_renamed_its_cameras(monkeypatch):
     """GR00T keeps the dataset camera keys, so its rename map is empty and nothing needs
     preserving.  The gate used to read that as a broken checkpoint and refused it."""

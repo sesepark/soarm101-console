@@ -59,7 +59,16 @@ def _looks_like_url_task(task: str) -> bool:
 
 
 def _remote_action_steps(model: dict[str, object]) -> int:
-    """Use the shortest advertised horizon; the server cannot return more than that."""
+    """Request the number of actions predict_action_chunk actually returns.
+
+    FastWAM's ``n_action_steps`` limits the synchronous ``select_action`` queue, not
+    ``predict_action_chunk``. The latter returns ``action_horizon`` actions. Using the
+    former truncated the 32-frame prediction to 10 frames, shorter than inference.
+    """
+    if str(model.get("policy", "")).lower() == "fastwam":
+        horizon = model.get("action_horizon")
+        if isinstance(horizon, (int, float)) and int(horizon) > 0:
+            return int(horizon)
     values = [
         int(value)
         for key in ("chunk_size", "n_action_steps")

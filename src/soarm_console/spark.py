@@ -136,6 +136,7 @@ for directory, _, files in os.walk(root, followlinks=False):
 print(json.dumps({
     "policy": config.get("type"), "dataset": dataset.get("repo_id"),
     "trained_steps": train.get("steps"), "chunk_size": config.get("chunk_size"),
+    "action_horizon": config.get("action_horizon"),
     "n_action_steps": config.get("n_action_steps"), "image_features": images,
     "state_dim": dim(inputs, "observation.state"),
     "action_dim": dim(config.get("output_features") or {}, "action"),
